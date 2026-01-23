@@ -11,8 +11,9 @@ class ModelExplorer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(5, 5, 5, 5)
-        self.layout.setSpacing(8)
+        # 极度紧凑模式
+        self.layout.setContentsMargins(0, 4, 0, 4)
+        self.layout.setSpacing(4)
         
         # 1. 核心筛选：Checkpoint 下拉框
         model_layout = QHBoxLayout()
@@ -36,14 +37,7 @@ class ModelExplorer(QWidget):
         
         # 筛选结果提示 - 紧凑样式
         self.filter_hint = QLabel("显示全部图片")
-        self.filter_hint.setStyleSheet("""
-            QLabel {
-                color: #888; 
-                font-size: 10px;
-                padding: 2px 4px;
-                margin: 0px;
-            }
-        """)
+        self.filter_hint.setObjectName("FilterHint")
         self.filter_hint.setMaximumHeight(20)
         self.filter_hint.setWordWrap(False)
         self.layout.addWidget(self.filter_hint)

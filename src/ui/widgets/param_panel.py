@@ -21,14 +21,8 @@ class ParameterPanel(QWidget):
         
         # ========== 1. 顶部核心信息卡片 ==========
         self.info_card = QFrame()
-        self.info_card.setStyleSheet("""
-            QFrame {
-                background-color: palette(window);
-                border: 1px solid palette(mid);
-                border-radius: 8px;
-            }
-            QLabel { border: none; background: transparent; }
-        """)
+        # 移除硬编码 palette 样式，依赖全局 QSS
+        self.info_card.setObjectName("InfoCard") # 方便 QSS 定制
         info_card_layout = QVBoxLayout(self.info_card)
         info_card_layout.setContentsMargins(12, 12, 12, 12)
         info_card_layout.setSpacing(10)
@@ -42,42 +36,40 @@ class ParameterPanel(QWidget):
         title_row.addStretch()
         
         btn_copy_all = QPushButton("📋 复制全部")
-        btn_copy_all.setFixedWidth(85)
-        btn_copy_all.setStyleSheet("""
-            QPushButton {
-                padding: 4px 6px;
-                border: 1px solid palette(mid);
-                border-radius: 4px;
-                background-color: palette(button);
-            }
-            QPushButton:hover { background-color: palette(midlight); }
-        """)
+        btn_copy_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        # 移除固定宽度，改用最小宽度 + 自适应
+        btn_copy_all.setMinimumWidth(80) 
         btn_copy_all.clicked.connect(self._copy_all_params)
         title_row.addWidget(btn_copy_all)
-
+        
         # 添加远程生成按钮
         self.btn_remote_gen = QPushButton("🔥 远程生成")
-        self.btn_remote_gen.setFixedWidth(90)
+        self.btn_remote_gen.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_remote_gen.setMinimumWidth(90)
+        self.btn_remote_gen.setObjectName("RemoteGenButton")
+        # 保持远程生成的特殊颜色，但调整为 Fluent 风格
         self.btn_remote_gen.setStyleSheet("""
-            QPushButton {
-                padding: 4px 6px;
-                border: 1px solid #ff4d00;
-                border-radius: 4px;
+            QPushButton#RemoteGenButton {
                 background-color: #ff4d00;
                 color: white;
+                border: none;
                 font-weight: bold;
             }
-            QPushButton:hover { background-color: #ff6a00; border-color: #ff6a00; }
-            QPushButton:disabled { background-color: #444; border-color: #555; color: #888; }
+            QPushButton#RemoteGenButton:hover { background-color: #ff6a00; }
+            QPushButton#RemoteGenButton:pressed { background-color: #e64500; }
+            QPushButton#RemoteGenButton:disabled { background-color: #444; color: #888; }
         """)
         self.btn_remote_gen.clicked.connect(self._on_remote_gen_click)
         title_row.addWidget(self.btn_remote_gen)
+        # 强制垂直居中对齐，修复按钮高低不平的问题
+        title_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        title_row.setContentsMargins(0, 0, 0, 0)
         info_card_layout.addLayout(title_row)
         
         # 分割线
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet("background-color: palette(mid); max-height: 1px;")
+        line.setObjectName("CardSeparator")
         info_card_layout.addWidget(line)
         
         # 参数网格展示区 (不再使用沉重的 GroupBox)
@@ -130,21 +122,80 @@ class ParameterPanel(QWidget):
         # ========== 2. Prompt/Negative/详细参数区 (可拉伸) ==========
         self.main_splitter = QSplitter(Qt.Orientation.Vertical)
         
+        # 定义一个简单的样式函数
+        def apply_edit_style(edit):
+            edit.setReadOnly(False)
+            edit.setStyleSheet("""
+                QTextEdit {
+                    background-color: transparent;
+                    border: none;
+                    font-family: "Segoe UI", "Microsoft YaHei";
+                    font-size: 11px;
+                    line-height: 1.4;
+                    padding: 8px;
+                }
+            """)
+            
         # Prompt 区
-        self.prompt_group = self._create_collapsible_group("✨ Prompt", self._copy_prompt)
+        self.prompt_container = QWidget()
+        prompt_layout = QVBoxLayout(self.prompt_container)
+        prompt_layout.setContentsMargins(0, 0, 0, 0)
+        prompt_layout.setSpacing(4)
+        
+        prompt_header = self._create_compact_header("✨ Prompt", self._copy_prompt)
+        prompt_layout.addLayout(prompt_header)
+        
+        # 外框
+        self.prompt_frame = QFrame()
+        self.prompt_frame.setObjectName("TextCard")
+        self.prompt_frame.setStyleSheet("""
+            QFrame#TextCard {
+                background-color: palette(base);
+                border: 1px solid palette(mid);
+                border-radius: 6px;
+            }
+        """)
+        pf_layout = QVBoxLayout(self.prompt_frame)
+        pf_layout.setContentsMargins(1, 1, 1, 1)
+        
         self.prompt_edit = QTextEdit()
-        self.prompt_edit.setReadOnly(False) # 解锁编辑权限，支持回填修改
         self.prompt_edit.setPlaceholderText("在这里修改提示词...")
-        self.prompt_group.layout().addWidget(self.prompt_edit)
-        self.main_splitter.addWidget(self.prompt_group)
+        apply_edit_style(self.prompt_edit)
+        
+        pf_layout.addWidget(self.prompt_edit)
+        prompt_layout.addWidget(self.prompt_frame)
+        
+        self.main_splitter.addWidget(self.prompt_container)
         
         # Negative Prompt 区
-        self.neg_group = self._create_collapsible_group("🚫 Negative Prompt", self._copy_neg_prompt)
+        self.neg_container = QWidget()
+        neg_layout = QVBoxLayout(self.neg_container)
+        neg_layout.setContentsMargins(0, 0, 0, 0)
+        neg_layout.setSpacing(4)
+        
+        neg_header = self._create_compact_header("🚫 Negative Prompt", self._copy_neg_prompt)
+        neg_layout.addLayout(neg_header)
+        
+        self.neg_frame = QFrame()
+        self.neg_frame.setObjectName("TextCard")
+        self.neg_frame.setStyleSheet("""
+            QFrame#TextCard {
+                background-color: palette(base);
+                border: 1px solid palette(mid);
+                border-radius: 6px;
+            }
+        """)
+        nf_layout = QVBoxLayout(self.neg_frame)
+        nf_layout.setContentsMargins(1, 1, 1, 1)
+        
         self.neg_prompt_edit = QTextEdit()
-        self.neg_prompt_edit.setReadOnly(False) # 解锁编辑权限
         self.neg_prompt_edit.setPlaceholderText("在这里修改反向提示词...")
-        self.neg_group.layout().addWidget(self.neg_prompt_edit)
-        self.main_splitter.addWidget(self.neg_group)
+        apply_edit_style(self.neg_prompt_edit)
+        
+        nf_layout.addWidget(self.neg_prompt_edit)
+        neg_layout.addWidget(self.neg_frame)
+        
+        self.main_splitter.addWidget(self.neg_container)
         
         # 设置初始权重 - 更加均衡，减少单方面区域过大的空旷感
         self.main_splitter.setStretchFactor(0, 1)
@@ -152,25 +203,45 @@ class ParameterPanel(QWidget):
         
         self.layout.addWidget(self.main_splitter)
 
-    def _create_collapsible_group(self, title, copy_func):
-        """创建可折叠分组"""
-        group = QGroupBox(title)
-        group_layout = QVBoxLayout()
-        group_layout.setContentsMargins(4, 15, 4, 4) # 减小内边距
-        group_layout.setSpacing(2) # 极简间距
-        
-        # 标题栏+复制按钮
+    def _create_compact_header(self, title, copy_func):
+        """创建紧凑的标题行 (替代笨重的 GroupBox)"""
         header = QHBoxLayout()
-        header.addStretch()
-        btn_copy = QPushButton("📋")
-        btn_copy.setFixedWidth(30)
-        btn_copy.clicked.connect(copy_func)
-        btn_copy.setToolTip("复制")
-        header.addWidget(btn_copy)
-        group_layout.addLayout(header)
+        header.setContentsMargins(4, 6, 4, 2)
+        header.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         
-        group.setLayout(group_layout)
-        return group
+        lbl_title = QLabel(title)
+        lbl_title.setStyleSheet("font-weight: bold; color: palette(text); font-size: 12px;")
+        header.addWidget(lbl_title)
+        
+        header.addStretch()
+        
+        # 改用英文 "Copy"，防止乱码
+        btn_copy = QPushButton("Copy") 
+        btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._fix_text_button(btn_copy) # 应用通用修复
+        if copy_func:
+            btn_copy.clicked.connect(copy_func)
+        header.addWidget(btn_copy)
+        return header
+
+    def _fix_text_button(self, btn):
+        """统一调整文字按钮尺寸，防止截断"""
+        btn.setMinimumWidth(60) 
+        btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                border-radius: 4px;
+                color: palette(mid);
+                font-size: 11px;
+                padding: 2px 8px;
+                text-align: center;
+            }
+            QPushButton:hover { 
+                background-color: palette(midlight);
+                color: palette(highlight); 
+            }
+        """)
 
     def _copy_prompt(self):
         text = self.prompt_edit.toPlainText()
@@ -178,14 +249,14 @@ class ParameterPanel(QWidget):
             QApplication.clipboard().setText(text)
             self._temp_notify("✅ 提示词已复制")
             # 查找复制按钮并临时改变文字
-            self._flash_button_feedback(self.prompt_group, "✓")
+            self._flash_button_feedback(self.prompt_container, "✓")
 
     def _copy_neg_prompt(self):
         text = self.neg_prompt_edit.toPlainText()
         if text:
             QApplication.clipboard().setText(text)
             self._temp_notify("✅ 反向提示词已复制")
-            self._flash_button_feedback(self.neg_group, "✓")
+            self._flash_button_feedback(self.neg_container, "✓")
 
     def _copy_all_params(self):
         """复制所有参数为文本格式"""
@@ -229,6 +300,11 @@ class ParameterPanel(QWidget):
         has_workflow = 'workflow' in meta_data
         self.btn_remote_gen.setEnabled(has_workflow)
         self.btn_remote_gen.setToolTip("通过远程 ComfyUI 重新生成" if has_workflow else "非 ComfyUI 图片，暂不支持远程生成")
+        
+        # 启用复制按钮
+        for btn in self.info_card.findChildren(QPushButton):
+            if "复制" in btn.text():
+                btn.setEnabled(True)
 
         params = meta_data.get('params', {})
         tech_info = meta_data.get('tech_info', {})
@@ -262,17 +338,8 @@ class ParameterPanel(QWidget):
         self._clear_lora_tags()
         for lora in loras:
             tag = QLabel(f"{lora}")
-            tag.setStyleSheet("""
-                QLabel {
-                    background-color: palette(midlight);
-                    color: palette(text);
-                    border: 1px solid palette(mid);
-                    border-radius: 4px;
-                    padding: 3px 8px;
-                    font-size: 11px;
-                }
-            """)
-            tag.setMaximumHeight(22)
+            tag.setObjectName("LoraTag")
+            tag.setMaximumHeight(24)
             self.lora_flow.addWidget(tag)
         self.lora_flow.addStretch() # 靠左排列
         
@@ -383,6 +450,11 @@ class ParameterPanel(QWidget):
         """清空信息"""
         self.model_label.setText("🎨 未选择模型")
         self.seed_label.setText("Seed: -")
+        
+        # 禁用操作按钮
+        for btn in self.info_card.findChildren(QPushButton):
+            if "复制" in btn.text():
+                btn.setEnabled(False)
         self.resolution_label.setText("分辨率: -")
         self.steps_label.setText("Steps: -")
         self.cfg_label.setText("CFG: -")

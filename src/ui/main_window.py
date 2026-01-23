@@ -129,34 +129,7 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         toolbar.setIconSize(QSize(20, 20))
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        toolbar.setStyleSheet("""
-            QToolBar {
-                background-color: palette(window);
-                border: none;
-                border-bottom: 1px solid palette(mid);
-                spacing: 6px;
-                padding: 6px;
-            }
-            QToolButton {
-                background-color: transparent;
-                border: 1px solid transparent;
-                border-radius: 4px;
-                padding: 6px 12px;
-                margin: 2px;
-                color: palette(window-text);
-            }
-            QToolButton:hover {
-                background-color: palette(midlight);
-                border: 1px solid palette(mid);
-            }
-            QToolButton:pressed {
-                background-color: palette(mid);
-            }
-            QToolButton:checked {
-                background-color: palette(highlight);
-                color: palette(highlighted-text);
-            }
-        """)
+        # 移除硬编码样式，改由 apply_theme 统一控制
         self.addToolBar(toolbar)
         
         action_open = QAction("📂 打开文件夹", self)
@@ -169,18 +142,23 @@ class MainWindow(QMainWindow):
         
         toolbar.addSeparator()
         
-        action_fit = QAction("⛶ 适应窗口", self)
-        action_fit.triggered.connect(lambda: self.viewer.fit_to_window())
-        toolbar.addAction(action_fit)
+        # 缩放控制 - 下拉列表样式
+        zoom_label = QLabel(" 缩放: ")
+        zoom_label.setStyleSheet("color: palette(window-text); font-weight: bold;")
+        toolbar.addWidget(zoom_label)
         
-        action_fill = QAction("🖼 铺满窗口", self)
-        action_fill.triggered.connect(lambda: self.viewer.toggle_fill_mode())
-        action_fill.setToolTip("图片铺满区域，不留黑边（可能会裁剪图片）")
-        toolbar.addAction(action_fill)
+        self.zoom_combo = QComboBox()
+        self.zoom_combo.setMinimumWidth(100)
+        # 添加选项 (显示文本, 用户数据)
+        self.zoom_combo.addItem("⛶ 适应窗口", "fit")
+        self.zoom_combo.addItem("🖼 铺满窗口", "fill")
+        self.zoom_combo.addItem("100% 原始大小", "1.0")
+        self.zoom_combo.addItem("50%", "0.5")
+        self.zoom_combo.addItem("200%", "2.0")
+        self.zoom_combo.addItem("400%", "4.0")
         
-        action_original = QAction("1:1 原始大小", self)
-        action_original.triggered.connect(lambda: self.viewer.fit_to_original())
-        toolbar.addAction(action_original)
+        self.zoom_combo.currentIndexChanged.connect(self._on_zoom_changed)
+        toolbar.addWidget(self.zoom_combo)
         
         toolbar.addSeparator()
         
@@ -197,29 +175,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(sort_label)
         
         self.sort_combo = QComboBox()
-        self.sort_combo.setStyleSheet("""
-            QComboBox {
-                border: 1px solid palette(mid);
-                border-radius: 4px;
-                padding: 4px 8px;
-                min-width: 150px;
-                background-color: palette(base);
-            }
-            QComboBox:hover {
-                border: 1px solid palette(highlight);
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 20px;
-            }
-            QComboBox::down-arrow {
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 6px solid palette(text);
-                margin-right: 6px;
-            }
-        """)
+        # 移除硬编码样式
         self.sort_combo.addItem("⚡ 时间倒序 (最新在前)", "time_desc")
         self.sort_combo.addItem("🔼 时间正序 (最旧在前)", "time_asc")
         self.sort_combo.addItem("🅰 名称 A-Z", "name_asc")
@@ -245,32 +201,33 @@ class MainWindow(QMainWindow):
         # 左侧列表面板 (增加搜索框)
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(2, 2, 2, 2)
+        # 极致压缩边距，让空间更多留给图片列表
+        left_layout.setContentsMargins(8, 8, 8, 0)
+        left_layout.setSpacing(6)
         
         # 搜索栏 + 重置按钮
         search_layout = QHBoxLayout()
+        search_layout.setSpacing(4) # 搜索栏内部紧凑
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("🔍 搜索提示词/模型/文件名...")
         self.search_bar.textChanged.connect(self.on_search_changed)
         search_layout.addWidget(self.search_bar)
         
-        btn_reset = QPushButton("🔄")
-        btn_reset.setFixedWidth(35)
-        btn_reset.setToolTip("重置所有筛选")
+        btn_reset = QPushButton("Reset") # 改为英文防止乱码
+        btn_reset.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_reset.setToolTip("Reset Filters")
+        btn_reset.setObjectName("GhostButton")
+        # 增加宽度防止文字 "Reset" 被截断
+        btn_reset.setMinimumWidth(60)
         btn_reset.clicked.connect(self._reset_all_filters)
         search_layout.addWidget(btn_reset)
         
         left_layout.addLayout(search_layout)
         
-        # 增加一条细分割线，区分全局搜索与筛选器
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
-        line.setStyleSheet("background-color: #333; margin: 2px 0;")
-        left_layout.addWidget(line)
-        
         # 使用 QSplitter 整合“筛选区”和“图库列表”
         self.left_splitter = QSplitter(Qt.Orientation.Vertical)
+        # 允许筛选区尽可能压扁
+        self.left_splitter.setHandleWidth(2)
         
         # 1. 模型筛选器
         self.model_explorer = ModelExplorer()
@@ -280,12 +237,11 @@ class MainWindow(QMainWindow):
         # 2. 缩略图图库
         self.thumbnail_list = ThumbnailList()
         self.thumbnail_list.image_selected.connect(self.on_image_selected)
-        self.thumbnail_list.selectionModel().selectionChanged.connect(self.on_selection_changed)
         self.left_splitter.addWidget(self.thumbnail_list)
         
-        # 初始权重：筛选占 30%，列表占 70%
-        self.left_splitter.setStretchFactor(0, 3)
-        self.left_splitter.setStretchFactor(1, 7)
+        # 初始权重：筛选占 20%，列表占 80% (列表更重要)
+        self.left_splitter.setStretchFactor(0, 2)
+        self.left_splitter.setStretchFactor(1, 8)
         
         left_layout.addWidget(self.left_splitter)
         
@@ -312,11 +268,12 @@ class MainWindow(QMainWindow):
         self.param_panel.setMaximumWidth(600)
         self.splitter.addWidget(self.param_panel)
         
-        # 设置 Splitter 初始比例
-        self.splitter.setStretchFactor(0, 0) # 侧边栏不主动伸缩
+        # 设置 Splitter 初始比例 (加宽侧边栏以显示多行)
+        self.splitter.setStretchFactor(0, 0) 
         self.splitter.setStretchFactor(1, 1) # 中间区域主动伸缩
         self.splitter.setStretchFactor(2, 0)
-        self.splitter.setSizes([250, 900, 250])
+        # 左侧给到 320px 以容纳至少两列，右侧给到 300px
+        self.splitter.setSizes([320, 800, 300])
 
     def resizeEvent(self, event):
         """窗口缩放时尝试消除空白"""
@@ -564,7 +521,12 @@ class MainWindow(QMainWindow):
                 return
         
         try:
-            send2trash(path)
+            # FIX: Windows API (SHFileOperation) 对路径分隔符非常敏感
+            # 必须使用 os.path.normpath 将混用的 / 和 \ 统一为 Windows 标准的 反斜杠
+            # 并使用 abspath 确保是绝对路径
+            safe_path = os.path.normpath(os.path.abspath(path))
+            send2trash(safe_path)
+            
             # 从模型中移除
             self.thumbnail_list.image_model.beginRemoveRows(idx.parent(), row, row)
             self.thumbnail_list.image_model.image_data.pop(row)
@@ -624,158 +586,289 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def apply_theme(self):
-        """应用界面主题 (从配置读取)"""
+        """应用界面主题 (Windows 11 Fluent Design 风格)"""
         theme = self.settings.value("theme", "dark")
         
+        # 定义 Fluent 变量
         if theme == "dark":
-            self.setStyleSheet("""
-                QMainWindow, QWidget {
-                    background-color: #0f0f0f;
-                    color: #d1d1d1;
-                    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei";
-                    font-size: 9pt;
-                }
-                QSplitter::handle:vertical { background-color: #2a2a2a; height: 1px; }
-                QSplitter::handle:horizontal { width: 2px; background-color: #222; }
-                QToolBar {
-                    background-color: #1a1a1a;
-                    border-bottom: 1px solid #2a2a2a;
-                    spacing: 8px;
-                    padding: 4px;
-                }
-                QToolButton {
-                    padding: 6px 12px;
-                    border: 1px solid transparent;
-                    border-radius: 4px;
-                    color: #bbb;
-                }
-                QToolButton:hover {
-                    background-color: #2a2a2a;
-                    border: 1px solid #3a3a3a;
-                    color: #fff;
-                }
-                QLineEdit {
-                    background-color: #1a1a1a;
-                    border: 1px solid #333;
-                    padding: 8px 12px;
-                    border-radius: 6px;
-                    color: #fff;
-                }
-                QListWidget { background-color: #0f0f0f; border: none; }
-                QListWidget::item { padding: 4px 8px; border-radius: 4px; }
-                QListWidget::item:selected {
-                    background-color: #252525;
-                    border: 1px solid #0078d4;
-                    color: #fff;
-                }
-                QListWidget::item:hover { background-color: #1a1a1a; }
-                QStatusBar {
-                    background-color: #121212;
-                    color: #666;
-                    border-top: 1px solid #222;
-                }
-                QTabWidget::pane { border-top: 1px solid #222; background-color: #0f0f0f; }
-                QTabBar::tab {
-                    background-color: #1a1a1a;
-                    color: #888;
-                    padding: 8px 20px;
-                }
-                QTabBar::tab:selected {
-                    background-color: #222;
-                    color: #fff;
-                    border-bottom: 2px solid #0078d4;
-                }
-                QGroupBox { 
-                    border: 1px solid #2a2a2a; 
-                    border-radius: 6px;
-                    margin-top: 15px;
-                    padding-top: 15px; 
-                    color: #888; 
-                }
-                QTextEdit { background-color: #161616; border: 1px solid #2a2a2a; color: #aaa; }
-                QScrollBar:vertical { background: #0f0f0f; width: 10px; }
-                QScrollBar::handle:vertical { background: #333; border-radius: 5px; }
-            """)
-            self.viewer.set_background_color("#0f0f0f")
-            self.comparison_view.viewer_left.set_background_color("#0f0f0f")
-            self.comparison_view.viewer_right.set_background_color("#0f0f0f")
+            colors = {
+                "bg_main": "#1c1c1c",        # Mica 深色背景模拟
+                "bg_sidebar": "#202020",
+                "bg_card": "#2b2b2b",
+                "bg_hover": "#323232",
+                "bg_pressed": "#2d2d2d",
+                "text_main": "#ffffff",
+                "text_secondary": "#a1a1a1",
+                "accent": "#60cdff",          # Win11 默认蓝色高亮
+                "border": "#3c3c3c",
+                "separator": "#333333"
+            }
         else:
-            # 经典浅色主题
-            self.setStyleSheet("""
-                QMainWindow, QWidget {
-                    background-color: #fcfcfc;
-                    color: #333;
-                    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei";
-                    font-size: 9pt;
-                }
-                QSplitter::handle:vertical { background-color: #ddd; height: 1px; }
-                QSplitter::handle:horizontal { width: 2px; background-color: #eee; }
-                QToolBar {
-                    background-color: #f0f0f0;
-                    border-bottom: 1px solid #ddd;
-                    spacing: 8px;
-                    padding: 4px;
-                }
-                QToolButton {
-                    padding: 6px 12px;
-                    border: 1px solid transparent;
-                    border-radius: 4px;
-                    color: #555;
-                }
-                QToolButton:hover {
-                    background-color: #e5e5e5;
-                    border: 1px solid #ccc;
-                    color: #000;
-                }
-                QLineEdit {
-                    background-color: #fff;
-                    border: 1px solid #ccc;
-                    padding: 8px 12px;
-                    border-radius: 6px;
-                    color: #000;
-                }
-                QListWidget { background-color: #fff; border: 1px solid #eee; }
-                QListWidget::item { padding: 4px 8px; border-radius: 4px; }
-                QListWidget::item:selected {
-                    background-color: #e1f0ff;
-                    border: 1px solid #0078d4;
-                    color: #000;
-                }
-                QListWidget::item:hover { background-color: #f0f0f0; }
-                QStatusBar {
-                    background-color: #f0f0f0;
-                    color: #888;
-                    border-top: 1px solid #ddd;
-                }
-                QTabWidget::pane { border-top: 1px solid #ddd; background-color: #fff; }
-                QTabBar::tab {
-                    background-color: #e5e5e5;
-                    color: #666;
-                    padding: 8px 20px;
-                    border: 1px solid #ddd;
-                    border-bottom: none;
-                }
-                QTabBar::tab:selected {
-                    background-color: #fff;
-                    color: #000;
-                    border-bottom: 2px solid #0078d4;
-                }
-                QGroupBox { 
-                    border: 1px solid #ddd; 
-                    border-radius: 6px;
-                    margin-top: 15px;
-                    padding-top: 15px;
-                    color: #666; 
-                    font-weight: bold; 
-                }
-                QTextEdit { background-color: #fff; border: 1px solid #ddd; color: #333; }
-                QScrollBar:vertical { background: #f5f5f5; width: 10px; }
-                QScrollBar::handle:vertical { background: #ccc; border-radius: 5px; }
-                QScrollBar::handle:vertical:hover { background: #bbb; }
-            """)
-            self.viewer.set_background_color("#fcfcfc")
-            self.comparison_view.viewer_left.set_background_color("#fcfcfc")
-            self.comparison_view.viewer_right.set_background_color("#fcfcfc")
+            colors = {
+                "bg_main": "#f3f3f3",        # Mica 浅色背景模拟
+                "bg_sidebar": "#ebebeb",
+                "bg_card": "#ffffff",
+                "bg_hover": "#f9f9f9",
+                "bg_pressed": "#f0f0f0",
+                "text_main": "#000000",
+                "text_secondary": "#5f5f5f",
+                "accent": "#005a9e",
+                "border": "#d2d2d2",
+                "separator": "#e5e5e5"
+            }
+
+        qss = f"""
+            /* 全局基础设置 */
+            QMainWindow, QWidget {{
+                background-color: {colors['bg_main']};
+                color: {colors['text_main']};
+                font-family: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI";
+                font-size: 10pt;
+            }}
+
+            /* 分隔符 */
+            QSplitter::handle {{
+                background-color: transparent;
+            }}
+            QSplitter::handle:horizontal {{
+                width: 1px;
+                background-color: {colors['separator']};
+            }}
+            QSplitter::handle:vertical {{
+                height: 1px;
+                background-color: {colors['separator']};
+            }}
+
+            /* 工具栏 */
+            QToolBar {{
+                background-color: {colors['bg_main']};
+                border-bottom: 1px solid {colors['separator']};
+                spacing: 4px;
+                padding: 4px 8px;
+            }}
+            QToolButton {{
+                background-color: transparent;
+                border: 1px solid transparent;
+                border-radius: 6px;
+                padding: 6px 10px;
+                color: {colors['text_secondary']};
+            }}
+            QToolButton:hover {{
+                background-color: {colors['bg_hover']};
+                color: {colors['text_main']};
+            }}
+            QToolButton:pressed {{
+                background-color: {colors['bg_pressed']};
+            }}
+            QToolButton:checked {{
+                background-color: {colors['bg_card']};
+                border: 1px solid {colors['border']};
+                color: {colors['accent']};
+            }}
+
+            /* 输入框 */
+            QLineEdit {{
+                background-color: {colors['bg_card']};
+                border: 1px solid {colors['border']};
+                border-bottom: 2px solid {colors['separator']}; /* 底部边框强调 */
+                padding: 8px 12px;
+                border-radius: 6px;
+                color: {colors['text_main']};
+            }}
+            QLineEdit:focus {{
+                border-bottom: 2px solid {colors['accent']};
+                background-color: {colors['bg_hover']};
+            }}
+
+            /* 列表组件 (QListView/QListWidget) */
+            QListView, QListWidget {{
+                background-color: transparent;
+                border: none;
+                outline: none;
+            }}
+            QListView::item {{
+                padding: 10px;
+                border-radius: 8px;
+                margin: 2px 8px;
+                background-color: transparent;
+            }}
+            QListView::item:hover {{
+                background-color: {colors['bg_hover']};
+            }}
+            QListView::item:selected {{
+                background-color: {colors['bg_card']};
+                border: 1px solid {colors['border']};
+                color: {colors['accent']};
+            }}
+
+            /* 下拉框 */
+            QComboBox {{
+                background-color: {colors['bg_card']};
+                border: 1px solid {colors['border']};
+                border-radius: 6px;
+                padding: 4px 10px;
+                min-height: 24px;
+            }}
+            QComboBox:hover {{
+                background-color: {colors['bg_hover']};
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 24px;
+            }}
+
+            /* 状态栏 */
+            QStatusBar {{
+                background-color: {colors['bg_main']};
+                color: {colors['text_secondary']};
+                border-top: 1px solid {colors['separator']};
+                padding: 2px 10px;
+            }}
+
+            /* 滚动条 - Win11 现代风格 */
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 12px;
+                margin: 0px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {colors['border']};
+                min-height: 30px;
+                border-radius: 6px;
+                margin: 2px 3px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: {colors['text_secondary']};
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+
+            /* 选项卡 */
+            QTabWidget::pane {{
+                border: 1px solid {colors['separator']};
+                border-radius: 8px;
+                background-color: {colors['bg_card']};
+            }}
+            QTabBar::tab {{
+                background-color: transparent;
+                padding: 8px 16px;
+                margin: 2px;
+                border-radius: 4px;
+            }}
+            QTabBar::tab:hover {{
+                background-color: {colors['bg_hover']};
+            }}
+            QTabBar::tab:selected {{
+                color: {colors['accent']};
+                font-weight: bold;
+                border-bottom: 2px solid {colors['accent']};
+            }}
+
+            /* 分组框 - 卡片化样式 */
+            QGroupBox {{
+                background-color: {colors['bg_card']};
+                border: 1px solid {colors['border']};
+                border-radius: 8px;
+                margin-top: 24px;
+                padding: 16px;
+                font-weight: bold;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: {colors['text_secondary']};
+            }}
+
+            /* 参数面板特定样式 */
+            QFrame#InfoCard {{
+                background-color: {colors['bg_card']};
+                border: 1px solid {colors['border']};
+                border-radius: 8px;
+            }}
+            QFrame#CardSeparator {{
+                background-color: {colors['separator']};
+                max-height: 1px;
+            }}
+            QLabel#LoraTag {{
+                background-color: {colors['bg_hover']};
+                border: 1px solid {colors['border']};
+                border-radius: 4px;
+                padding: 2px 8px;
+                font-size: 11px;
+                color: {colors['text_secondary']};
+            }}
+            QLabel#LoraTag:hover {{
+                color: {colors['accent']};
+                border-color: {colors['accent']};
+            }}
+            QLabel#FilterHint {{
+                color: {colors['text_secondary']};
+                font-size: 11px;
+                padding: 2px 4px;
+            }}
+            QFrame#TextCard {{
+                background-color: {colors['bg_card']};
+                border: 1px solid {colors['border']};
+                border-radius: 6px;
+            }}
+            
+            /* 幽灵按钮 (透明背景，悬浮显色) */
+            QPushButton#GhostButton {{
+                background-color: transparent;
+                border: none;
+                border-radius: 4px;
+                color: {colors['text_secondary']};
+                font-size: 14px;
+            }}
+            QPushButton#GhostButton:hover {{
+                background-color: {colors['bg_hover']};
+                color: {colors['accent']};
+            }}
+
+            /* 按钮 */
+            QPushButton {{
+                background-color: {colors['bg_card']};
+                border: 1px solid {colors['border']};
+                border-radius: 4px;
+                padding: 4px 12px;
+                color: {colors['text_main']};
+            }}
+            QPushButton:hover {{
+                background-color: {colors['bg_hover']};
+                border: 1px solid {colors['accent']};
+            }}
+            QPushButton:pressed {{
+                background-color: {colors['bg_pressed']};
+            }}
+
+            /* 下拉框修复 */
+            QComboBox {{
+                background-color: {colors['bg_card']};
+                border: 1px solid {colors['border']};
+                border-radius: 4px;
+                padding: 4px 8px;
+                color: {colors['text_main']};
+            }}
+            QComboBox:hover {{
+                border-color: {colors['accent']};
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {colors['bg_card']};
+                border: 1px solid {colors['border']};
+                selection-background-color: {colors['accent']};
+                selection-color: white;
+                outline: none;
+            }}
+        """
+        self.setStyleSheet(qss)
+        
+        # 更新组件背景色
+        bg_viewer = colors['bg_main']
+        self.viewer.set_background_color(bg_viewer)
+        self.comparison_view.viewer_left.set_background_color(bg_viewer)
+        self.comparison_view.viewer_right.set_background_color(bg_viewer)
 
     def on_search_changed(self):
         """搜索文字改变，开启防抖计时"""
@@ -826,6 +919,24 @@ class MainWindow(QMainWindow):
             self.search_loader = SearchThumbnailLoader(results, self.thumb_cache)
             self.search_loader.thumbnail_ready.connect(self._on_search_thumb_ready)
             self.search_loader.start()
+
+    def _on_zoom_changed(self, index):
+        """处理缩放下拉框变化"""
+        data = self.zoom_combo.itemData(index)
+        if not data: return
+        
+        if data == "fit":
+            self.viewer.fit_to_window()
+        elif data == "fill":
+            self.viewer.toggle_fill_mode()
+        else:
+            try:
+                scale_val = float(data)
+                self.viewer.fit_to_original() # 先重置
+                if scale_val != 1.0:
+                    self.viewer.scale(scale_val, scale_val)
+            except ValueError:
+                pass
 
     def _on_search_thumb_ready(self, index, path, thumb):
         """异步补全搜索结果的图标 (Model 版)"""
