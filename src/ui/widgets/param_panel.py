@@ -1,14 +1,18 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QTextEdit, QScrollArea,
                              QFrame, QGridLayout, QHBoxLayout, QPushButton, QApplication, 
                              QSplitter, QGroupBox)
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
+import random
+import copy
 
 class ParameterPanel(QWidget):
     """
     重设计的参数信息面板 - V4.0
     采用卡片化、层次化设计，参考SD WebUI最佳实践
     """
+    remote_gen_requested = pyqtSignal(dict) # 发送修改后的工作流
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         self.layout = QVBoxLayout(self)
@@ -38,10 +42,10 @@ class ParameterPanel(QWidget):
         title_row.addStretch()
         
         btn_copy_all = QPushButton("📋 复制全部")
-        btn_copy_all.setFixedWidth(90)
+        btn_copy_all.setFixedWidth(85)
         btn_copy_all.setStyleSheet("""
             QPushButton {
-                padding: 4px 8px;
+                padding: 4px 6px;
                 border: 1px solid palette(mid);
                 border-radius: 4px;
                 background-color: palette(button);
@@ -50,6 +54,24 @@ class ParameterPanel(QWidget):
         """)
         btn_copy_all.clicked.connect(self._copy_all_params)
         title_row.addWidget(btn_copy_all)
+
+        # 添加远程生成按钮
+        self.btn_remote_gen = QPushButton("🔥 远程生成")
+        self.btn_remote_gen.setFixedWidth(90)
+        self.btn_remote_gen.setStyleSheet("""
+            QPushButton {
+                padding: 4px 6px;
+                border: 1px solid #ff4d00;
+                border-radius: 4px;
+                background-color: #ff4d00;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #ff6a00; border-color: #ff6a00; }
+            QPushButton:disabled { background-color: #444; border-color: #555; color: #888; }
+        """)
+        self.btn_remote_gen.clicked.connect(self._on_remote_gen_click)
+        title_row.addWidget(self.btn_remote_gen)
         info_card_layout.addLayout(title_row)
         
         # 分割线
@@ -111,34 +133,16 @@ class ParameterPanel(QWidget):
         # Prompt 区
         self.prompt_group = self._create_collapsible_group("✨ Prompt", self._copy_prompt)
         self.prompt_edit = QTextEdit()
-        self.prompt_edit.setReadOnly(True)
-        self.prompt_edit.setStyleSheet("""
-            QTextEdit {
-                border: 1px solid palette(mid);
-                border-radius: 4px;
-                padding: 2px;
-                background-color: palette(base);
-                font-family: 'Consolas', 'Monaco', monospace;
-                font-size: 10pt;
-            }
-        """)
+        self.prompt_edit.setReadOnly(False) # 解锁编辑权限，支持回填修改
+        self.prompt_edit.setPlaceholderText("在这里修改提示词...")
         self.prompt_group.layout().addWidget(self.prompt_edit)
         self.main_splitter.addWidget(self.prompt_group)
         
         # Negative Prompt 区
         self.neg_group = self._create_collapsible_group("🚫 Negative Prompt", self._copy_neg_prompt)
         self.neg_prompt_edit = QTextEdit()
-        self.neg_prompt_edit.setReadOnly(True)
-        self.neg_prompt_edit.setStyleSheet("""
-            QTextEdit {
-                border: 1px solid palette(mid);
-                border-radius: 4px;
-                padding: 2px;
-                background-color: palette(base);
-                font-family: 'Consolas', 'Monaco', monospace;
-                font-size: 10pt;
-            }
-        """)
+        self.neg_prompt_edit.setReadOnly(False) # 解锁编辑权限
+        self.neg_prompt_edit.setPlaceholderText("在这里修改反向提示词...")
         self.neg_group.layout().addWidget(self.neg_prompt_edit)
         self.main_splitter.addWidget(self.neg_group)
         
@@ -215,10 +219,17 @@ class ParameterPanel(QWidget):
 
     def update_info(self, meta_data):
         """更新UI - V4.0新版"""
+        self.current_meta = meta_data # 保存当前元数据
         if not meta_data:
             self.clear_info()
+            self.btn_remote_gen.setEnabled(False)
             return
             
+        # 只有 ComfyUI 导出的图片才支持远程生成（因为需要工作流 JSON）
+        has_workflow = 'workflow' in meta_data
+        self.btn_remote_gen.setEnabled(has_workflow)
+        self.btn_remote_gen.setToolTip("通过远程 ComfyUI 重新生成" if has_workflow else "非 ComfyUI 图片，暂不支持远程生成")
+
         params = meta_data.get('params', {})
         tech_info = meta_data.get('tech_info', {})
         loras = meta_data.get('loras', [])
@@ -288,6 +299,69 @@ class ParameterPanel(QWidget):
             
             self.details_layout.addWidget(QLabel("格式:"), row, 0)
             self.details_layout.addWidget(QLabel(tech_info.get('format', '-')), row, 1)
+
+    def _on_remote_gen_click(self):
+        """处理远程生成点击"""
+        if not hasattr(self, 'current_meta') or not self.current_meta:
+            return
+        
+        raw_workflow = self.current_meta.get('workflow')
+        if not raw_workflow:
+            return
+            
+        # 使用深拷贝防止修改内存中的原始元数据副本
+        workflow = copy.deepcopy(raw_workflow)
+            
+        # 智能同步修改后的提示词到工作流 (V5.4 精准透明版)
+        new_prompt = self.prompt_edit.toPlainText().strip()
+        new_neg = self.neg_prompt_edit.toPlainText().strip()
+        
+        pos_node_id = self.current_meta.get('prompt_node_id')
+        neg_node_id = self.current_meta.get('negative_prompt_node_id')
+        
+        print(f"\n[Comfy] --- 准备提交生成任务 ---")
+        
+        # 1. 注入提示词
+        if pos_node_id and pos_node_id in workflow:
+            workflow[pos_node_id]['inputs']['text'] = new_prompt
+            print(f"[Comfy] -> 正向提示词注入节点: {pos_node_id} (CLIPTextEncode)")
+        
+        if neg_node_id and neg_node_id in workflow:
+            workflow[neg_node_id]['inputs']['text'] = new_neg
+            print(f"[Comfy] -> 反向提示词注入节点: {neg_node_id} (CLIPTextEncode)")
+        
+        # 2. 采样器识别与种子随机化 (V5.5 广谱识别)
+        sampler_count = 0
+        for node_id, node in workflow.items():
+            class_type = node.get('class_type', '').lower()
+            # 匹配 KSampler, KSamplerAdvanced 以及其他包含 sampler 的自定义节点
+            if 'sampler' in class_type:
+                inputs = node.get('inputs', {})
+                for seed_key in ['seed', 'noise_seed', 'noise_seed_value']:
+                    if seed_key in inputs:
+                        new_seed = random.randint(1000000000000, 9999999999999) 
+                        inputs[seed_key] = new_seed
+                        print(f"[Comfy] -> 注入随机种子: 节点 {node_id} ({node.get('class_type')}) -> {new_seed}")
+                        sampler_count += 1
+        
+        if sampler_count == 0:
+            print("[Comfy] ! 未在工作流中发现标准采样器节点，将尝试对所有包含 seed 关键字的节点进行注入")
+            for node_id, node in workflow.items():
+                inputs = node.get('inputs', {})
+                for k in inputs.keys():
+                    if 'seed' in k.lower() and isinstance(inputs[k], (int, float)):
+                        new_seed = random.randint(1000000000000, 9999999999999)
+                        inputs[k] = new_seed
+                        print(f"[Comfy] -> 兜底随机化: 节点 {node_id}.{k} -> {new_seed}")
+                        sampler_count += 1
+        
+        if sampler_count == 0:
+            print("[Comfy] ! 最终警告: 工作流中完全未发现任何种子参数，可能会触发服务端缓存")
+
+        print(f"[Comfy] --- 任务数据准备就绪 ---\n")
+        
+        # 发送请求信号
+        self.remote_gen_requested.emit(workflow)
 
     def _clear_lora_tags(self):
         """清空LoRA标签"""

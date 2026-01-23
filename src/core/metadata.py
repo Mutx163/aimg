@@ -122,7 +122,8 @@ class MetadataParser:
         
         try:
             data = json.loads(json_text)
-            prompts = []
+            result['workflow'] = data 
+            prompts = [] 
             
             # 1. 遍历节点寻找提示词和 LoRA
             for node_id, node in data.items():
@@ -142,22 +143,28 @@ class MetadataParser:
                         if k in inputs:
                             result['params'][k] = inputs[k]
 
-                # 提取文本
-                if 'text' in inputs and isinstance(inputs['text'], str):
-                    text = inputs['text'].strip()
-                    if len(text) > 2:
-                        prompts.append(text)
+                # 提取文本节点 (V5.5 增强：排查那些只有单个 word 的 'text'，通常它们是模型名)
+                if class_type == 'cliptextencode':
+                    if 'text' in inputs and isinstance(inputs['text'], str):
+                        text = inputs['text'].strip()
+                        # 如果文本包含逗号或空格，极大概率是提示词；如果只有一个单词且以 .sft/.ckpt 结尾，那一定是模型名
+                        is_model_name = text.endswith(('.safetensors', '.ckpt', '.sft', '.pt'))
+                        if len(text) > 0 and not is_model_name:
+                            prompts.append((node_id, text))
                 elif 'text_l' in inputs or 'text_g' in inputs: # SDXL
                     text = f"{inputs.get('text_l', '')} {inputs.get('text_g', '')}".strip()
                     if len(text) > 2:
-                        prompts.append(text)
+                        prompts.append((node_id, text))
 
-            # 2. 启发式分配提示词
-            # ComfyUI 中通常第一个加载的文本是 Positive，第二个是 Negative
+            # 2. 启发式分配提示词并记录节点 ID (精准回传)
             if prompts:
-                result['prompt'] = prompts[0]
+                # 排序规则：倾向于认为第一个长文本是 Positive
+                prompts.sort(key=lambda x: len(x[1]), reverse=True)
+                result['prompt'] = prompts[0][1]
+                result['prompt_node_id'] = prompts[0][0]
                 if len(prompts) >= 2:
-                    result['negative_prompt'] = prompts[1]
+                    result['negative_prompt'] = prompts[1][1]
+                    result['negative_prompt_node_id'] = prompts[1][0]
                     
         except Exception as e:
             print(f"Error parsing ComfyUI JSON: {e}")

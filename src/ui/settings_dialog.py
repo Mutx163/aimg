@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QComboBox, QCheckBox, QPushButton, QGroupBox, QFormLayout)
+                             QComboBox, QCheckBox, QPushButton, QGroupBox, QFormLayout, QLineEdit)
 from PyQt6.QtCore import Qt, QSettings
 
 class SettingsDialog(QDialog):
@@ -35,6 +35,12 @@ class SettingsDialog(QDialog):
         self.check_del_confirm.setChecked(self.settings.value("confirm_delete", True, type=bool))
         form_layout.addRow("", self.check_del_confirm)
         
+        # ComfyUI 设置
+        self.edit_comfy_addr = QLineEdit()
+        self.edit_comfy_addr.setPlaceholderText("例如: 127.0.0.1:8188")
+        self.edit_comfy_addr.setText(self.settings.value("comfy_address", "127.0.0.1:8188"))
+        form_layout.addRow("ComfyUI 地址:", self.edit_comfy_addr)
+        
         layout.addWidget(group_input)
         
         # 2. 底部按钮
@@ -59,5 +65,6 @@ class SettingsDialog(QDialog):
         self.settings.setValue("wheel_action", wheel_action)
         self.settings.setValue("theme", theme)
         self.settings.setValue("confirm_delete", self.check_del_confirm.isChecked())
+        self.settings.setValue("comfy_address", self.edit_comfy_addr.text().strip())
         
         self.accept()

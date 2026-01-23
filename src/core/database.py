@@ -15,7 +15,7 @@ class DatabaseManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # 图片主表
+        # 1. 图片主表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS images (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,7 +30,7 @@ class DatabaseManager:
                 model_name TEXT,
                 model_hash TEXT,
                 tool TEXT,
-                loras TEXT,
+                loras TEXT, -- 保留 JSON 副本用于兼容
                 tech_info TEXT,
                 raw_metadata TEXT,
                 file_mtime REAL,
@@ -38,21 +38,60 @@ class DatabaseManager:
             )
         ''')
         
-        # 索引，优化搜索
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_prompt ON images(prompt)')
+        # 2. LoRA 关联表 (优化统计和筛选)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS image_loras (
+                image_id INTEGER,
+                lora_name TEXT,
+                weight REAL,
+                FOREIGN KEY(image_id) REFERENCES images(id) ON DELETE CASCADE
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_lora_name ON image_loras(lora_name)')
+
+        # 3. FTS5 全文检索表
+        # 注意：某些环境可能不支持 FTS5，这里做个兜底
+        try:
+            cursor.execute('''
+                CREATE VIRTUAL TABLE IF NOT EXISTS images_fts USING fts5(
+                    prompt, 
+                    file_name,
+                    content='images',
+                    content_rowid='id'
+                )
+            ''')
+            # 建立触发器以保持同步
+            cursor.execute('''
+                CREATE TRIGGER IF NOT EXISTS bu_images_fts AFTER UPDATE ON images BEGIN
+                    INSERT INTO images_fts(images_fts, rowid, prompt, file_name) VALUES('delete', old.id, old.prompt, old.file_name);
+                    INSERT INTO images_fts(rowid, prompt, file_name) VALUES (new.id, new.prompt, new.file_name);
+                END;
+            ''')
+            cursor.execute('''
+                CREATE TRIGGER IF NOT EXISTS bi_images_fts AFTER INSERT ON images BEGIN
+                    INSERT INTO images_fts(rowid, prompt, file_name) VALUES (new.id, new.prompt, new.file_name);
+                END;
+            ''')
+            cursor.execute('''
+                CREATE TRIGGER IF NOT EXISTS bd_images_fts AFTER DELETE ON images BEGIN
+                    INSERT INTO images_fts(images_fts, rowid, prompt, file_name) VALUES('delete', old.id, old.prompt, old.file_name);
+                END;
+            ''')
+        except sqlite3.OperationalError:
+            print("[Warning] SQLite FTS5 extension not available. Falling back to LIKE.")
+
+        # 索引，优化基础搜索
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_path ON images(file_path)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_model_name ON images(model_name)')
         
         conn.commit()
         
-        # 数据库迁移：添加 file_mtime 列（如果不存在）
+        # 属性迁移
         try:
             cursor.execute("SELECT file_mtime FROM images LIMIT 1")
         except sqlite3.OperationalError:
-            # 列不存在，需要添加
-            print("[DB Migration] Adding file_mtime column to existing database...")
             cursor.execute("ALTER TABLE images ADD COLUMN file_mtime REAL DEFAULT 0")
             conn.commit()
-            print("[DB Migration] Migration complete.")
         
         conn.close()
 
@@ -67,7 +106,6 @@ class DatabaseManager:
         tech_info = meta.get('tech_info', {})
         loras = meta.get('loras', [])
         
-        # 获取文件修改时间
         file_mtime = os.path.getmtime(file_path) if os.path.exists(file_path) else 0
         
         try:
@@ -94,6 +132,21 @@ class DatabaseManager:
                 meta.get('raw', ""),
                 file_mtime
             ))
+            
+            # 获取 ID 以更新 LoRA 表
+            img_id = cursor.lastrowid
+            cursor.execute('DELETE FROM image_loras WHERE image_id = ?', (img_id,))
+            for l in loras:
+                # 尝试解析 "LoRA Name (Weight)"
+                name = l.split('(')[0].strip()
+                weight = 1.0
+                if '(' in l:
+                    try:
+                        weight = float(l.split('(')[1].rstrip(')'))
+                    except: pass
+                cursor.execute('INSERT INTO image_loras (image_id, lora_name, weight) VALUES (?, ?, ?)',
+                             (img_id, name, weight))
+                             
             conn.commit()
         except Exception as e:
             print(f"Database insertion error: {e}")
@@ -105,36 +158,49 @@ class DatabaseManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        query = "SELECT file_path FROM images WHERE 1=1"
-        args = []
-        
-        if keyword:
-            query += " AND (prompt LIKE ? OR file_name LIKE ?)"
-            args.extend([f"%{keyword}%", f"%{keyword}%"])
-            
-        if folder_path:
-            query += " AND file_path LIKE ?"
-            args.append(f"{folder_path}%")
-
-        if model:
-            if model == "ALL":
-                pass
-            else:
-                query += " AND model_name = ?"
-                args.append(model)
-        
-        if lora:
-            query += " AND loras LIKE ?"
-            args.append(f'%"{lora}%')
-        
-        # 排序逻辑
+        # 排序逻辑映射
         order_map = {
             "time_desc": "file_mtime DESC",
             "time_asc": "file_mtime ASC",
             "name_asc": "file_name ASC",
             "name_desc": "file_name DESC"
         }
-        query += f" ORDER BY {order_map.get(order_by, 'file_mtime DESC')}"
+        order_sql = order_map.get(order_by, 'file_mtime DESC')
+
+        args = []
+        
+        # 构建主查询，如果使用 LoRA 过滤，则需要 JOIN
+        if lora:
+            query = "SELECT i.file_path FROM images i JOIN image_loras il ON i.id = il.image_id WHERE il.lora_name = ?"
+            args.append(lora)
+        else:
+            query = "SELECT file_path FROM images WHERE 1=1"
+
+        if keyword:
+            # 尝试使用 FTS5
+            try:
+                # 检查 FTS5 表是否存在
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='images_fts'")
+                if cursor.fetchone():
+                    # 使用 FTS5 MATCH，结合子查询
+                    query += f" AND id IN (SELECT rowid FROM images_fts WHERE images_fts MATCH ?)"
+                    args.append(keyword)
+                else:
+                    query += " AND (prompt LIKE ? OR file_name LIKE ?)"
+                    args.extend([f"%{keyword}%", f"%{keyword}%"])
+            except:
+                query += " AND (prompt LIKE ? OR file_name LIKE ?)"
+                args.extend([f"%{keyword}%", f"%{keyword}%"])
+            
+        if folder_path:
+            query += " AND file_path LIKE ?"
+            args.append(f"{folder_path}%")
+
+        if model and model != "ALL":
+            query += " AND model_name = ?"
+            args.append(model)
+        
+        query += f" ORDER BY {order_sql}"
         
         cursor.execute(query, args)
         results = [row[0] for row in cursor.fetchall()]
@@ -157,24 +223,20 @@ class DatabaseManager:
         return results
 
     def get_unique_loras(self, folder_path=None):
-        """获取已索引的所有 LoRA 模型及其计数"""
+        """获取已索引的所有 LoRA 网络及其计数 (极速版)"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        query = "SELECT loras FROM images WHERE loras != '[]'"
-        args = []
-        if folder_path:
-            query += " AND file_path LIKE ?"
-            args.append(f"{folder_path}%")
-        cursor.execute(query, args)
         
-        lora_counts = {}
-        for row in cursor.fetchall():
-            try:
-                loras = json.loads(row[0])
-                for l in loras:
-                    name = l.split('(')[0].strip()
-                    lora_counts[name] = lora_counts.get(name, 0) + 1
-            except: pass
+        query = "SELECT il.lora_name, COUNT(*) as count FROM image_loras il"
+        args = []
+        
+        if folder_path:
+            query += " JOIN images i ON il.image_id = i.id WHERE i.file_path LIKE ?"
+            args.append(f"{folder_path}%")
             
+        query += " GROUP BY il.lora_name ORDER BY count DESC"
+        
+        cursor.execute(query, args)
+        results = cursor.fetchall()
         conn.close()
-        return sorted(lora_counts.items(), key=lambda x: x[1], reverse=True)
+        return results

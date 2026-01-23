@@ -1,5 +1,3 @@
-import os
-import datetime
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QSplitter, QFileDialog, QToolBar, QMessageBox, 
                              QStatusBar, QLineEdit, QLabel, QTabWidget, QStackedWidget, 
@@ -7,6 +5,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 from PyQt6.QtCore import Qt, QSize, QSettings, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QImage
 import time
+import os
 from send2trash import send2trash
 
 from src.core.watcher import FileWatcher
@@ -18,15 +17,18 @@ from src.ui.widgets.param_panel import ParameterPanel
 from src.ui.widgets.model_explorer import ModelExplorer
 from src.ui.widgets.comparison_view import ComparisonView
 from src.core.metadata import MetadataParser
+from src.core.comfy_client import ComfyClient
 from src.ui.settings_dialog import SettingsDialog
+from src.core.cache import ThumbnailCache
 
 class SearchThumbnailLoader(QThread):
-    """专门为搜索结果异步加载缩略图的微型线程 - V3.3 优化版"""
+    """专门为搜索结果异步加载缩略图的微型线程 - V4.1 缓存优化版"""
     thumbnail_ready = pyqtSignal(int, str, QImage)
 
-    def __init__(self, paths):
+    def __init__(self, paths, thumb_cache=None):
         super().__init__()
         self.paths = paths
+        self.thumb_cache = thumb_cache or ThumbnailCache()
         self._is_running = True
 
     def run(self):
@@ -35,11 +37,16 @@ class SearchThumbnailLoader(QThread):
             if not os.path.exists(path): continue
             
             try:
-                img = QImage(path)
-                if not img.isNull():
-                    # 使用 FastTransformation 加快缩放速度
-                    thumb = img.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, 
-                                      Qt.TransformationMode.FastTransformation)
+                # 优先从缓存读取
+                thumb = self.thumb_cache.get_thumbnail(path)
+                if not thumb:
+                    img = QImage(path)
+                    if not img.isNull():
+                        thumb = img.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, 
+                                          Qt.TransformationMode.FastTransformation)
+                        self.thumb_cache.save_thumbnail(path, thumb)
+                
+                if thumb:
                     self.thumbnail_ready.emit(i, path, thumb)
             except Exception as e:
                 print(f"[SearchLoader] Thumb error for {path}: {e}")
@@ -58,8 +65,9 @@ class MainWindow(QMainWindow):
         self.current_model = "ALL"
         self.current_lora = "ALL"
         
-        # 初始化数据库
+        # 初始化数据库与缓存
         self.db_manager = DatabaseManager()
+        self.thumb_cache = ThumbnailCache()
         
         # 核心组件初始化
         self.watcher = FileWatcher()
@@ -76,6 +84,17 @@ class MainWindow(QMainWindow):
         self.setup_ui()
         self.apply_theme()
         
+        # 初始化 ComfyUI 客户端
+        self.comfy_client = ComfyClient(self.settings.value("comfy_address", "127.0.0.1:8188"))
+        self.comfy_client.status_changed.connect(lambda msg: self.statusBar().showMessage(f"[Comfy] {msg}", 3000))
+        self.comfy_client.progress_updated.connect(self._on_comfy_progress)
+        self.comfy_client.connect_server()
+        
+        # 绑定参数面板的远程生成请求
+        self.param_panel.remote_gen_requested.connect(self.on_remote_gen_requested)
+        self.comfy_client.execution_start.connect(self._on_comfy_node_start)
+        self.comfy_client.execution_done.connect(lambda: self.statusBar().showMessage("ComfyUI 生成任务已完成", 5000))
+        
         # 自动加载上次的文件夹
         last_folder = self.settings.value("last_folder")
         if last_folder and os.path.exists(last_folder):
@@ -85,7 +104,25 @@ class MainWindow(QMainWindow):
             # 启动监控
             if self.watcher.start_monitoring(last_folder):
                 self.statusBar().showMessage(f"正在监控(上次位置): {last_folder}")
+
+    def load_folder(self, folder):
+        """扫描文件夹并加载现有图片 (异步)"""
+        self.thumbnail_list.clear_list()
+        self.viewer.clear_view()
+        self.param_panel.clear_info()
+        self.statusBar().showMessage(f"正在加载: {folder}...")
         
+        if hasattr(self, 'loader_thread') and self.loader_thread.isRunning():
+            self.loader_thread.stop()
+            self.loader_thread.wait()
+            
+        from src.core.loader import ImageLoaderThread
+        self.loader_thread = ImageLoaderThread(folder, self.db_manager, self.thumb_cache)
+        self.loader_thread.image_thumb_ready.connect(self._on_loader_image_ready)
+        self.loader_thread.image_found.connect(self._on_loader_image_found)
+        self.loader_thread.finished_loading.connect(self._on_loader_finished)
+        self.loader_thread.start()
+
     def setup_ui(self):
         # 1. 工具栏 - Windows 原生风格
         toolbar = QToolBar("Main Toolbar")
@@ -243,7 +280,7 @@ class MainWindow(QMainWindow):
         # 2. 缩略图图库
         self.thumbnail_list = ThumbnailList()
         self.thumbnail_list.image_selected.connect(self.on_image_selected)
-        self.thumbnail_list.itemSelectionChanged.connect(self.on_selection_changed)
+        self.thumbnail_list.selectionModel().selectionChanged.connect(self.on_selection_changed)
         self.left_splitter.addWidget(self.thumbnail_list)
         
         # 初始权重：筛选占 30%，列表占 70%
@@ -459,6 +496,28 @@ class MainWindow(QMainWindow):
                 self.thumbnail_list.setCurrentRow(0)
                 self.on_image_selected(path)
 
+    def _on_comfy_progress(self, value, max_val):
+        """处理 ComfyUI 进度"""
+        progress = int((value / max_val) * 100) if max_val > 0 else 0
+        # 如果正在采样，显示具体百分号
+        current_msg = self.statusBar().currentMessage()
+        if "正在生成" in current_msg or "采样" in current_msg:
+             self.statusBar().showMessage(f"ComfyUI 正在采样... {progress}%")
+
+    def _on_comfy_node_start(self, node_id, node_type):
+        """当 ComfyUI 开始执行某个节点时"""
+        self.statusBar().showMessage(f"ComfyUI 正在执行: {node_type} (节点 {node_id})")
+        print(f"[Comfy] 正在执行节点: {node_id} ({node_type})")
+
+    def on_remote_gen_requested(self, workflow):
+        """发送远程生成请求"""
+        self.statusBar().showMessage("正在提交生成请求到 ComfyUI...", 3000)
+        prompt_id = self.comfy_client.send_prompt(workflow)
+        if prompt_id:
+            self.statusBar().showMessage(f"请求已提交 (ID: {prompt_id[:8]}...)", 5000)
+        else:
+            QMessageBox.warning(self, "生成失败", "无法提交任务到 ComfyUI，请检查地址和连接状态。")
+
     def on_image_selected(self, path):
         """用户点击缩略图或自动跳转"""
         import time
@@ -489,12 +548,12 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def delete_current_image(self):
-        row = self.thumbnail_list.currentRow()
-        if row < 0:
+        idx = self.thumbnail_list.currentIndex()
+        if not idx.isValid():
             return
             
-        item = self.thumbnail_list.item(row)
-        path = item.data(Qt.ItemDataRole.UserRole)
+        row = idx.row()
+        path = self.thumbnail_list.image_model.get_path(row)
         
         # 确认对话框
         confirm = self.settings.value("confirm_delete", True, type=bool)
@@ -506,8 +565,11 @@ class MainWindow(QMainWindow):
         
         try:
             send2trash(path)
-            # 从列表中移除
-            self.thumbnail_list.takeItem(row)
+            # 从模型中移除
+            self.thumbnail_list.image_model.beginRemoveRows(idx.parent(), row, row)
+            self.thumbnail_list.image_model.image_data.pop(row)
+            self.thumbnail_list.image_model.endRemoveRows()
+            
             self.statusBar().showMessage(f"已删除: {os.path.basename(path)}")
             
             # 自动选中下一张 (如果有)
@@ -516,8 +578,8 @@ class MainWindow(QMainWindow):
                 self.thumbnail_list.setCurrentRow(next_row)
                 
                 # 重新加载新选中的图片
-                next_item = self.thumbnail_list.item(next_row)
-                self.on_image_selected(next_item.data(Qt.ItemDataRole.UserRole))
+                next_path = self.thumbnail_list.image_model.get_path(next_row)
+                self.on_image_selected(next_path)
             else:
                 self.viewer.scene.clear()
                 self.param_panel.clear_info()
@@ -531,8 +593,9 @@ class MainWindow(QMainWindow):
         if count == 0:
             return
             
-        current = self.thumbnail_list.currentRow()
-        # 如果当前没有选中（比如刚启动），默认选第0个
+        current_idx = self.thumbnail_list.currentIndex()
+        current = current_idx.row() if current_idx.isValid() else -1
+        
         if current < 0:
             current = 0
             
@@ -540,15 +603,20 @@ class MainWindow(QMainWindow):
         new_index = current + delta
         if 0 <= new_index < count:
             self.thumbnail_list.setCurrentRow(new_index)
-            item = self.thumbnail_list.item(new_index)
-            self.on_image_selected(item.data(Qt.ItemDataRole.UserRole))
+            path = self.thumbnail_list.image_model.get_path(new_index)
+            self.on_image_selected(path)
         else:
             self.statusBar().showMessage("已经是第一张/最后一张了")
 
     def open_settings(self):
         dlg = SettingsDialog(self)
+        old_addr = self.settings.value("comfy_address", "127.0.0.1:8188")
         if dlg.exec():
             # 重新应用主题以响应设置变化
+            new_addr = self.settings.value("comfy_address", "127.0.0.1:8188")
+            if new_addr != old_addr:
+                self.comfy_client.server_address = new_addr
+                self.comfy_client.connect_server()
             self.apply_theme()
 
     def closeEvent(self, event):
@@ -755,17 +823,13 @@ class MainWindow(QMainWindow):
                 self.search_loader.stop()
                 self.search_loader.wait()
             
-            self.search_loader = SearchThumbnailLoader(results)
+            self.search_loader = SearchThumbnailLoader(results, self.thumb_cache)
             self.search_loader.thumbnail_ready.connect(self._on_search_thumb_ready)
             self.search_loader.start()
 
     def _on_search_thumb_ready(self, index, path, thumb):
-        """异步补全搜索结果的图标"""
-        if index < self.thumbnail_list.count():
-            item = self.thumbnail_list.item(index)
-            if item and item.data(Qt.ItemDataRole.UserRole) == path:
-                from PyQt6.QtGui import QIcon, QPixmap
-                item.setIcon(QIcon(QPixmap.fromImage(thumb)))
+        """异步补全搜索结果的图标 (Model 版)"""
+        self.thumbnail_list.image_model.update_thumbnail(path, thumb)
 
     def _on_sort_changed(self, index):
         """排序方式变更"""
@@ -793,13 +857,13 @@ class MainWindow(QMainWindow):
             self.current_lora = name
             self.perform_search(model=self.current_model, lora=self.current_lora)
 
-    def on_selection_changed(self):
+    def on_selection_changed(self, selected, deselected):
         """当选择项改变时（用于对比模式自动触发）"""
         if hasattr(self, 'action_compare') and self.action_compare.isChecked():
-            items = self.thumbnail_list.selectedItems()
-            if len(items) == 2:
-                p1 = items[0].data(Qt.ItemDataRole.UserRole)
-                p2 = items[1].data(Qt.ItemDataRole.UserRole)
+            indexes = self.thumbnail_list.selectionModel().selectedIndexes()
+            if len(indexes) == 2:
+                p1 = self.thumbnail_list.image_model.get_path(indexes[0].row())
+                p2 = self.thumbnail_list.image_model.get_path(indexes[1].row())
                 self.comparison_view.load_images(p1, p2)
                 if self.view_stack.currentIndex() != 1:
                     self.view_stack.setCurrentIndex(1)
@@ -814,10 +878,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("⚖ 对比模式已开启：请按住 Ctrl/Shift 选中 2 张图片，然后再次点击此按钮或双击。")
             
             # 获取当前选中的图片 (如果有)
-            items = self.thumbnail_list.selectedItems()
-            if len(items) >= 2:
-                p1 = items[0].data(Qt.ItemDataRole.UserRole)
-                p2 = items[1].data(Qt.ItemDataRole.UserRole)
+            indexes = self.thumbnail_list.selectionModel().selectedIndexes()
+            if len(indexes) >= 2:
+                p1 = self.thumbnail_list.image_model.get_path(indexes[0].row())
+                p2 = self.thumbnail_list.image_model.get_path(indexes[1].row())
                 self.comparison_view.load_images(p1, p2)
                 self.view_stack.setCurrentIndex(1)
                 self.statusBar().showMessage(f"正在对比: {os.path.basename(p1)} vs {os.path.basename(p2)}")
