@@ -15,6 +15,11 @@ class ComfyClient(QObject):
     execution_start = pyqtSignal(str, str) # 节点ID, 节点类型/名称
     execution_done = pyqtSignal(str) # 执行完成的图片路径(或ID)
     prompt_submitted = pyqtSignal(str) # 任务提交成功，携带 prompt_id
+    
+    # 队列管理信号
+    queue_updated = pyqtSignal(dict) # 队列状态更新
+    task_cancelled = pyqtSignal(str) # 任务已取消，携带prompt_id
+    queue_cleared = pyqtSignal() # 队列已清空
 
     def __init__(self, server_address="127.0.0.1:8188"):
         super().__init__()

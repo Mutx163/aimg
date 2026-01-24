@@ -276,3 +276,63 @@ class DatabaseManager:
             
         conn.close()
         return results
+    
+    def get_unique_resolutions(self, folder_path: Optional[str] = None) -> List[tuple]:
+        """获取所有使用过的分辨率"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        args = []
+        
+        # 从tech_info JSON中提取分辨率
+        query = """
+            SELECT DISTINCT json_extract(tech_info, '$.resolution') as resolution
+            FROM images
+            WHERE json_extract(tech_info, '$.resolution') IS NOT NULL
+        """
+        
+        if folder_path:
+            norm_folder = folder_path.replace("\\", "/")
+            query += " AND file_path LIKE ?"
+            args.append(f"{norm_folder}%")
+        
+        cursor.execute(query, args)
+        
+        # 解析分辨率字符串"512x768"为(512, 768)元组
+        resolutions = set()
+        for row in cursor.fetchall():
+            res_str = row[0]
+            if res_str and 'x' in res_str:
+                try:
+                    w, h = res_str.split('x')
+                    resolutions.add((int(w.strip()), int(h.strip())))
+                except:
+                    pass
+        
+        conn.close()
+        return sorted(list(resolutions), key=lambda x: (x[0], x[1]))
+    
+    def get_unique_samplers(self, folder_path: Optional[str] = None) -> List[str]:
+        """获取所有使用过的采样器名称"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        args = []
+        
+        # 直接从sampler列读取
+        query = """
+            SELECT DISTINCT sampler
+            FROM images
+            WHERE sampler IS NOT NULL AND sampler != ''
+        """
+        
+        if folder_path:
+            norm_folder = folder_path.replace("\\", "/")
+            query += " AND file_path LIKE ?"
+            args.append(f"{norm_folder}%")
+        
+        cursor.execute(query, args)
+        
+        # 提取采样器名称并排序
+        samplers = [row[0] for row in cursor.fetchall()]
+        
+        conn.close()
+        return sorted(list(set(samplers)))

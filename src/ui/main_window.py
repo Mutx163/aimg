@@ -51,10 +51,27 @@ class MainWindow(QMainWindow):
         
         # 进度条初始化（先创建，稍后在setup_ui中添加到状态栏）
         self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumWidth(200)
+        self.progress_bar.setMaximumWidth(250)
+        self.progress_bar.setMinimumHeight(20)  # 增加高度
         self.progress_bar.setVisible(False)  # 默认隐藏
         self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setFormat("生成中... %p%")
+        # 增强样式，使其更明显
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid palette(mid);
+                border-radius: 5px;
+                text-align: center;
+                font-weight: bold;
+                font-size: 11px;
+                background-color: palette(base);
+            }
+            QProgressBar::chunk {
+                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #ff4d00, stop:1 #ff8800);
+                border-radius: 3px;
+            }
+        """)
         
         # 控制器初始化
         self.search_controller = SearchController(self)
@@ -106,6 +123,12 @@ class MainWindow(QMainWindow):
         if last_folder and os.path.exists(last_folder):
             self.current_folder = last_folder
             self.file_controller.load_folder(last_folder)
+            
+            # 从数据库加载历史分辨率并更新到param_panel
+            self._load_historical_resolutions()
+            
+            # 从数据库加载历史采样器并更新到param_panel
+            self._load_historical_samplers()
             
             # 启动监控
             if self.watcher.start_monitoring(last_folder):
@@ -180,7 +203,7 @@ class MainWindow(QMainWindow):
         
         toolbar.addSeparator()
         action_settings = QAction("⚙ 设置", self)
-        action_settings.triggered.connect(self.show_settings)
+        action_settings.triggered.connect(self.open_settings)
         toolbar.addAction(action_settings)
         
         self.addToolBar(toolbar)
@@ -273,7 +296,8 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         """窗口缩放时尝试消除空白"""
         super().resizeEvent(event)
-        self.auto_adjust_layout()
+        # 禁用自动布局调整，保持固定的splitter比例
+        # self.auto_adjust_layout()
 
     def auto_adjust_layout(self):
         """
@@ -370,6 +394,36 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("✅ ComfyUI 生成完成！", 5000)
         print("[Comfy] 生成任务完成")
 
+    def _load_historical_resolutions(self):
+        """从数据库加载历史分辨率并更新到参数面板"""
+        try:
+            history_res = self.db_manager.get_unique_resolutions(self.current_folder)
+            # 预设分辨率
+            preset_res = [
+                (512, 512), (768, 768), (1024, 1024),
+                (512, 768), (768, 512),
+                (1024, 768), (768, 1024),
+            ]
+            self.param_panel._populate_resolutions(preset_res, history_res)
+            print(f"[UI] 已加载 {len(history_res)} 个历史分辨率")
+        except Exception as e:
+            print(f"[UI] 加载历史分辨率失败: {e}")
+
+    def _load_historical_samplers(self):
+        """从数据库加载历史采样器并更新到参数面板"""
+        try:
+            print(f"[UI] 开始加载历史采样器...")
+            samplers = self.db_manager.get_unique_samplers(self.current_folder)
+            print(f"[UI] 从数据库获取到 {len(samplers)} 个采样器: {samplers}")
+            self.param_panel._populate_samplers(samplers)
+            print(f"[UI] 已加载 {len(samplers)} 个历史采样器")
+        except Exception as e:
+            import traceback
+            print(f"[UI] 加载历史采样器失败: {e}")
+            print(f"[UI] 错误堆栈: {traceback.format_exc()}")
+            # 即使失败也填充默认采样器
+            self.param_panel._populate_samplers([])
+
 
     def on_remote_gen_requested(self, workflow):
         """处理远程生成请求 - 使用当前图片的workflow重新生成"""
@@ -387,8 +441,8 @@ class MainWindow(QMainWindow):
         t0 = time.time()
         
         self.viewer.load_image(path)
-        # 图片改变后，自动调整布局以消除空白
-        self.auto_adjust_layout()
+        # 禁用自动布局调整，保持固定布局
+        # self.auto_adjust_layout()
         
         # 解析并显示参数
         meta = MetadataParser.parse_image(path)
