@@ -458,8 +458,8 @@ class MainWindow(QMainWindow):
         t0 = time.time()
         
         self.viewer.load_image(path)
-        # 禁用自动布局调整，保持固定布局
-        # self.auto_adjust_layout()
+        # 切换图片时，重置手动缩放状态，应用当前的缩放选项
+        self._on_zoom_changed(self.zoom_combo.currentIndex())
         
         # 解析并显示参数
         meta = MetadataParser.parse_image(path)
