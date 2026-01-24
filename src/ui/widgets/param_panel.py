@@ -44,25 +44,23 @@ class ParameterPanel(QWidget):
         btn_copy_all.clicked.connect(self._copy_all_params)
         title_row.addWidget(btn_copy_all)
         
-        # 添加远程生成按钮
-        self.btn_remote_gen = QPushButton("🔥 远程生成")
-        self.btn_remote_gen.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_remote_gen.setMinimumWidth(90)
-        self.btn_remote_gen.setObjectName("RemoteGenButton")
-        # 保持远程生成的特殊颜色，但调整为 Fluent 风格
-        self.btn_remote_gen.setStyleSheet("""
-            QPushButton#RemoteGenButton {
-                background-color: #ff4d00;
-                color: white;
-                border: none;
+        # 添加“调用到工作区”按钮 (替代之前的生成按钮)
+        self.btn_apply_workspace = QPushButton("📥 调用进生成区")
+        self.btn_apply_workspace.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_apply_workspace.setMinimumWidth(110)
+        self.btn_apply_workspace.setObjectName("ApplyWorkspaceButton")
+        self.btn_apply_workspace.setStyleSheet("""
+            QPushButton#ApplyWorkspaceButton {
+                background-color: palette(button);
+                border: 1px solid palette(highlight);
+                color: palette(text);
                 font-weight: bold;
+                padding: 4px 8px;
             }
-            QPushButton#RemoteGenButton:hover { background-color: #ff6a00; }
-            QPushButton#RemoteGenButton:pressed { background-color: #e64500; }
-            QPushButton#RemoteGenButton:disabled { background-color: #444; color: #888; }
+            QPushButton#ApplyWorkspaceButton:hover { background-color: palette(highlight); color: white; }
         """)
-        self.btn_remote_gen.clicked.connect(self._on_remote_gen_click)
-        title_row.addWidget(self.btn_remote_gen)
+        self.btn_apply_workspace.clicked.connect(self.apply_to_workspace)
+        title_row.addWidget(self.btn_apply_workspace)
         # 强制垂直居中对齐，修复按钮高低不平的问题
         title_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         title_row.setContentsMargins(0, 0, 0, 0)
@@ -149,16 +147,106 @@ class ParameterPanel(QWidget):
         self.info_prompt_val.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
         self.info_neg_val.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
 
-        # 更多细节网格 (文件大小等)
+        # 更多细节网格 (预创建坑位，避免跳动)
         self.details_layout = QGridLayout()
         self.details_layout.setVerticalSpacing(4)
         self.details_layout.setHorizontalSpacing(20)
+        
+        self.detail_widgets = {} # {key: (label_widget, value_widget)}
+        detail_keys = [("文件大小", "file_size"), ("格式", "format"), 
+                       ("Scheduler", "scheduler"), ("Denoise", "denoise"), 
+                       ("Model hash", "model_hash")]
+        
+        for i, (label_text, key) in enumerate(detail_keys):
+            row = i // 2
+            col = (i % 2) * 2
+            lbl = QLabel(f"{label_text}:")
+            lbl.setStyleSheet(self._label_style)
+            lbl.setFixedWidth(self._fixed_label_width)
+            val = QLabel("-")
+            val.setStyleSheet(self._value_style)
+            self.details_layout.addWidget(lbl, row, col)
+            self.details_layout.addWidget(val, row, col + 1)
+            self.detail_widgets[key] = val
+            
         info_card_layout.addLayout(self.details_layout)
         
+        # 锁定卡片最小高度，防止切换时的视觉剧烈振荡
+        self.info_card.setMinimumHeight(320)
         self.layout.addWidget(self.info_card)
         
         # ========== 2. 底部专用生成设置区域 (可编辑工作区) ==========
         self._setup_generation_settings(self.layout)
+
+    def _populate_resolutions(self, preset_res, history_res):
+        """填充分辨率下拉框（预设+历史，去重）"""
+        # 记录当前选中内容，以便刷新后恢复
+        current_res = self.resolution_combo.currentData()
+        
+        # 合并并去重
+        all_res = set(preset_res + history_res)
+        # 排序：先按宽度，再按高度
+        sorted_res = sorted(list(all_res), key=lambda x: (x[0], x[1]))
+        
+        self.resolution_combo.clear()
+        for w, h in sorted_res:
+            # 判断横竖图
+            if w == h:
+                label = f"{w} × {h} (方图)"
+            elif w < h:
+                label = f"{w} × {h} (竖图)"
+            else:
+                label = f"{w} × {h} (横图)"
+            
+            self.resolution_combo.addItem(label, (w, h))
+        
+        # 恢复之前的选择，如果没有选择，则默认选择512x768
+        target_res = current_res if current_res else (512, 768)
+        
+        found = False
+        for i in range(self.resolution_combo.count()):
+            res_data = self.resolution_combo.itemData(i)
+            if res_data == target_res:
+                self.resolution_combo.setCurrentIndex(i)
+                found = True
+                break
+        
+        # 如果既没恢复成功也没默认成功，且列表不为空，选第一个
+        if not found and self.resolution_combo.count() > 0:
+            self.resolution_combo.setCurrentIndex(0)
+
+    def _populate_samplers(self, samplers: List[str]):
+        """填充采样器下拉框"""
+        print(f"[UI] _populate_samplers被调用，采样器列表: {samplers}")
+        
+        # 记录当前选中
+        current_sampler = self.sampler_combo.currentText()
+        self.sampler_combo.clear()
+        
+        if samplers:
+            for sampler in samplers:
+                self.sampler_combo.addItem(sampler)
+                print(f"[UI] 添加采样器: {sampler}")
+        else:
+            # 如果没有历史记录，添加一些常用采样器
+            default_samplers = ["euler", "euler_ancestral", "dpmpp_2m", "dpmpp_sde"]
+            print(f"[UI] 没有历史采样器，使用默认列表: {default_samplers}")
+            for sampler in default_samplers:
+                self.sampler_combo.addItem(sampler)
+        
+        # 优先恢复之前的选择
+        if current_sampler:
+            index = self.sampler_combo.findText(current_sampler)
+            if index >= 0:
+                self.sampler_combo.setCurrentIndex(index)
+                return
+
+        # 默认选择第一个
+        if self.sampler_combo.count() > 0:
+            self.sampler_combo.setCurrentIndex(0)
+            print(f"[UI] 采样器下拉框已填充，共 {self.sampler_combo.count()} 项")
+        else:
+            print(f"[UI] 警告：采样器下拉框为空！")
 
     def _setup_generation_settings(self, parent_layout):
         """设置生成参数编辑面板（专用工作区）"""
@@ -393,57 +481,31 @@ class ParameterPanel(QWidget):
         
         outer_layout.addWidget(self.gen_settings_container)
         
+        # --- 3. 底部生成按钮 (从上方移动到这里) ---
+        self.btn_remote_gen = QPushButton("🔥 开始远程生成")
+        self.btn_remote_gen.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_remote_gen.setMinimumHeight(40)
+        self.btn_remote_gen.setObjectName("RemoteGenButton")
+        self.btn_remote_gen.setStyleSheet("""
+            QPushButton#RemoteGenButton {
+                background-color: #ff4d00;
+                color: white;
+                border: none;
+                font-weight: bold;
+                font-size: 14px;
+                border-radius: 6px;
+                margin-top: 5px;
+            }
+            QPushButton#RemoteGenButton:hover { background-color: #ff6a00; }
+            QPushButton#RemoteGenButton:pressed { background-color: #e64500; }
+            QPushButton#RemoteGenButton:disabled { background-color: #444; color: #888; }
+        """)
+        self.btn_remote_gen.clicked.connect(self._on_remote_gen_click)
+        outer_layout.addWidget(self.btn_remote_gen)
+        
         # 将整个外层容器添加到父布局
         parent_layout.addWidget(gen_settings_outer)
     
-    def _populate_resolutions(self, preset_res, history_res):
-        """填充分辨率下拉框（预设+历史，去重）"""
-        # 合并并去重
-        all_res = set(preset_res + history_res)
-        # 排序：先按宽度，再按高度
-        sorted_res = sorted(list(all_res), key=lambda x: (x[0], x[1]))
-        
-        self.resolution_combo.clear()
-        for w, h in sorted_res:
-            # 判断横竖图
-            if w == h:
-                label = f"{w} × {h} (方图)"
-            elif w < h:
-                label = f"{w} × {h} (竖图)"
-            else:
-                label = f"{w} × {h} (横图)"
-            
-            self.resolution_combo.addItem(label, (w, h))
-        
-        # 默认选择512x768
-        for i in range(self.resolution_combo.count()):
-            res_data = self.resolution_combo.itemData(i)
-            if res_data == (512, 768):
-                self.resolution_combo.setCurrentIndex(i)
-                break
-
-    def _populate_samplers(self, samplers: List[str]):
-        """填充采样器下拉框"""
-        print(f"[UI] _populate_samplers被调用，采样器列表: {samplers}")
-        self.sampler_combo.clear()
-        
-        if samplers:
-            for sampler in samplers:
-                self.sampler_combo.addItem(sampler)
-                print(f"[UI] 添加采样器: {sampler}")
-        else:
-            # 如果没有历史记录，添加一些常用采样器
-            default_samplers = ["euler", "euler_ancestral", "dpmpp_2m", "dpmpp_sde"]
-            print(f"[UI] 没有历史采样器，使用默认列表: {default_samplers}")
-            for sampler in default_samplers:
-                self.sampler_combo.addItem(sampler)
-        
-        # 默认选择第一个
-        if self.sampler_combo.count() > 0:
-            self.sampler_combo.setCurrentIndex(0)
-            print(f"[UI] 采样器下拉框已填充，共 {self.sampler_combo.count()} 项")
-        else:
-            print(f"[UI] 警告：采样器下拉框为空！")
     
     def _add_lora_item(self, name: str = "", weight: float = 1.0):
         """添加一个LoRA项到列表（下拉框模式）"""
@@ -745,11 +807,13 @@ class ParameterPanel(QWidget):
         self.current_meta = meta_data # 保存当前元数据
         if not meta_data:
             self.clear_info()
+            self.btn_apply_workspace.setEnabled(False)
             self.btn_remote_gen.setEnabled(False)
             return
             
-        # 只有 ComfyUI 导出的图片才支持远程生成（因为需要工作流 JSON）
+        # 只有 ComfyUI 导出的图片才支持调用和生成
         has_workflow = 'workflow' in meta_data
+        self.btn_apply_workspace.setEnabled(has_workflow)
         self.btn_remote_gen.setEnabled(has_workflow)
         self.btn_remote_gen.setToolTip("通过远程 ComfyUI 重新生成" if has_workflow else "非 ComfyUI 图片，暂不支持远程生成")
         
@@ -808,146 +872,94 @@ class ParameterPanel(QWidget):
         self.info_prompt_val.setPlainText(prompt_text)
         self.info_neg_val.setPlainText(neg_text)
         
-        # --- 填充底部编辑区 (默认使用图片原始值) ---
-        self.prompt_edit.setPlainText(prompt_text)
-        self.neg_prompt_edit.setPlainText(neg_text)
+        # --- 注意：解开关联，update_info 不再自动改动编辑区 ---
+        # 只有调用 apply_to_workspace 时才会同步到编辑区
 
-        # 更新更多细节 (分两列排列)
-        self._clear_layout(self.details_layout)
+        # 更新详细信息 (只更新文字，不重建布局)
+        def update_detail(key, value):
+            if key in self.detail_widgets:
+                self.detail_widgets[key].setText(str(value) if value else "-")
+
+        update_detail("scheduler", params.get('Scheduler'))
+        update_detail("denoise", params.get('Denoise'))
+        update_detail("model_hash", params.get('Model hash'))
         
-        detail_items = []
-        # 其他生成参数
-        detail_keys = ['Scheduler', 'Denoise', 'Model hash']
-        for key in detail_keys:
-            if key in params:
-                detail_items.append((key, str(params[key])))
-        
-        # 文件信息也加入列表
         if tech_info:
-            detail_items.append(("文件大小", tech_info.get('file_size', '-')))
-            detail_items.append(("格式", tech_info.get('format', '-')))
-            
-        # 填充到网格中 (每行两组标签-值对)
-        for i, (key, value) in enumerate(detail_items):
-            row = i // 2
-            col = (i % 2) * 2
-            
-            lbl = QLabel(f"{key}:")
-            lbl.setStyleSheet(self._label_style)
-            lbl.setFixedWidth(self._fixed_label_width) # 确保即使是底部细节也完美对齐
-            val = QLabel(value)
-            val.setStyleSheet(self._value_style)
-            
-            self.details_layout.addWidget(lbl, row, col)
-            self.details_layout.addWidget(val, row, col + 1)
+            update_detail("file_size", tech_info.get('file_size'))
+            update_detail("format", tech_info.get('format'))
+        else:
+            for k in ["file_size", "format"]: update_detail(k, None)
         
-        # ========== 填充生成设置控件 ==========
-        # Seed - 保存并显示
+        # 采样器（需要先from数据库加载列表，暂时只设置文本）
+        # TODO: 从数据库加载采样器列表
+
+    def apply_to_workspace(self):
+        """将当前图片参数显式调用到生成工作区"""
+        if not hasattr(self, 'current_meta') or not self.current_meta:
+            self._temp_notify("⚠️ 未选中有效图片")
+            return
+            
+        meta_data = self.current_meta
+        params = meta_data.get('params', {})
+        tech_info = meta_data.get('tech_info', {})
+        loras = meta_data.get('loras', [])
+        
+        # 1. 提示词
+        self.prompt_edit.setPlainText(meta_data.get('prompt', ''))
+        self.neg_prompt_edit.setPlainText(meta_data.get('negative_prompt', ''))
+        
+        # 2. Seed
+        seed = params.get('Seed', params.get('seed', '-'))
         if seed != '-':
             self.last_image_seed = seed
             self.seed_input.setText(str(seed))
-        else:
-            # 图片没有seed信息，设为随机并清空/显示0
-            if not self.seed_random_checkbox.isChecked():
-                self.seed_random_checkbox.setChecked(True)
-            self.seed_input.setText("0")
+            # 自动切换为固定模式，方便用户微调
+            self.seed_random_checkbox.setChecked(False)
         
-        # 分辨率
+        # 3. 分辨率
+        resolution = tech_info.get('resolution', '-')
         if resolution != '-' and 'x' in str(resolution):
             try:
                 w, h = str(resolution).split('x')
-                width = int(w.strip())
-                height = int(h.strip())
-                
-                # 在下拉框中查找匹配项
-                found = False
+                width, height = int(w.strip()), int(h.strip())
                 for i in range(self.resolution_combo.count()):
                     res_data = self.resolution_combo.itemData(i)
                     if res_data and res_data[0] == width and res_data[1] == height:
                         self.resolution_combo.setCurrentIndex(i)
-                        found = True
                         break
-                
-                # 如果没找到，选择最接近的或默认值
-                if not found:
-                    self.resolution_combo.setCurrentIndex(3)  # 默认512x768
-            except:
-                pass
+            except: pass
+            
+        # 4. Steps & CFG
+        try:
+            steps = params.get('Steps', params.get('steps'))
+            if steps: self.steps_value.setValue(int(steps))
+            cfg = params.get('CFG scale', params.get('cfg'))
+            if cfg: self.cfg_value.setValue(float(cfg))
+        except: pass
         
-        # Steps
-        if steps != '-':
-            try:
-                self.steps_value.setValue(int(steps))
-            except:
-                pass
-        
-        # CFG
-        if cfg != '-':
-            try:
-                self.cfg_value.setValue(float(cfg))
-            except:
-                pass
-        
-        # 采样器
-        if sampler != '-':
-            # 在下拉框中查找匹配项
+        # 5. Sampler
+        sampler = params.get('Sampler', params.get('sampler_name'))
+        if sampler:
             for i in range(self.sampler_combo.count()):
                 if self.sampler_combo.itemText(i) == sampler:
                     self.sampler_combo.setCurrentIndex(i)
                     break
-        
-        # LoRA列表
+                    
+        # 6. LoRAs
         self._clear_lora_list()
-        if loras and isinstance(loras, list):
-            for lora_info in loras:
-                if isinstance(lora_info, dict):
-                    lora_name = lora_info.get('name', '')
-                    lora_weight = lora_info.get('weight', 1.0)
-                    
-                    if lora_name:
-                        # 清理名称并提取权重
-                        # 格式1: "yyyy_000002250.safetensors (0.85)"
-                        # 格式2: "yyyy_000002250.safetensors"
-                        clean_name = lora_name
-                        extracted_weight = None
-                        
-                        if '(' in lora_name and ')' in lora_name:
-                            # 提取括号中的权重
-                            try:
-                                parts = lora_name.split('(')
-                                clean_name = parts[0].strip()
-                                weight_str = parts[1].split(')')[0].strip()
-                                extracted_weight = float(weight_str)
-                            except:
-                                clean_name = lora_name.split('(')[0].strip()
-                        
-                        # 优先使用从名称提取的权重，其次使用weight字段
-                        final_weight = extracted_weight if extracted_weight is not None else float(lora_weight)
-                        
-                        self._add_lora_item(clean_name, final_weight)
-                        print(f"[UI] LoRA填充: {clean_name} = {final_weight}")
-                        
-                elif isinstance(lora_info, str):
-                    # 字符串格式，也需要清理和提取权重
-                    clean_name = lora_info
-                    extracted_weight = 1.0
-                    
-                    if '(' in lora_info and ')' in lora_info:
-                        try:
-                            parts = lora_info.split('(')
-                            clean_name = parts[0].strip()
-                            weight_str = parts[1].split(')')[0].strip()
-                            extracted_weight = float(weight_str)
-                        except:
-                            clean_name = lora_info.split('(')[0].strip()
-                    
-                    self._add_lora_item(clean_name, extracted_weight)
-                    print(f"[UI] LoRA填充(字符串): {clean_name} = {extracted_weight}")
-                    
-            print(f"[UI] 已加载图片的 {len(loras)} 个LoRA")
+        for lora in loras:
+            name, weight = "", 1.0
+            if isinstance(lora, dict):
+                name = lora.get('name', '')
+                weight = lora.get('weight', 1.0)
+            elif isinstance(lora, str):
+                name = lora
+            if name:
+                # 简单清理名称（移除括号权重）
+                clean_name = name.split('(')[0].strip()
+                self._add_lora_item(clean_name, float(weight))
         
-        # 采样器（需要先from数据库加载列表，暂时只设置文本）
-        # TODO: 从数据库加载采样器列表
+        self._temp_notify("✨ 已成功调用参数到工作区")
 
     def _on_remote_gen_click(self):
         """处理远程生成点击"""
@@ -1123,16 +1135,13 @@ class ParameterPanel(QWidget):
         self.cfg_label.setText("-")
         self.sampler_label.setText("-")
         
-        # 清除新版顶部信息项
-        if hasattr(self, 'info_lora_val'): self.info_lora_val.setText("-")
-        if hasattr(self, 'info_prompt_val'): self.info_prompt_val.clear()
-        if hasattr(self, 'info_neg_val'): self.info_neg_val.clear()
+        # 清除详情区文字（不再清除布局）
+        for val_widget in self.detail_widgets.values():
+            val_widget.setText("-")
         
-        self._clear_layout(self.details_layout)
-        
-        # 清除生成工作区
-        self.prompt_edit.clear()
-        self.neg_prompt_edit.clear()
+        # 生成工作区现在是独立的，不随图片清空而清空
+        # self.prompt_edit.clear()
+        # self.neg_prompt_edit.clear()
     def eventFilter(self, source, event):
         """实现点击复制逻辑"""
         from PyQt6.QtCore import QEvent

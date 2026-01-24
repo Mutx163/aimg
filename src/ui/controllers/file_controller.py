@@ -53,9 +53,10 @@ class FileController(QObject):
         self.main.thumbnail_list.add_image(path)
         
     def _on_loader_finished(self):
-        self.main.statusBar().showMessage("文件夹加载完成")
         # 刷新模型浏览器数据
         self.refresh_model_explorer()
+        # 刷新历史参数 (分辨率/采样器)
+        self.main.refresh_historical_params()
         # 尝试自动选中已有的第一张（如果列表不为空）
         if self.main.thumbnail_list.count() > 0:
              pass
@@ -141,6 +142,8 @@ class FileController(QObject):
                 
                 # 刷新模型浏览器，确保新生成图片使用的 Model/LoRA 逻辑立即可用
                 self.refresh_model_explorer()
+                # 刷新历史参数，确保新分辨率/采样器立即可见
+                self.main.refresh_historical_params()
                 
                 # 自动查看最新的
                 self.main.on_image_selected(path)

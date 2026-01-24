@@ -441,6 +441,12 @@ class MainWindow(QMainWindow):
             # 即使失败也填充默认采样器
             self.param_panel._populate_samplers([])
 
+    def refresh_historical_params(self):
+        """刷新历史分辨率和采样器列表"""
+        if self.current_folder:
+            self._load_historical_resolutions()
+            self._load_historical_samplers()
+
 
     def on_remote_gen_requested(self, workflow):
         """处理远程生成请求 - 使用当前图片的workflow重新生成"""

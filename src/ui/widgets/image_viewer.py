@@ -1,6 +1,6 @@
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QPixmap, QWheelEvent, QColor, QBrush
+from PyQt6.QtGui import QPixmap, QWheelEvent, QColor, QBrush, QPainter
 
 class ImageViewer(QGraphicsView):
     """
@@ -27,7 +27,12 @@ class ImageViewer(QGraphicsView):
         self.viewport().setContentsMargins(0, 0, 0, 0)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setOptimizationFlags(QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing)
+        
         self.pixmap_item = QGraphicsPixmapItem()
+        self.pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self.scene.addItem(self.pixmap_item)
         
         self._zoom_factor = 1.15
@@ -69,6 +74,7 @@ class ImageViewer(QGraphicsView):
             self.pixmap_item.isVisible()
         except RuntimeError:
             self.pixmap_item = QGraphicsPixmapItem()
+            self.pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
             self.scene.addItem(self.pixmap_item)
 
         pixmap = QPixmap(file_path)
