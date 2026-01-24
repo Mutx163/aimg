@@ -130,9 +130,17 @@ class FileController(QObject):
                 thumb = img.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, 
                                   Qt.TransformationMode.FastTransformation)
                 # print(f"[新图片] 缩略图生成成功: {thumb.size()}")
+                # 立即将图片存入数据库，防止重置或搜索时由于未入库而消失
+                from src.core.metadata import MetadataParser
+                meta = MetadataParser.parse_image(path)
+                if meta:
+                    self.main.db_manager.add_image(path, meta)
+                
                 self.main.thumbnail_list.add_image(path, index=0, thumbnail=thumb)
                 self.main.thumbnail_list.setCurrentRow(0) # 明确选中第一张图片，确保高亮同步
-                # print(f"[新图片] 已添加到列表（带缩略图）并选中")
+                
+                # 刷新模型浏览器，确保新生成图片使用的 Model/LoRA 逻辑立即可用
+                self.refresh_model_explorer()
                 
                 # 自动查看最新的
                 self.main.on_image_selected(path)

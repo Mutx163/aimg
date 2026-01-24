@@ -3,7 +3,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QSplitter, QFileDialog, QToolBar, QMessageBox, 
                              QStatusBar, QLineEdit, QLabel, QTabWidget, QStackedWidget, 
                              QFrame, QComboBox, QPushButton, QAbstractSpinBox, QTextEdit, QApplication,
-                             QProgressBar)
+                             QProgressBar, QSizePolicy)
 from PyQt6.QtCore import Qt, QSize, QSettings, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QImage
 import time
@@ -48,30 +48,6 @@ class MainWindow(QMainWindow):
         # 核心组件初始化
         self.watcher = FileWatcher()
         self.current_sort_by = self.settings.value("sort_by", "time_desc")
-        
-        # 进度条初始化（先创建，稍后在setup_ui中添加到状态栏）
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumWidth(250)
-        self.progress_bar.setMinimumHeight(20)  # 增加高度
-        self.progress_bar.setVisible(False)  # 默认隐藏
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFormat("生成中... %p%")
-        # 增强样式，使其更明显
-        self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: 2px solid palette(mid);
-                border-radius: 5px;
-                text-align: center;
-                font-weight: bold;
-                font-size: 11px;
-                background-color: palette(base);
-            }
-            QProgressBar::chunk {
-                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #ff4d00, stop:1 #ff8800);
-                border-radius: 3px;
-            }
-        """)
         
         # 控制器初始化
         self.search_controller = SearchController(self)
@@ -208,35 +184,109 @@ class MainWindow(QMainWindow):
         
         self.addToolBar(toolbar)
         
-        # 5. 状态栏（添加进度条）
+        # 5. 状态栏 (终极一体化功能区 - 物理锁定在最右侧)
         status_bar = self.statusBar()
-        status_bar.addPermanentWidget(self.progress_bar)  # 添加到右侧固定位置
+        
+        # 强制清理状态栏，防止有幽灵控件残留
+        for child in status_bar.findChildren(QWidget):
+            status_bar.removeWidget(child)
+            
+        # 创建一个坚实的原子容器（这就是右侧唯一的盒子）
+        self.right_status_box = QFrame()
+        self.right_status_box.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        box_lay = QHBoxLayout(self.right_status_box)
+        box_lay.setContentsMargins(0, 0, 5, 0) # 右侧留一点缝隙
+        box_lay.setSpacing(4) # 再次缩小间距，确保紧凑
+        # 移除 box_lay.addStretch()，依靠 addPermanentWidget 自动靠右
+        
+        # --- 进度组 (容器内并排放置 Bar 和 取消按钮) ---
+        from PyQt6.QtWidgets import QGridLayout
+        self.progress_container = QWidget()
+        self.progress_container.setVisible(False)
+        self.progress_container.setFixedWidth(200) # 回归 200px 宽度
+        prog_lay = QGridLayout(self.progress_container) # 回归叠加布局
+        prog_lay.setContentsMargins(0, 0, 0, 0)
+        prog_lay.setSpacing(0)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedHeight(18)
+        self.progress_bar.setFixedWidth(200) 
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter) 
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid palette(mid);
+                border-radius: 4px;
+                text-align: center;
+                background-color: palette(alternate-base);
+                color: #000000; 
+                font-weight: bold;
+                font-size: 10px;
+            }
+            QProgressBar::chunk {
+                background-color: #ff4d00;
+                border-radius: 3px;
+            }
+        """)
+        prog_lay.addWidget(self.progress_bar, 0, 0)
+        
+        self.interrupt_btn = QPushButton("✕")
+        self.interrupt_btn.setFixedWidth(24) 
+        self.interrupt_btn.setFixedHeight(18)
+        self.interrupt_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.interrupt_btn.clicked.connect(lambda: self.comfy_client.interrupt_current())
+        self.interrupt_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: none;
+                color: #000000; /* 高对比度纯黑，无背景方块 */
+                font-weight: 900;
+                font-size: 13px;
+                text-align: center;
+                padding-right: 5px;
+            }
+            QPushButton:hover { color: #ff4d00; }
+        """)
+        prog_lay.addWidget(self.interrupt_btn, 0, 0, Qt.AlignmentFlag.AlignRight)
+        self.interrupt_btn.raise_()
+        
+        box_lay.addWidget(self.progress_container)
+        
+        # --- 队列按钮 ---
+        self.queue_btn = QPushButton("📋 队列")
+        self.queue_btn.setFixedWidth(85) # 恢复到较窄的宽度，平衡审美与可见性
+        self.queue_btn.setFixedHeight(22)
+        self.queue_btn.clicked.connect(self._show_queue_dialog)
+        box_lay.addWidget(self.queue_btn)
+        
+        # 将整个容器作为一个原子级的 PermanentWidget 添加到右侧
+        status_bar.addPermanentWidget(self.right_status_box)
+
+        # 6. 中央分割器设置 (恢复被意外删除的部分)
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setHandleWidth(2) # 细分割线
         self.splitter.setChildrenCollapsible(False) # 禁止折叠
-        self.splitter.setFocusPolicy(Qt.FocusPolicy.NoFocus) # 禁止获得焦点，防止方向键调整大小
+        self.splitter.setFocusPolicy(Qt.FocusPolicy.NoFocus) # 禁止获得焦点
         self.setCentralWidget(self.splitter)
         
         # 左侧列表面板 (增加搜索框)
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
-        # 极致压缩边距，让空间更多留给图片列表
         left_layout.setContentsMargins(8, 8, 8, 0)
         left_layout.setSpacing(6)
         
         # 搜索栏 + 重置按钮
         search_layout = QHBoxLayout()
-        search_layout.setSpacing(4) # 搜索栏内部紧凑
+        search_layout.setSpacing(4)
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("🔍 搜索提示词/模型/文件名...")
         self.search_bar.textChanged.connect(self.search_controller.on_search_changed)
         search_layout.addWidget(self.search_bar)
         
-        btn_reset = QPushButton("Reset") # 改为英文防止乱码
+        btn_reset = QPushButton("Reset")
         btn_reset.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_reset.setToolTip("Reset Filters")
         btn_reset.setObjectName("GhostButton")
-        # 增加宽度防止文字 "Reset" 被截断
         btn_reset.setMinimumWidth(60)
         btn_reset.clicked.connect(self.search_controller.reset_filters)
         search_layout.addWidget(btn_reset)
@@ -245,30 +295,27 @@ class MainWindow(QMainWindow):
         
         # 使用 QSplitter 整合“筛选区”和“图库列表”
         self.left_splitter = QSplitter(Qt.Orientation.Vertical)
-        # 允许筛选区尽可能压扁
         self.left_splitter.setHandleWidth(2)
         
-        # 1. 模型筛选器
+        # 模型筛选器
         self.model_explorer = ModelExplorer()
         self.model_explorer.filter_requested.connect(self.search_controller.on_filter_requested)
         self.left_splitter.addWidget(self.model_explorer)
         
-        # 2. 缩略图图库
+        # 缩略图图库
         self.thumbnail_list = ThumbnailList()
         self.thumbnail_list.image_selected.connect(self.on_image_selected)
         self.left_splitter.addWidget(self.thumbnail_list)
         
-        # 初始权重：筛选占 20%，列表占 80% (列表更重要)
         self.left_splitter.setStretchFactor(0, 2)
         self.left_splitter.setStretchFactor(1, 8)
         
         left_layout.addWidget(self.left_splitter)
-        
         self.splitter.addWidget(left_widget)
         
         # 中间：主展示区 (使用 Stack 进行单图/对比切换)
         self.view_stack = QStackedWidget()
-        self.view_stack.setContentsMargins(0, 0, 0, 0) # 消除 Stack 内部边距
+        self.view_stack.setContentsMargins(0, 0, 0, 0)
         
         self.viewer = ImageViewer()
         self.viewer.navigate_request.connect(self.navigate_image)
@@ -283,14 +330,12 @@ class MainWindow(QMainWindow):
         
         # 右侧：参数面板
         self.param_panel = ParameterPanel()
-        self.param_panel.setMinimumWidth(380) # 强制最小宽度，防止内容被压缩
+        self.param_panel.setMinimumWidth(380)
         self.param_panel.setMaximumWidth(600)
         self.splitter.addWidget(self.param_panel)
         
-        # 设置 Splitter 初始比例 (仅当没有保存的状态时应用)
+        # 设置 Splitter 初始比例
         if not self.settings.value("window/main_splitter"):
-            # 左侧给到 340px (刚好两列缩略图 148*2 + margins)，右侧 400px
-            # 中间区域自动占据剩余空间 (1600 - 340 - 400 = 860px)
             self.splitter.setSizes([340, 860, 400])
 
     def resizeEvent(self, event):
@@ -365,34 +410,6 @@ class MainWindow(QMainWindow):
         if self.current_folder:
             self.search_controller.perform_search()
             self.statusBar().showMessage("已刷新列表", 2000)
-
-
-
-    def _on_comfy_progress(self, value, max_val):
-        """处理 ComfyUI 进度"""
-        if max_val > 0:
-            progress = int((value / max_val) * 100)
-            # 显示进度条
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(progress)
-            # 同时在状态栏显示详细信息
-            self.statusBar().showMessage(f"ComfyUI 正在生成... 步骤 {value}/{max_val}")
-        else:
-            self.progress_bar.setVisible(False)
-
-    def _on_comfy_node_start(self, node_id, node_type):
-        """当 ComfyUI 开始执行某个节点时"""
-        self.statusBar().showMessage(f"ComfyUI 正在执行: {node_type} (节点 {node_id})")
-        print(f"[Comfy] 正在执行节点: {node_id} ({node_type})")
-    
-    def _on_comfy_done(self):
-        """当 ComfyUI 完成生成时"""
-        # 隐藏进度条
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setValue(0)
-        # 显示完成消息
-        self.statusBar().showMessage("✅ ComfyUI 生成完成！", 5000)
-        print("[Comfy] 生成任务完成")
 
     def _load_historical_resolutions(self):
         """从数据库加载历史分辨率并更新到参数面板"""
@@ -605,10 +622,20 @@ class MainWindow(QMainWindow):
                 border-bottom: 2px solid {colors['accent']};
                 background-color: {colors['bg_hover']};
             }}
+            QListView {{
+                outline: none;
+            }}
+            QListView::item {{
+                border: none;
+                padding: 2px;
+                border-radius: 6px;
+            }}
             QListView::item:selected {{
                 background-color: {colors['bg_card']};
-                border: 1px solid {colors['border']};
                 color: {colors['accent']};
+            }}
+            QListView::item:hover {{
+                background-color: {colors['bg_hover']};
             }}
 
             /* 下拉框 */
@@ -844,6 +871,76 @@ class MainWindow(QMainWindow):
             self.thumbnail_list.clearSelection() # 清理一下
             self.view_stack.setCurrentIndex(0)
             self.statusBar().showMessage("对比模式已关闭，恢复单选浏览。")
+
+    def _show_queue_dialog(self):
+        """显示队列管理对话框"""
+        from src.ui.widgets.queue_dialog import QueueDialog
+        
+        if not hasattr(self, 'queue_dialog') or self.queue_dialog is None:
+            self.queue_dialog = QueueDialog(self.comfy_client, self)
+        
+        self.queue_dialog.show()
+        self.queue_dialog.raise_()
+        self.queue_dialog.activateWindow()
+
+    def _on_comfy_progress(self, current, total):
+        """处理 ComfyUI 进度更新"""
+        if hasattr(self, 'progress_bar'):
+            # 确保处于确定进度状态
+            if self.progress_bar.maximum() == 0:
+                self.progress_bar.setMaximum(total)
+            
+            # 确保子控件也是可见的
+            self.progress_container.setVisible(True)
+            self.interrupt_btn.raise_() # 确保每次重绘后都在最上层
+            
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(current)
+            self.progress_bar.setFormat(f"生成中... {current}/{total} (%p%)")
+
+    def _on_prompt_submitted(self, prompt_id):
+        """处理任务提交成功"""
+        self.statusBar().showMessage(f"任务已提交: {prompt_id[:8]}...", 5000)
+        # 如果队列窗口打开，刷新它
+        if hasattr(self, 'queue_dialog') and self.queue_dialog and self.queue_dialog.isVisible():
+            self.queue_dialog.refresh_queue()
+
+    def _on_comfy_node_start(self, node_id, node_type):
+        """处理节点开始执行"""
+        if hasattr(self, 'progress_bar'):
+            self.progress_container.setVisible(True)
+            
+            # 常用节点名称翻译
+            node_map = {
+                "CheckpointLoaderSimple": "加载模型",
+                "LoraLoader": "加载 LoRA",
+                "CLIPTextEncode": "解析提示词",
+                "KSampler": "正在采样",
+                "VAEDecode": "VAE 解码",
+                "SaveImage": "保存图片",
+                "EmptyLatentImage": "初始化画布",
+                "ControlNetApply": "应用 ControlNet",
+                "UpscaleModelLoader": "加载放大模型"
+            }
+            
+            display_name = node_map.get(node_type, node_type)
+            
+            # 如果是非采样节点，使用忙碌动画（Indeterminate）
+            if "sampler" not in node_type.lower() and node_type != "KSampler":
+                self.progress_bar.setMaximum(0) # 开启忙碌动画
+                self.progress_bar.setFormat(f"任务: {display_name}...")
+            else:
+                self.progress_bar.setFormat(f"正在准备采样...")
+            
+            self.interrupt_btn.raise_()
+                
+        self.statusBar().showMessage(f"正在执行: {node_type} ({node_id})")
+
+    def _on_comfy_done(self, result=None):
+        """处理执行完成"""
+        if hasattr(self, 'progress_bar'):
+            self.progress_container.setVisible(False) # 隐藏整个容器
+        self.statusBar().showMessage("生成任务已完成", 5000)
 
     def closeEvent(self, event):
         """窗口关闭时保存状态"""

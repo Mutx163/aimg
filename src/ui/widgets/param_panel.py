@@ -79,181 +79,128 @@ class ParameterPanel(QWidget):
         self.stats_grid.setVerticalSpacing(6)
         self.stats_grid.setHorizontalSpacing(20)
         
-        # 预定义标签，统一样式
-        label_style = "color: palette(mid); font-weight: bold; font-size: 11px;"
-        value_style = "color: palette(text); font-size: 11px;"
+        # 预定义标签样式
+        self._label_style = "color: palette(mid); font-weight: bold; font-size: 10px;"
+        # 统一数值区域样式：增加背景框效果
+        self._value_style = "background-color: palette(alternate-base); border-radius: 4px; padding: 2px 8px; color: palette(text); font-size: 11px;"
+        self._fixed_label_width = 65 # 统一标签宽度，确保对齐
         
-        def add_stat(row, col, label_text, attr_name):
+        def add_stat(row, col, label_text, attr_name, colspan=1):
             lbl = QLabel(label_text)
-            lbl.setStyleSheet(label_style)
+            lbl.setStyleSheet(self._label_style)
+            lbl.setFixedWidth(self._fixed_label_width) # 强制固定宽度
             val = QLabel("-")
-            val.setStyleSheet(value_style)
+            val.setStyleSheet(self._value_style)
             val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             setattr(self, attr_name, val)
             self.stats_grid.addWidget(lbl, row, col)
-            self.stats_grid.addWidget(val, row, col + 1)
+            self.stats_grid.addWidget(val, row, col + 1, 1, colspan)
 
-        add_stat(0, 0, "SEED", "seed_label")
-        add_stat(0, 2, "分辨率", "resolution_label")
-        add_stat(1, 0, "STEPS", "steps_label")
-        add_stat(1, 2, "CFG", "cfg_label")
-        add_stat(2, 0, "采样器", "sampler_label")
+        # 第一行：SEED 独占
+        add_stat(0, 0, "SEED", "seed_label", colspan=3)
+        
+        # 第二行：分辨率 + 采样器
+        add_stat(1, 0, "分辨率", "resolution_label")
+        add_stat(1, 2, "采样器", "sampler_label")
+        
+        # 第三行：Steps + CFG
+        add_stat(2, 0, "STEPS", "steps_label")
+        add_stat(2, 2, "CFG", "cfg_label")
+
+        # 第四行：LoRAs (改为和SEED一样的独占行显示)
+        lbl_lora = QLabel("LORAS")
+        lbl_lora.setStyleSheet(self._label_style)
+        lbl_lora.setFixedWidth(self._fixed_label_width) # 强制对齐
+        self.info_lora_val = QLabel("-")
+        self.info_lora_val.setStyleSheet(self._value_style)
+        self.info_lora_val.setWordWrap(True)
+        self.stats_grid.addWidget(lbl_lora, 3, 0)
+        self.stats_grid.addWidget(self.info_lora_val, 3, 1, 1, 3)
         
         info_card_layout.addLayout(self.stats_grid)
 
-        # 更多细节网格 (平铺展示)
+        # --- 新增：原始提示词滚动查看区 (样式向SEED看齐) ---
+        def add_scroll_info(label_text, attr_name, height):
+            lay = QHBoxLayout()
+            lay.setSpacing(20) # 提升至 20，与 stats_grid 的 HorizontalSpacing 保持一致
+            lbl = QLabel(label_text)
+            lbl.setStyleSheet(self._label_style)
+            lbl.setFixedWidth(self._fixed_label_width) # 强力对齐
+            lbl.setAlignment(Qt.AlignmentFlag.AlignTop)
+            
+            edit = QTextEdit()
+            edit.setReadOnly(True)
+            edit.setMaximumHeight(height)
+            # 统一提示词区域样式：与上方数值项的“灰色框框”保持一致
+            edit.setStyleSheet("background-color: palette(alternate-base); border-radius: 4px; padding: 5px; font-size: 11px; color: palette(text); border: none;")
+            setattr(self, attr_name, edit)
+            
+            lay.addWidget(lbl)
+            lay.addWidget(edit)
+            info_card_layout.addLayout(lay)
+
+        info_card_layout.addSpacing(5)
+        add_scroll_info("提示词", "info_prompt_val", 80)
+        add_scroll_info("反向词", "info_neg_val", 60)
+        
+        # 安装事件过滤器，实现“点击任意区域复制”
+        self.info_prompt_val.viewport().installEventFilter(self)
+        self.info_neg_val.viewport().installEventFilter(self)
+        self.info_prompt_val.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+        self.info_neg_val.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+
+        # 更多细节网格 (文件大小等)
         self.details_layout = QGridLayout()
         self.details_layout.setVerticalSpacing(4)
+        self.details_layout.setHorizontalSpacing(20)
         info_card_layout.addLayout(self.details_layout)
-        
-        # LoRA 区域
-        lora_box = QVBoxLayout()
-        lora_title = QLabel("LORAS")
-        lora_title.setStyleSheet(label_style)
-        lora_box.addWidget(lora_title)
-        
-        self.lora_container = QWidget()
-        self.lora_flow = QHBoxLayout(self.lora_container)
-        self.lora_flow.setContentsMargins(0, 5, 0, 0)
-        self.lora_flow.setSpacing(6)
-        lora_box.addWidget(self.lora_container)
-        info_card_layout.addLayout(lora_box)
         
         self.layout.addWidget(self.info_card)
         
-        # ========== 生成设置面板 (可折叠，放在info_card外部) ==========
+        # ========== 2. 底部专用生成设置区域 (可编辑工作区) ==========
         self._setup_generation_settings(self.layout)
-        
-        # ========== 2. Prompt/Negative/详细参数区 (可拉伸) ==========
-        self.main_splitter = QSplitter(Qt.Orientation.Vertical)
-        
-        # 定义一个简单的样式函数
-        def apply_edit_style(edit):
-            edit.setReadOnly(False)
-            edit.setStyleSheet("""
-                QTextEdit {
-                    background-color: transparent;
-                    border: none;
-                    font-family: "Segoe UI", "Microsoft YaHei";
-                    font-size: 11px;
-                    line-height: 1.4;
-                    padding: 8px;
-                }
-            """)
-            
-        # Prompt 区
-        self.prompt_container = QWidget()
-        prompt_layout = QVBoxLayout(self.prompt_container)
-        prompt_layout.setContentsMargins(0, 0, 0, 0)
-        prompt_layout.setSpacing(4)
-        
-        prompt_header = self._create_compact_header("✨ Prompt", self._copy_prompt)
-        prompt_layout.addLayout(prompt_header)
-        
-        # 外框
-        self.prompt_frame = QFrame()
-        self.prompt_frame.setObjectName("TextCard")
-        self.prompt_frame.setStyleSheet("""
-            QFrame#TextCard {
-                background-color: palette(base);
-                border: 1px solid palette(mid);
-                border-radius: 6px;
-            }
-        """)
-        pf_layout = QVBoxLayout(self.prompt_frame)
-        pf_layout.setContentsMargins(1, 1, 1, 1)
-        
-        self.prompt_edit = QTextEdit()
-        self.prompt_edit.setPlaceholderText("在这里修改提示词...")
-        apply_edit_style(self.prompt_edit)
-        
-        pf_layout.addWidget(self.prompt_edit)
-        prompt_layout.addWidget(self.prompt_frame)
-        
-        self.main_splitter.addWidget(self.prompt_container)
-        
-        # Negative Prompt 区
-        self.neg_container = QWidget()
-        neg_layout = QVBoxLayout(self.neg_container)
-        neg_layout.setContentsMargins(0, 0, 0, 0)
-        neg_layout.setSpacing(4)
-        
-        neg_header = self._create_compact_header("🚫 Negative Prompt", self._copy_neg_prompt)
-        neg_layout.addLayout(neg_header)
-        
-        self.neg_frame = QFrame()
-        self.neg_frame.setObjectName("TextCard")
-        self.neg_frame.setStyleSheet("""
-            QFrame#TextCard {
-                background-color: palette(base);
-                border: 1px solid palette(mid);
-                border-radius: 6px;
-            }
-        """)
-        nf_layout = QVBoxLayout(self.neg_frame)
-        nf_layout.setContentsMargins(1, 1, 1, 1)
-        
-        self.neg_prompt_edit = QTextEdit()
-        self.neg_prompt_edit.setPlaceholderText("在这里修改反向提示词...")
-        apply_edit_style(self.neg_prompt_edit)
-        
-        nf_layout.addWidget(self.neg_prompt_edit)
-        neg_layout.addWidget(self.neg_frame)
-        
-        self.main_splitter.addWidget(self.neg_container)
-        
-        # 设置初始权重 - 更加均衡，减少单方面区域过大的空旷感
-        self.main_splitter.setStretchFactor(0, 1)
-        self.main_splitter.setStretchFactor(1, 1)
-        
-        self.layout.addWidget(self.main_splitter)
 
     def _setup_generation_settings(self, parent_layout):
-        """设置生成参数编辑面板（可折叠）"""
-        # 创建外层容器（带样式）
+        """设置生成参数编辑面板（专用工作区）"""
         gen_settings_outer = QFrame()
-        gen_settings_outer.setObjectName("GenSettingsFrame")
+        gen_settings_outer.setObjectName("GenWorkspace")
         gen_settings_outer.setStyleSheet("""
-            QFrame#GenSettingsFrame {
-                background-color: palette(base);
-                border: 1px solid palette(mid);
-                border-radius: 6px;
-                margin-top: 4px;
+            QFrame#GenWorkspace {
+                background-color: palette(window);
+                border: 1px solid palette(highlight);
+                border-radius: 8px;
+                margin-top: 5px;
             }
         """)
         outer_layout = QVBoxLayout(gen_settings_outer)
-        outer_layout.setContentsMargins(8, 8, 8, 8)
-        outer_layout.setSpacing(6)
+        outer_layout.setContentsMargins(10, 10, 10, 10)
+        outer_layout.setSpacing(12)
         
-        # 折叠按钮行
-        toggle_row = QHBoxLayout()
-        toggle_row.setContentsMargins(0, 0, 0, 0)
+        header_lbl = QLabel("🛠️ 生成工作区 (在此修改并生成)")
+        header_lbl.setStyleSheet("font-weight: bold; font-size: 12px; color: palette(highlight);")
+        outer_layout.addWidget(header_lbl)
+
+        # --- 1. 可编辑文本区 ---
+        def create_edit_block(title, placeholder, height):
+            outer_layout.addWidget(QLabel(title, styleSheet=self._label_style))
+            edit = QTextEdit()
+            edit.setPlaceholderText(placeholder)
+            edit.setMaximumHeight(height)
+            edit.setStyleSheet("background-color: palette(base); border: 1px solid palette(mid); border-radius: 4px; padding: 5px;")
+            outer_layout.addWidget(edit)
+            return edit
+
+        self.prompt_edit = create_edit_block("✨ 正向提示词", "输入新的提示词进行创作...", 100)
+        self.neg_prompt_edit = create_edit_block("🚫 反向提示词", "输入过滤词...", 80)
         
-        self.btn_toggle_settings = QPushButton("▶ 生成设置")
-        self.btn_toggle_settings.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_toggle_settings.clicked.connect(self._toggle_gen_settings)
-        self.btn_toggle_settings.setStyleSheet("""
-            QPushButton {
-                background: transparent;
-                border: none;
-                text-align: left;
-                font-weight: bold;
-                color: palette(highlight);
-                padding: 2px;
-                font-size: 12px;
-            }
-            QPushButton:hover { color: palette(highlight); text-decoration: underline; }
-        """)
-        toggle_row.addWidget(self.btn_toggle_settings)
-        toggle_row.addStretch()
-        outer_layout.addLayout(toggle_row)
-        
-        # 生成设置内容容器（默认隐藏）
+        # --- 2. 其他参数设置 ---
         self.gen_settings_container = QWidget()
-        self.gen_settings_container.setVisible(False)
         gen_layout = QVBoxLayout(self.gen_settings_container)
-        gen_layout.setContentsMargins(0, 8, 0, 0)
-        gen_layout.setSpacing(12)
+        gen_layout.setContentsMargins(0, 0, 0, 0)
+        gen_layout.setSpacing(10)
+        
+        # 将整个外层容器添加到父布局
+        parent_layout.addWidget(gen_settings_outer)
         
         # ===== Seed行 =====
         seed_row = QHBoxLayout()
@@ -773,8 +720,9 @@ class ParameterPanel(QWidget):
         """随机种子复选框状态改变"""
         self.seed_input.setEnabled(not checked)
         if checked:
-            # 勾选随机 -> 显示-1
-            self.seed_input.setText("-1")
+            # 勾选随机也保持显示当前图片的seed，只是禁用编辑
+            if self.last_image_seed:
+                self.seed_input.setText(str(self.last_image_seed))
         else:
             # 取消随机 -> 恢复上一张图片的seed
             if self.last_image_seed:
@@ -824,63 +772,85 @@ class ParameterPanel(QWidget):
         self.model_label.setText(f"🎨 {model_name}")
         
         seed = params.get('Seed', params.get('seed', '-'))
-        self.seed_label.setText(f"Seed: {seed}")
+        self.seed_label.setText(f"{seed}")
         
         resolution = tech_info.get('resolution', '-')
-        self.resolution_label.setText(f"分辨率: {resolution}")
+        self.resolution_label.setText(f"{resolution}")
         
         steps = params.get('Steps', params.get('steps', '-'))
-        self.steps_label.setText(f"Steps: {steps}")
+        self.steps_label.setText(f"{steps}")
         
         cfg = params.get('CFG scale', params.get('cfg', '-'))
-        self.cfg_label.setText(f"CFG: {cfg}")
+        self.cfg_label.setText(f"{cfg}")
         
         sampler = params.get('Sampler', params.get('sampler_name', '-'))
-        self.sampler_label.setText(f"Sampler: {sampler}")
+        self.sampler_label.setText(f"{sampler}")
         
-        # 更新LoRA标签云
-        self._clear_lora_tags()
-        for lora in loras:
-            tag = QLabel(f"{lora}")
-            tag.setObjectName("LoraTag")
-            tag.setMaximumHeight(24)
-            self.lora_flow.addWidget(tag)
-        self.lora_flow.addStretch() # 靠左排列
+        # 更新LoRA展示 (简约文本)
+        lora_texts = []
+        for l in loras:
+            if isinstance(l, dict):
+                # 修复浮点数精度 bug: 0.850000001 -> 0.85
+                name = l.get('name','')
+                weight = l.get('weight', 1.0)
+                try:
+                    weight_rounded = round(float(weight), 2)
+                    lora_texts.append(f"{name} ({weight_rounded})")
+                except:
+                    lora_texts.append(f"{name} ({weight})")
+            else:
+                lora_texts.append(str(l))
+        self.info_lora_val.setText(", ".join(lora_texts) if lora_texts else "无")
         
-        # 更新Prompt
-        self.prompt_edit.setText(meta_data.get('prompt', ''))
-        self.neg_prompt_edit.setText(meta_data.get('negative_prompt', ''))
+        # 更新提示词展示 (只读滚动区)
+        prompt_text = meta_data.get('prompt', '')
+        neg_text = meta_data.get('negative_prompt', '')
+        self.info_prompt_val.setPlainText(prompt_text)
+        self.info_neg_val.setPlainText(neg_text)
         
-        # 更新详细参数 (平铺展示)
+        # --- 填充底部编辑区 (默认使用图片原始值) ---
+        self.prompt_edit.setPlainText(prompt_text)
+        self.neg_prompt_edit.setPlainText(neg_text)
+
+        # 更新更多细节 (分两列排列)
         self._clear_layout(self.details_layout)
-        row = 0
+        
+        detail_items = []
         # 其他生成参数
         detail_keys = ['Scheduler', 'Denoise', 'Model hash']
         for key in detail_keys:
             if key in params:
-                self.details_layout.addWidget(QLabel(f"{key}:"), row, 0)
-                self.details_layout.addWidget(QLabel(str(params[key])), row, 1)
-                row += 1
+                detail_items.append((key, str(params[key])))
         
-        # 文件信息
+        # 文件信息也加入列表
         if tech_info:
-            self.details_layout.addWidget(QLabel("文件大小:"), row, 0)
-            self.details_layout.addWidget(QLabel(tech_info.get('file_size', '-')), row, 1)
-            row += 1
+            detail_items.append(("文件大小", tech_info.get('file_size', '-')))
+            detail_items.append(("格式", tech_info.get('format', '-')))
             
-            self.details_layout.addWidget(QLabel("格式:"), row, 0)
-            self.details_layout.addWidget(QLabel(tech_info.get('format', '-')), row, 1)
+        # 填充到网格中 (每行两组标签-值对)
+        for i, (key, value) in enumerate(detail_items):
+            row = i // 2
+            col = (i % 2) * 2
+            
+            lbl = QLabel(f"{key}:")
+            lbl.setStyleSheet(self._label_style)
+            lbl.setFixedWidth(self._fixed_label_width) # 确保即使是底部细节也完美对齐
+            val = QLabel(value)
+            val.setStyleSheet(self._value_style)
+            
+            self.details_layout.addWidget(lbl, row, col)
+            self.details_layout.addWidget(val, row, col + 1)
         
         # ========== 填充生成设置控件 ==========
         # Seed - 保存并显示
         if seed != '-':
-            self.last_image_seed = seed  # 保存到变量
+            self.last_image_seed = seed
             self.seed_input.setText(str(seed))
-            self.seed_random_checkbox.setChecked(False)  # 取消随机，显示图片的seed
         else:
-            # 图片没有seed信息，保持随机状态
+            # 图片没有seed信息，设为随机并清空/显示0
             if not self.seed_random_checkbox.isChecked():
-                self.seed_random_checkbox.setChecked(True)  # 设为随机
+                self.seed_random_checkbox.setChecked(True)
+            self.seed_input.setText("0")
         
         # 分辨率
         if resolution != '-' and 'x' in str(resolution):
@@ -1053,9 +1023,19 @@ class ParameterPanel(QWidget):
             if 'ksampler' in class_type:
                 # Seed
                 if 'seed' in inputs:
-                    final_seed = user_seed if user_seed is not None else random.randint(1000000000000, 9999999999999)
+                    if user_seed is not None:
+                        final_seed = int(user_seed)
+                    else:
+                        # “超随机种子”实现：使用 OS 级真随机源
+                        # 锁定 18-20 位长度，使用 64 位无符号整数上限
+                        # ComfyUI 最大支持范围约为 2^64-1 (18,446,744,073,709,551,615)
+                        final_seed = random.SystemRandom().randint(10**17, 18446744073709551614)
+                    
                     inputs['seed'] = final_seed
-                    print(f"[Comfy] -> 注入Seed: 节点 {node_id} -> {final_seed}")
+                    # 实时反馈：将生成的随机种子显示在界面上，不再隐藏
+                    self.seed_input.setText(str(final_seed))
+                    self.seed_label.setText(str(final_seed)) # 同时更新顶部展示卡片
+                    print(f"[Comfy] -> 注入超随机Seed: 节点 {node_id} -> {final_seed}")
                 
                 # Steps
                 if 'steps' in inputs:
@@ -1120,13 +1100,6 @@ class ParameterPanel(QWidget):
         # 发送请求信号
         self.remote_gen_requested.emit(workflow)
 
-    def _clear_lora_tags(self):
-        """清空LoRA标签"""
-        while self.lora_flow.count():
-            child = self.lora_flow.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
-
     def _clear_layout(self, layout):
         """递归清空布局"""
         while layout.count():
@@ -1139,17 +1112,41 @@ class ParameterPanel(QWidget):
     def clear_info(self):
         """清空信息"""
         self.model_label.setText("🎨 未选择模型")
-        self.seed_label.setText("Seed: -")
+        self.seed_label.setText("-")
         
         # 禁用操作按钮
         for btn in self.info_card.findChildren(QPushButton):
             if "复制" in btn.text():
                 btn.setEnabled(False)
-        self.resolution_label.setText("分辨率: -")
-        self.steps_label.setText("Steps: -")
-        self.cfg_label.setText("CFG: -")
-        self.sampler_label.setText("Sampler: -")
-        self._clear_lora_tags()
+        self.resolution_label.setText("-")
+        self.steps_label.setText("-")
+        self.cfg_label.setText("-")
+        self.sampler_label.setText("-")
+        
+        # 清除新版顶部信息项
+        if hasattr(self, 'info_lora_val'): self.info_lora_val.setText("-")
+        if hasattr(self, 'info_prompt_val'): self.info_prompt_val.clear()
+        if hasattr(self, 'info_neg_val'): self.info_neg_val.clear()
+        
         self._clear_layout(self.details_layout)
+        
+        # 清除生成工作区
         self.prompt_edit.clear()
         self.neg_prompt_edit.clear()
+    def eventFilter(self, source, event):
+        """实现点击复制逻辑"""
+        from PyQt6.QtCore import QEvent
+        if event.type() == QEvent.Type.MouseButtonPress:
+            if source is self.info_prompt_val.viewport():
+                self._copy_to_clip(self.info_prompt_val.toPlainText(), "✨ 提示词已复制")
+                return True
+            elif source is self.info_neg_val.viewport():
+                self._copy_to_clip(self.info_neg_val.toPlainText(), "🚫 反向词已复制")
+                return True
+        return super().eventFilter(source, event)
+
+    def _copy_to_clip(self, text, msg):
+        """通用复制并提示函数"""
+        if text:
+            QApplication.clipboard().setText(text)
+            self._temp_notify(f"✅ {msg}")

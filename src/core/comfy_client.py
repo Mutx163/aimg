@@ -20,6 +20,7 @@ class ComfyClient(QObject):
     queue_updated = pyqtSignal(dict) # 队列状态更新
     task_cancelled = pyqtSignal(str) # 任务已取消，携带prompt_id
     queue_cleared = pyqtSignal() # 队列已清空
+    operation_failed = pyqtSignal(str) # 操作失败 (取消、清空等), 携带错误信息
 
     def __init__(self, server_address="127.0.0.1:8188"):
         super().__init__()
@@ -281,7 +282,125 @@ class ComfyClient(QObject):
         if "sampler" in class_type.lower() or class_type == "KSampler":
             inputs = node_data.get("inputs", {})
             if "seed" in inputs:
-                # 生成新的随机种子（ComfyUI通常使用较大的整数）
-                inputs["seed"] = random.randint(1, 2**32 - 1)
-                print(f"[Comfy] 已随机化节点 {node_id} ({class_type}) 的seed")
+                # “超随机种子”实现：使用 OS 级真随机源，保持 18-20 位长度
+                # ComfyUI 最大支持范围约为 2^64-1 (18,446,744,073,709,551,615)
+                ultra_random_seed = random.SystemRandom().randint(10**17, 18446744073709551614)
+                inputs["seed"] = ultra_random_seed
+                print(f"[Comfy] 已随机化节点 {node_id} ({class_type}) 的超随机seed: {ultra_random_seed}")
 
+    # ========== 队列管理方法 ==========
+    
+    def get_queue(self):
+        """获取当前队列状态"""
+        url = QUrl(f"http://{self.server_address}/queue")
+        request = QNetworkRequest(url)
+        reply = self.nam.get(request)
+        reply.finished.connect(lambda: self._handle_queue_response(reply))
+    
+    def _handle_queue_response(self, reply: QNetworkReply):
+        """处理队列查询响应"""
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                print(f"[Comfy Queue] 查询失败: {reply.errorString()}")
+                return
+            
+            data = json.loads(bytes(reply.readAll()).decode())
+            print(f"[Comfy Queue] 当前队列: Running={len(data.get('queue_running', []))}, Pending={len(data.get('queue_pending', []))}")
+            
+            # 发送信号
+            self.queue_updated.emit(data)
+            
+        except Exception as e:
+            print(f"[Comfy Queue] 解析队列数据失败: {e}")
+        finally:
+            reply.deleteLater()
+    
+    def cancel_task(self, prompt_id: str):
+        """取消指定任务"""
+        url = QUrl(f"http://{self.server_address}/queue")
+        request = QNetworkRequest(url)
+        request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
+        
+        data = {"delete": [prompt_id]}
+        json_data = QByteArray(json.dumps(data).encode())
+        
+        reply = self.nam.post(request, json_data)
+        reply.finished.connect(lambda: self._handle_cancel_response(reply, prompt_id))
+    
+    def _handle_cancel_response(self, reply: QNetworkReply, prompt_id: str):
+        """处理取消任务响应"""
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                err_msg = reply.errorString()
+                print(f"[Comfy Queue] 取消任务失败: {err_msg}")
+                self.operation_failed.emit(f"取消失败: {err_msg}")
+                return
+            # 读取响应 (ComfyUI /queue 接口 POST delete 返回类似 {"delete": [id1, id2]})
+            resp_raw = reply.readAll()
+            try:
+                resp_json = json.loads(bytes(resp_raw).decode())
+                print(f"[Comfy Queue] 响应: {resp_json}")
+            except:
+                print(f"[Comfy Queue] 无法解析响应: {resp_raw}")
+            
+            print(f"[Comfy Queue] 已成功发送取消请求: {prompt_id}")
+            self.task_cancelled.emit(prompt_id)
+            
+        except Exception as e:
+            print(f"[Comfy Queue] 取消任务错误: {e}")
+        finally:
+            reply.deleteLater()
+    
+    def clear_queue(self):
+        """清空队列"""
+        url = QUrl(f"http://{self.server_address}/queue")
+        request = QNetworkRequest(url)
+        request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
+        
+        data = {"clear": True}
+        json_data = QByteArray(json.dumps(data).encode())
+        
+        reply = self.nam.post(request, json_data)
+        reply.finished.connect(lambda: self._handle_clear_response(reply))
+    
+    def _handle_clear_response(self, reply: QNetworkReply):
+        """处理清空队列响应"""
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                err_msg = reply.errorString()
+                print(f"[Comfy Queue] 清空队列失败: {err_msg}")
+                self.operation_failed.emit(f"清空失败: {err_msg}")
+                return
+            
+            print(f"[Comfy Queue] 队列已清空")
+            self.queue_cleared.emit()
+            
+        except Exception as e:
+            print(f"[Comfy Queue] 清空队列错误: {e}")
+        finally:
+            reply.deleteLater()
+    
+    def interrupt_current(self):
+        """中断当前任务"""
+        url = QUrl(f"http://{self.server_address}/interrupt")
+        request = QNetworkRequest(url)
+        
+        reply = self.nam.post(request, QByteArray())
+        reply.finished.connect(lambda: self._handle_interrupt_response(reply))
+    
+    def _handle_interrupt_response(self, reply: QNetworkReply):
+        """处理中断响应"""
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                err_msg = reply.errorString()
+                print(f"[Comfy Queue] 中断任务失败: {err_msg}")
+                self.operation_failed.emit(f"中断失败: {err_msg}")
+                return
+            
+            print(f"[Comfy Queue] 已中断当前任务")
+            self.status_changed.emit("已中断当前任务")
+            
+        except Exception as e:
+            print(f"[Comfy Queue] 中断任务错误: {e}")
+        finally:
+            reply.deleteLater()
