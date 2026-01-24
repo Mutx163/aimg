@@ -55,15 +55,24 @@ class ModelExplorer(QWidget):
         self.raw_models = models
         self.raw_loras = loras
         
-        # 这种更新方式可以保留当前选中（如果还在的话）
-        curr_model = self.combo_model.currentText()
-        curr_lora = self.combo_lora.currentText()
+        # 缓存当前选中的 Model 和 LoRA
+        # 注意：如果是 SearchController 调用的，Model 可能就是我们要设置的那个
+        # 但如果是外部刷新，我们需要保持状态
+        curr_model_data = self.combo_model.currentData()
+        curr_lora_data = self.combo_lora.currentData()
         
         self.combo_model.blockSignals(True)
         self.combo_model.clear()
         self.combo_model.addItem("全部模型", "ALL")
         for name, count in models:
             self.combo_model.addItem(f"{name} ({count})", name)
+            
+        # 尝试恢复 Model 选中状态
+        idx = self.combo_model.findData(curr_model_data)
+        if idx >= 0:
+            self.combo_model.setCurrentIndex(idx)
+        else:
+            self.combo_model.setCurrentIndex(0)
         self.combo_model.blockSignals(False)
         
         self.combo_lora.blockSignals(True)
@@ -71,6 +80,15 @@ class ModelExplorer(QWidget):
         self.combo_lora.addItem("全部 LoRA", "ALL")
         for name, count in loras:
             self.combo_lora.addItem(f"{name} ({count})", name)
+            
+        # 尝试恢复 LoRA 选中状态
+        # (注意：如果是因为切换模型而触发的更新，Controller 可能会显式重置 LoRA，
+        # 但在这里我们尽力保持。如果新列表中没有那个 LoRA，自然会归零)
+        idx = self.combo_lora.findData(curr_lora_data)
+        if idx >= 0:
+            self.combo_lora.setCurrentIndex(idx)
+        else:
+            self.combo_lora.setCurrentIndex(0)
         self.combo_lora.blockSignals(False)
 
     def _on_model_selected(self, index):

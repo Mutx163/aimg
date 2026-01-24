@@ -47,6 +47,33 @@ class ThumbnailList(QListView):
     def add_image(self, path, index=None, thumbnail=None):
         """代理模型添加图片"""
         self.image_model.add_image(path, thumb=thumbnail, index=index)
+    
+    def update_image_icon(self, index, icon):
+        """更新指定索引的图片图标 (代理给 Model)"""
+        # SearchController 传递的是 index (int) 和 QImage/QPixmap
+        # ImageModel.update_thumbnail 需要 path 和 thumb
+        # 但既然我们知道 index，直接通过 Model 获取 Path 似乎多余，不如直接用 update_item
+        # 看看 ImageModel，它有 update_thumbnail(path, thumb)
+        
+        # 修正：SearchController 传递的是 (index, path, thumb)
+        # 所以我们可以直接调用 list 的 model
+        # 但为了方便，我们在这里封装一下
+        # 注意：SearchController 中的 _on_search_thumb_ready(self, index, path, thumb)
+        # 直接调用 update_image_icon(index, thumb) 是错误的，因为 Controller 里是
+        # self.main.thumbnail_list.update_image_icon(index, thumb)
+        # 应该改为 update_thumbnail(path, thumb)
+        
+        # 既然之前的代码尝试调 update_image_icon，我就加上它，并让它调用 model 的 update_thumbnail
+        # 但参数不对齐。
+        # 让我看看 SearchController 的调用：
+        # self.main.thumbnail_list.update_image_icon(index, thumb) 
+        # 它只传了 index 和 thumb，没传 path。
+        # 这是一个问题，因为 model.update_thumbnail 是基于 path 的。
+        # 不过，我们有 index，可以拿到 path。
+        
+        path = self.image_model.get_path(index)
+        if path:
+            self.image_model.update_thumbnail(path, icon)
         
     def clear_list(self):
         self.image_model.clear()
@@ -71,11 +98,27 @@ class ThumbnailList(QListView):
         path = self.image_model.get_path(row)
         return MockItem(path) if path else None
 
-    # 重写这些是为了保持原有的网格自适应感
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # QListView 的 IconMode 会自动流式布局，这里可以补充更精细的网格控制
-        # 暂时保持默认，由 setGridSize 驱动
+        # 响应式网格调整：根据当前宽度自动计算最合适的 GridSize，消除右侧留白
+        viewport_width = self.viewport().width()
+        if viewport_width <= 0: return
+
+        # 定义基准宽度 (图标128 + 左右内边距)
+        base_width = 148 
+        min_cols = 1
+        
+        # 计算当前能容纳的列数
+        cols = max(min_cols, viewport_width // base_width)
+        
+        # 计算新的单元格宽度，使其填满整行
+        # 减去滚动条可能的误差 (虽然 viewport 应该是不含滚动条的)
+        new_item_width = int(viewport_width / cols) - 2 
+        
+        # 保持高度不变
+        current_grid = self.gridSize()
+        if new_item_width != current_grid.width():
+            self.setGridSize(QSize(new_item_width, 170))
 
     def wheelEvent(self, event):
         """重写滚轮事件以实现细腻顺滑的滚动体验"""

@@ -83,3 +83,45 @@ class ImageLoaderThread(QThread):
 
     def stop(self):
         self._is_running = False
+
+class SearchThumbnailLoader(QThread):
+    """专门为搜索结果异步加载缩略图的微型线程 - V4.2 竞态防护版"""
+    # 增加 search_id 参数，防止快速切换筛选时旧线程的回调污染新列表
+    thumbnail_ready = pyqtSignal(int, str, QImage, str) # index, path, thumb, search_id
+    file_missing = pyqtSignal(str) # 发现文件丢失，请求清理 DB
+
+    def __init__(self, paths, thumb_cache=None, search_id=None):
+        super().__init__()
+        self.paths = paths
+        self.thumb_cache = thumb_cache or ThumbnailCache()
+        self.search_id = search_id
+        self._is_running = True
+
+    def run(self):
+        for i, path in enumerate(self.paths):
+            if not self._is_running: break
+            
+            # V4.3 修复：恢复存在性检查
+            # 如果文件被外部删除，必须在此拦截，否则会生成空缩略图占位
+            if not os.path.exists(path): 
+                print(f"[SearchLoader] File missing: {path}")
+                self.file_missing.emit(path) # 通知主线程清理僵尸记录
+                continue
+            
+            try:
+                # 优先从缓存读取
+                thumb = self.thumb_cache.get_thumbnail(path)
+                if not thumb:
+                    img = QImage(path)
+                    if not img.isNull():
+                        thumb = img.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, 
+                                          Qt.TransformationMode.FastTransformation)
+                        self.thumb_cache.save_thumbnail(path, thumb)
+                
+                if thumb and self._is_running:
+                    self.thumbnail_ready.emit(i, path, thumb, self.search_id)
+            except Exception as e:
+                print(f"[SearchLoader] Thumb error for {path}: {e}")
+
+    def stop(self):
+        self._is_running = False

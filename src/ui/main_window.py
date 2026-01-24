@@ -1,7 +1,9 @@
+
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QSplitter, QFileDialog, QToolBar, QMessageBox, 
                              QStatusBar, QLineEdit, QLabel, QTabWidget, QStackedWidget, 
-                             QFrame, QComboBox, QPushButton)
+                             QFrame, QComboBox, QPushButton, QAbstractSpinBox, QTextEdit, QApplication,
+                             QProgressBar)
 from PyQt6.QtCore import Qt, QSize, QSettings, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QImage
 import time
@@ -20,45 +22,19 @@ from src.core.metadata import MetadataParser
 from src.core.comfy_client import ComfyClient
 from src.ui.settings_dialog import SettingsDialog
 from src.core.cache import ThumbnailCache
+from src.ui.controllers.file_controller import FileController
 
-class SearchThumbnailLoader(QThread):
-    """专门为搜索结果异步加载缩略图的微型线程 - V4.1 缓存优化版"""
-    thumbnail_ready = pyqtSignal(int, str, QImage)
-
-    def __init__(self, paths, thumb_cache=None):
-        super().__init__()
-        self.paths = paths
-        self.thumb_cache = thumb_cache or ThumbnailCache()
-        self._is_running = True
-
-    def run(self):
-        for i, path in enumerate(self.paths):
-            if not self._is_running: break
-            if not os.path.exists(path): continue
-            
-            try:
-                # 优先从缓存读取
-                thumb = self.thumb_cache.get_thumbnail(path)
-                if not thumb:
-                    img = QImage(path)
-                    if not img.isNull():
-                        thumb = img.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, 
-                                          Qt.TransformationMode.FastTransformation)
-                        self.thumb_cache.save_thumbnail(path, thumb)
-                
-                if thumb:
-                    self.thumbnail_ready.emit(i, path, thumb)
-            except Exception as e:
-                print(f"[SearchLoader] Thumb error for {path}: {e}")
-
-    def stop(self):
-        self._is_running = False
+from src.ui.controllers.search_controller import SearchController
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AI Image Viewer Pro")
-        self.resize(1200, 800)
+        self.settings = QSettings("Antigravity", "AIImageViewer")
+        
+        # 恢复窗口状态 (优先恢复几何形状)
+        if not self.settings.value("window/geometry"):
+            self.resize(1600, 900)
         
         # 状态数据
         self.current_folder = None
@@ -71,57 +47,71 @@ class MainWindow(QMainWindow):
         
         # 核心组件初始化
         self.watcher = FileWatcher()
-        self.watcher.get_signal().connect(self.on_new_image_detected)
-        
-        self.settings = QSettings("Antigravity", "AIImageViewer")
         self.current_sort_by = self.settings.value("sort_by", "time_desc")
         
-        # 搜索防抖定时器
-        self.search_timer = QTimer()
-        self.search_timer.setSingleShot(True)
-        self.search_timer.timeout.connect(self.perform_search)
+        # 进度条初始化（先创建，稍后在setup_ui中添加到状态栏）
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumWidth(200)
+        self.progress_bar.setVisible(False)  # 默认隐藏
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p%")
+        
+        # 控制器初始化
+        self.search_controller = SearchController(self)
+        self.file_controller = FileController(self)
+        
+        # 连接监控信号 (需在控制器初始化后)
+        self.watcher.get_signal().connect(lambda p: self.file_controller.on_new_image_detected(p))
         
         self.setup_ui()
         self.apply_theme()
+        
+        # 恢复窗口状态
+        # 优先恢复几何形状（窗口位置和大小）
+        saved_geometry = self.settings.value("window/geometry")
+        if saved_geometry:
+            self.restoreGeometry(saved_geometry)
+            print(f"[Window] 已恢复窗口几何形状")
+        
+        # 恢复分割器状态（面板宽度比例）
+        saved_main_splitter = self.settings.value("window/main_splitter")
+        if saved_main_splitter:
+            self.splitter.restoreState(saved_main_splitter)
+            print(f"[Window] 已恢复主分割器状态")
+        
+        saved_left_splitter = self.settings.value("window/left_splitter")
+        if saved_left_splitter:
+            self.left_splitter.restoreState(saved_left_splitter)
+            print(f"[Window] 已恢复左侧分割器状态")
+            
+        # 安装全局事件过滤器以捕获所有键盘事件
+        # 必须安装在 QApplication 上才能捕获所有窗口的事件
+        QApplication.instance().installEventFilter(self)
         
         # 初始化 ComfyUI 客户端
         self.comfy_client = ComfyClient(self.settings.value("comfy_address", "127.0.0.1:8188"))
         self.comfy_client.status_changed.connect(lambda msg: self.statusBar().showMessage(f"[Comfy] {msg}", 3000))
         self.comfy_client.progress_updated.connect(self._on_comfy_progress)
+        self.comfy_client.prompt_submitted.connect(self._on_prompt_submitted)
         self.comfy_client.connect_server()
         
         # 绑定参数面板的远程生成请求
         self.param_panel.remote_gen_requested.connect(self.on_remote_gen_requested)
         self.comfy_client.execution_start.connect(self._on_comfy_node_start)
-        self.comfy_client.execution_done.connect(lambda: self.statusBar().showMessage("ComfyUI 生成任务已完成", 5000))
+        self.comfy_client.execution_done.connect(self._on_comfy_done)
+
         
         # 自动加载上次的文件夹
         last_folder = self.settings.value("last_folder")
         if last_folder and os.path.exists(last_folder):
             self.current_folder = last_folder
-            self.load_folder(last_folder)
+            self.file_controller.load_folder(last_folder)
             
             # 启动监控
             if self.watcher.start_monitoring(last_folder):
                 self.statusBar().showMessage(f"正在监控(上次位置): {last_folder}")
 
-    def load_folder(self, folder):
-        """扫描文件夹并加载现有图片 (异步)"""
-        self.thumbnail_list.clear_list()
-        self.viewer.clear_view()
-        self.param_panel.clear_info()
-        self.statusBar().showMessage(f"正在加载: {folder}...")
-        
-        if hasattr(self, 'loader_thread') and self.loader_thread.isRunning():
-            self.loader_thread.stop()
-            self.loader_thread.wait()
-            
-        from src.core.loader import ImageLoaderThread
-        self.loader_thread = ImageLoaderThread(folder, self.db_manager, self.thumb_cache)
-        self.loader_thread.image_thumb_ready.connect(self._on_loader_image_ready)
-        self.loader_thread.image_found.connect(self._on_loader_image_found)
-        self.loader_thread.finished_loading.connect(self._on_loader_finished)
-        self.loader_thread.start()
+
 
     def setup_ui(self):
         # 1. 工具栏 - Windows 原生风格
@@ -189,13 +179,19 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.sort_combo)
         
         toolbar.addSeparator()
-        
         action_settings = QAction("⚙ 设置", self)
-        action_settings.triggered.connect(self.open_settings)
+        action_settings.triggered.connect(self.show_settings)
         toolbar.addAction(action_settings)
-
-        # 2. 中间主要区域 (QSplitter)
+        
+        self.addToolBar(toolbar)
+        
+        # 5. 状态栏（添加进度条）
+        status_bar = self.statusBar()
+        status_bar.addPermanentWidget(self.progress_bar)  # 添加到右侧固定位置
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setHandleWidth(2) # 细分割线
+        self.splitter.setChildrenCollapsible(False) # 禁止折叠
+        self.splitter.setFocusPolicy(Qt.FocusPolicy.NoFocus) # 禁止获得焦点，防止方向键调整大小
         self.setCentralWidget(self.splitter)
         
         # 左侧列表面板 (增加搜索框)
@@ -210,7 +206,7 @@ class MainWindow(QMainWindow):
         search_layout.setSpacing(4) # 搜索栏内部紧凑
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("🔍 搜索提示词/模型/文件名...")
-        self.search_bar.textChanged.connect(self.on_search_changed)
+        self.search_bar.textChanged.connect(self.search_controller.on_search_changed)
         search_layout.addWidget(self.search_bar)
         
         btn_reset = QPushButton("Reset") # 改为英文防止乱码
@@ -219,7 +215,7 @@ class MainWindow(QMainWindow):
         btn_reset.setObjectName("GhostButton")
         # 增加宽度防止文字 "Reset" 被截断
         btn_reset.setMinimumWidth(60)
-        btn_reset.clicked.connect(self._reset_all_filters)
+        btn_reset.clicked.connect(self.search_controller.reset_filters)
         search_layout.addWidget(btn_reset)
         
         left_layout.addLayout(search_layout)
@@ -231,7 +227,7 @@ class MainWindow(QMainWindow):
         
         # 1. 模型筛选器
         self.model_explorer = ModelExplorer()
-        self.model_explorer.filter_requested.connect(self.on_filter_requested)
+        self.model_explorer.filter_requested.connect(self.search_controller.on_filter_requested)
         self.left_splitter.addWidget(self.model_explorer)
         
         # 2. 缩略图图库
@@ -264,16 +260,15 @@ class MainWindow(QMainWindow):
         
         # 右侧：参数面板
         self.param_panel = ParameterPanel()
-        self.param_panel.setMinimumWidth(100)
+        self.param_panel.setMinimumWidth(380) # 强制最小宽度，防止内容被压缩
         self.param_panel.setMaximumWidth(600)
         self.splitter.addWidget(self.param_panel)
         
-        # 设置 Splitter 初始比例 (加宽侧边栏以显示多行)
-        self.splitter.setStretchFactor(0, 0) 
-        self.splitter.setStretchFactor(1, 1) # 中间区域主动伸缩
-        self.splitter.setStretchFactor(2, 0)
-        # 左侧给到 320px 以容纳至少两列，右侧给到 300px
-        self.splitter.setSizes([320, 800, 300])
+        # 设置 Splitter 初始比例 (仅当没有保存的状态时应用)
+        if not self.settings.value("window/main_splitter"):
+            # 左侧给到 340px (刚好两列缩略图 148*2 + margins)，右侧 400px
+            # 中间区域自动占据剩余空间 (1600 - 340 - 400 = 860px)
+            self.splitter.setSizes([340, 860, 400])
 
     def resizeEvent(self, event):
         """窗口缩放时尝试消除空白"""
@@ -333,7 +328,7 @@ class MainWindow(QMainWindow):
         if folder:
             self.current_folder = folder
             self.settings.setValue("last_folder", folder) # 保存设置
-            self.load_folder(folder)
+            self.file_controller.load_folder(folder)
             
             # 启动监控
             if self.watcher.start_monitoring(folder):
@@ -344,136 +339,47 @@ class MainWindow(QMainWindow):
     def refresh_folder(self):
         """刷新当前文件夹 - 使用数据库查询而非重新扫描"""
         if self.current_folder:
-            # 不重新扫描，而是重新执行当前的搜索/过滤
-            self.perform_search(model=self.current_model, lora=self.current_lora)
+            self.search_controller.perform_search()
             self.statusBar().showMessage("已刷新列表", 2000)
 
-    def load_folder(self, folder):
-        """扫描文件夹并加载现有图片 (异步)"""
-        self.thumbnail_list.clear_list()
-        self.viewer.clear_view() # 使用安全清空方法
-        self.param_panel.clear_info()
-        self.statusBar().showMessage(f"正在加载: {folder}...")
-        
-        # 停止旧的加载线程（如果有）
-        if hasattr(self, 'loader_thread') and self.loader_thread.isRunning():
-            self.loader_thread.stop()
-            self.loader_thread.wait()
-            
-        from src.core.loader import ImageLoaderThread
-        self.loader_thread = ImageLoaderThread(folder, self.db_manager)
-        # 连接新的带缩略图的信号
-        self.loader_thread.image_thumb_ready.connect(self._on_loader_image_ready)
-        # 保留旧的 fallback
-        self.loader_thread.image_found.connect(self._on_loader_image_found)
-        self.loader_thread.finished_loading.connect(self._on_loader_finished)
-        self.loader_thread.start()
 
-    def _on_loader_image_ready(self, path, thumb):
-        # 检查是否是第一张图片（即最新的一张）
-        is_first = self.thumbnail_list.count() == 0
-        
-        # 线程回调：添加带缩略图的图片
-        self.thumbnail_list.add_image(path, thumbnail=thumb)
-        
-        # 如果是第一张，自动选中并显示
-        if is_first:
-            self.thumbnail_list.setCurrentRow(0)
-            self.on_image_selected(path)
-            
-        # 增量刷新模型筛选器：每加载 30 张图片刷新一次，让用户尽早看到 LoRA 列表
-        count = self.thumbnail_list.count()
-        if count > 0 and count % 30 == 0:
-            self.refresh_model_explorer()
-
-    def _on_loader_image_found(self, path):
-        # 线程回调：添加单张图片 (无缩略图)
-        self.thumbnail_list.add_image(path)
-        
-    def _on_loader_finished(self):
-        self.statusBar().showMessage("文件夹加载完成")
-        # 刷新模型浏览器数据
-        self.refresh_model_explorer()
-        # 尝试自动选中已有的第一张（如果列表不为空）
-        if self.thumbnail_list.count() > 0:
-             # 为了避免干扰用户操作，只有在当前没有任何选中项时才自动选中第一张
-             # 这里先不强制自动选中，以免覆盖用户意图
-             pass
-
-    def refresh_model_explorer(self):
-        """从数据库读取最新的模型和 LoRA 统计信息"""
-        if not self.current_folder: return
-        models = self.db_manager.get_unique_models(self.current_folder)
-        loras = self.db_manager.get_unique_loras(self.current_folder)
-        self.model_explorer.update_models(models, loras)
-
-    def on_new_image_detected(self, path):
-        """Watcher 信号回调：新图片生成"""
-        print(f"[新图片] 检测到: {path}")
-        self.statusBar().showMessage(f"新图片 detected: {os.path.basename(path)}")
-        
-        # 延迟加载，等待文件写入完成
-        QTimer.singleShot(500, lambda: self._load_new_image_with_retry(path, retries=3))
-    
-    def _load_new_image_with_retry(self, path, retries=3):
-        """延迟重试加载新图片，处理文件未完全写入的情况"""
-        try:
-            from PyQt6.QtGui import QImage
-            img = QImage(path)
-            print(f"[新图片] QImage 加载: isNull={img.isNull()}, size={img.size()}")
-            
-            if not img.isNull():
-                thumb = img.scaled(128, 128, Qt.AspectRatioMode.KeepAspectRatio, 
-                                  Qt.TransformationMode.FastTransformation)
-                print(f"[新图片] 缩略图生成成功: {thumb.size()}")
-                self.thumbnail_list.add_image(path, index=0, thumbnail=thumb)
-                self.thumbnail_list.setCurrentRow(0) # 明确选中第一张图片，确保高亮同步
-                print(f"[新图片] 已添加到列表（带缩略图）并选中")
-                
-                # 自动查看最新的
-                self.on_image_selected(path)
-            else:
-                # 图片加载失败，可能文件还在写入中
-                if retries > 0:
-                    print(f"[新图片] 加载失败，{retries} 次重试剩余，等待 800ms...")
-                    QTimer.singleShot(800, lambda: self._load_new_image_with_retry(path, retries - 1))
-                else:
-                    print(f"[新图片] 多次重试后仍失败，使用占位符")
-                    self.thumbnail_list.add_image(path, index=0)
-                    self.thumbnail_list.setCurrentRow(0)
-                    self.on_image_selected(path)
-        except Exception as e:
-            print(f"[新图片] 缩略图生成失败: {e}")
-            if retries > 0:
-                QTimer.singleShot(800, lambda: self._load_new_image_with_retry(path, retries - 1))
-            else:
-                import traceback
-                traceback.print_exc()
-                self.thumbnail_list.add_image(path, index=0)
-                self.thumbnail_list.setCurrentRow(0)
-                self.on_image_selected(path)
 
     def _on_comfy_progress(self, value, max_val):
         """处理 ComfyUI 进度"""
-        progress = int((value / max_val) * 100) if max_val > 0 else 0
-        # 如果正在采样，显示具体百分号
-        current_msg = self.statusBar().currentMessage()
-        if "正在生成" in current_msg or "采样" in current_msg:
-             self.statusBar().showMessage(f"ComfyUI 正在采样... {progress}%")
+        if max_val > 0:
+            progress = int((value / max_val) * 100)
+            # 显示进度条
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(progress)
+            # 同时在状态栏显示详细信息
+            self.statusBar().showMessage(f"ComfyUI 正在生成... 步骤 {value}/{max_val}")
+        else:
+            self.progress_bar.setVisible(False)
 
     def _on_comfy_node_start(self, node_id, node_type):
         """当 ComfyUI 开始执行某个节点时"""
         self.statusBar().showMessage(f"ComfyUI 正在执行: {node_type} (节点 {node_id})")
         print(f"[Comfy] 正在执行节点: {node_id} ({node_type})")
+    
+    def _on_comfy_done(self):
+        """当 ComfyUI 完成生成时"""
+        # 隐藏进度条
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setValue(0)
+        # 显示完成消息
+        self.statusBar().showMessage("✅ ComfyUI 生成完成！", 5000)
+        print("[Comfy] 生成任务完成")
+
 
     def on_remote_gen_requested(self, workflow):
-        """发送远程生成请求"""
-        self.statusBar().showMessage("正在提交生成请求到 ComfyUI...", 3000)
-        prompt_id = self.comfy_client.send_prompt(workflow)
-        if prompt_id:
-            self.statusBar().showMessage(f"请求已提交 (ID: {prompt_id[:8]}...)", 5000)
-        else:
-            QMessageBox.warning(self, "生成失败", "无法提交任务到 ComfyUI，请检查地址和连接状态。")
+        """处理远程生成请求 - 使用当前图片的workflow重新生成"""
+        # 使用当前图片的workflow，但会自动修改随机种子
+        print("[Main] 远程生成: 使用当前图片的workflow（随机种子）")
+        self.comfy_client.queue_current_prompt(workflow)
+        self.statusBar().showMessage("已发送生成请求到ComfyUI（使用当前图片参数）", 3000)
+    def _on_prompt_submitted(self, prompt_id):
+        """当任务成功提交到 ComfyUI 后触发"""
+        self.statusBar().showMessage(f"请求已提交 (ID: {prompt_id[:8]}...)", 5000)
 
     def on_image_selected(self, path):
         """用户点击缩略图或自动跳转"""
@@ -494,7 +400,7 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event):
         """处理全局快捷键"""
         if event.key() == Qt.Key.Key_Delete:
-            self.delete_current_image()
+            self.file_controller.delete_current_image()
         elif event.key() == Qt.Key.Key_Left:
             self.navigate_image(-1)
         elif event.key() == Qt.Key.Key_Right:
@@ -505,49 +411,8 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def delete_current_image(self):
-        idx = self.thumbnail_list.currentIndex()
-        if not idx.isValid():
-            return
-            
-        row = idx.row()
-        path = self.thumbnail_list.image_model.get_path(row)
-        
-        # 确认对话框
-        confirm = self.settings.value("confirm_delete", True, type=bool)
-        if confirm:
-            ret = QMessageBox.question(self, "确认删除", f"确定要将图片移至回收站吗？\n{os.path.basename(path)}",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if ret != QMessageBox.StandardButton.Yes:
-                return
-        
-        try:
-            # FIX: Windows API (SHFileOperation) 对路径分隔符非常敏感
-            # 必须使用 os.path.normpath 将混用的 / 和 \ 统一为 Windows 标准的 反斜杠
-            # 并使用 abspath 确保是绝对路径
-            safe_path = os.path.normpath(os.path.abspath(path))
-            send2trash(safe_path)
-            
-            # 从模型中移除
-            self.thumbnail_list.image_model.beginRemoveRows(idx.parent(), row, row)
-            self.thumbnail_list.image_model.image_data.pop(row)
-            self.thumbnail_list.image_model.endRemoveRows()
-            
-            self.statusBar().showMessage(f"已删除: {os.path.basename(path)}")
-            
-            # 自动选中下一张 (如果有)
-            if self.thumbnail_list.count() > 0:
-                next_row = min(row, self.thumbnail_list.count() - 1)
-                self.thumbnail_list.setCurrentRow(next_row)
-                
-                # 重新加载新选中的图片
-                next_path = self.thumbnail_list.image_model.get_path(next_row)
-                self.on_image_selected(next_path)
-            else:
-                self.viewer.scene.clear()
-                self.param_panel.clear_info()
-                
-        except Exception as e:
-            QMessageBox.critical(self, "删除失败", str(e))
+        # 兼容旧代码调用，转发给 controller
+        self.file_controller.delete_current_image()
 
     def navigate_image(self, delta):
         """切换图片: -1 上一张, 1 下一张"""
@@ -582,8 +447,15 @@ class MainWindow(QMainWindow):
             self.apply_theme()
 
     def closeEvent(self, event):
+        # 保存窗口状态
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        self.settings.setValue("window/main_splitter", self.splitter.saveState())
+        self.settings.setValue("window/left_splitter", self.left_splitter.saveState())
+        
         self.watcher.stop_monitoring()
         super().closeEvent(event)
+
+
 
     def apply_theme(self):
         """应用界面主题 (Windows 11 Fluent Design 风格)"""
@@ -677,22 +549,6 @@ class MainWindow(QMainWindow):
             }}
             QLineEdit:focus {{
                 border-bottom: 2px solid {colors['accent']};
-                background-color: {colors['bg_hover']};
-            }}
-
-            /* 列表组件 (QListView/QListWidget) */
-            QListView, QListWidget {{
-                background-color: transparent;
-                border: none;
-                outline: none;
-            }}
-            QListView::item {{
-                padding: 10px;
-                border-radius: 8px;
-                margin: 2px 8px;
-                background-color: transparent;
-            }}
-            QListView::item:hover {{
                 background-color: {colors['bg_hover']};
             }}
             QListView::item:selected {{
@@ -870,56 +726,6 @@ class MainWindow(QMainWindow):
         self.comparison_view.viewer_left.set_background_color(bg_viewer)
         self.comparison_view.viewer_right.set_background_color(bg_viewer)
 
-    def on_search_changed(self):
-        """搜索文字改变，开启防抖计时"""
-        self.search_timer.start(500) # 500ms 后执行搜索
-
-    def perform_search(self, model=None, lora=None):
-        """执行数据库搜索 (增加优化，防止 UI 阻塞)"""
-        keyword = self.search_bar.text().strip()
-        if not self.current_folder: return
-        
-        # 优化：不再强行 wait() 线程，而是直接 disconnect 并 stop
-        if hasattr(self, 'loader_thread') and self.loader_thread.isRunning():
-            try:
-                self.loader_thread.image_thumb_ready.disconnect()
-                self.loader_thread.image_found.disconnect()
-                self.loader_thread.finished_loading.disconnect()
-            except: pass
-            self.loader_thread.stop()
-            # 不调用 .wait()，直接开启新流程
-            
-        m_val = None if model == "ALL" else model
-        l_val = None if lora == "ALL" else lora
-        
-        results = self.db_manager.search_images(
-            keyword=keyword, 
-            folder_path=self.current_folder,
-            model=m_val,
-            lora=l_val,
-            order_by=self.current_sort_by
-        )
-        
-        # 性能优化：在填充大数据量列表前禁用更新
-        self.thumbnail_list.setUpdatesEnabled(False)
-        self.thumbnail_list.clear_list()
-        
-        for path in results:
-            self.thumbnail_list.add_image(path)
-            
-        self.thumbnail_list.setUpdatesEnabled(True)
-        self.statusBar().showMessage(f"通过筛选找到 {len(results)} 张图片")
-        
-        # 启动异步缩略图补全
-        if results:
-            if hasattr(self, 'search_loader') and self.search_loader.isRunning():
-                self.search_loader.stop()
-                self.search_loader.wait()
-            
-            self.search_loader = SearchThumbnailLoader(results, self.thumb_cache)
-            self.search_loader.thumbnail_ready.connect(self._on_search_thumb_ready)
-            self.search_loader.start()
-
     def _on_zoom_changed(self, index):
         """处理缩放下拉框变化"""
         data = self.zoom_combo.itemData(index)
@@ -938,10 +744,6 @@ class MainWindow(QMainWindow):
             except ValueError:
                 pass
 
-    def _on_search_thumb_ready(self, index, path, thumb):
-        """异步补全搜索结果的图标 (Model 版)"""
-        self.thumbnail_list.image_model.update_thumbnail(path, thumb)
-
     def _on_sort_changed(self, index):
         """排序方式变更"""
         if index < 0: return
@@ -949,24 +751,7 @@ class MainWindow(QMainWindow):
         if sort_by:
             self.current_sort_by = sort_by
             self.settings.setValue("sort_by", sort_by)
-            self.perform_search(model=self.current_model, lora=self.current_lora)
-
-    def _reset_all_filters(self):
-        """重置所有筛选条件"""
-        self.search_bar.clear()
-        self.model_explorer._clear_selection()
-        self.statusBar().showMessage("已重置所有筛选", 2000)
-
-    def on_filter_requested(self, filter_type, name):
-        """处理来自模型浏览器的过滤请求 (双向联动)"""
-        if filter_type == "Model":
-            self.current_model = name
-            if name == "ALL":
-                self.current_lora = "ALL" # 模型都重置了，LoRA 通常也重置
-            self.perform_search(model=self.current_model, lora=self.current_lora)
-        elif filter_type == "Lora":
-            self.current_lora = name
-            self.perform_search(model=self.current_model, lora=self.current_lora)
+            self.search_controller.perform_search()
 
     def on_selection_changed(self, selected, deselected):
         """当选择项改变时（用于对比模式自动触发）"""
@@ -1005,4 +790,29 @@ class MainWindow(QMainWindow):
             self.thumbnail_list.clearSelection() # 清理一下
             self.view_stack.setCurrentIndex(0)
             self.statusBar().showMessage("对比模式已关闭，恢复单选浏览。")
+
+    def closeEvent(self, event):
+        """窗口关闭时保存状态"""
+        print("[Window] closeEvent 被调用，正在保存窗口状态...")
+        
+        # 保存窗口几何形状（位置和大小）
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        print(f"[Window] 已保存窗口几何形状")
+        
+        # 保存分割器状态（各面板的宽度比例）
+        self.settings.setValue("window/main_splitter", self.splitter.saveState())
+        self.settings.setValue("window/left_splitter", self.left_splitter.saveState())
+        print(f"[Window] 已保存分割器状态")
+        
+        # 保存当前文件夹
+        if self.current_folder:
+            self.settings.setValue("last_folder", self.current_folder)
+            print(f"[Window] 已保存当前文件夹: {self.current_folder}")
+        
+        # 强制同步到磁盘
+        self.settings.sync()
+        print(f"[Window] 设置已同步到磁盘")
+        
+        # 继续正常关闭
+        event.accept()
 

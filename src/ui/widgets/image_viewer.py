@@ -127,3 +127,5 @@ class ImageViewer(QGraphicsView):
         super().resizeEvent(event)
         if self.auto_fit:
             self.fit_to_window()
+
+

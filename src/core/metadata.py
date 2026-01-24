@@ -137,6 +137,18 @@ class MetadataParser:
                     if lora_name:
                         result['loras'].append(f"{lora_name} ({strength})")
 
+                # 提取 Checkpoint (模型)
+                if 'checkpointloader' in class_type or 'checkpoint' in class_type:
+                    ckpt = inputs.get('ckpt_name')
+                    if ckpt:
+                        # 移除扩展名，保持整洁
+                        # result['params']['Model'] = ckpt # 这种方式可能不被 database 识别，因为它读的是 params.get('Model')
+                        # 实际上 database.py 读取 parse_image 返回的 result['params']['Model']
+                        # 让我们把 Model 放入 params
+                        name_without_ext = ckpt.rsplit('.', 1)[0]
+                        result['params']['Model'] = name_without_ext
+                        result['params']['Model hash'] = "Unknown" # ComfyUI 通常不直接提供 hash
+
                 # 提取核心参数 (KSampler)
                 if class_type in ['ksampler', 'ksampleradvanced']:
                     for k in ['seed', 'steps', 'cfg', 'sampler_name', 'scheduler', 'denoise']:
@@ -156,7 +168,40 @@ class MetadataParser:
                     if len(text) > 2:
                         prompts.append((node_id, text))
 
-            # 2. 启发式分配提示词并记录节点 ID (精准回传)
+            # 2. 启发式：如果通过标准节点没找到模型，尝试遍历所有参数寻找 .safetensors/.ckpt
+            if 'Model' not in result['params']:
+                potential_models = []
+                for node in data.values():
+                    inputs = node.get('inputs', {})
+                    for val in inputs.values():
+                        if isinstance(val, str) and val.lower().endswith(('.safetensors', '.ckpt', '.pt')):
+                            filename_lower = val.lower()
+                            # 排除列表：LoRA, ControlNet, VAE, Upscaler, LLM, CLIP
+                            # ComfyUI 的模型通常很乱，但主模型一般很大且名字独特
+                            # 简单的黑名单过滤
+                            ignore_keywords = ['lora', 'controlnet', 'vae', 'upscale', 'esrgan', 'llm', 'clip', 'bert', 't5', 'qwen', 'ae.']
+                            if not any(k in filename_lower for k in ignore_keywords):
+                                potential_models.append(val)
+                
+                if potential_models:
+                    # 如果有多个候选，优先选择看起来像主模型的 (比如含 sd, xl, flux)
+                    # 或者简单地取第一个
+                    # 排序策略：含 'xl', 'sd', 'v1', 'real' 的优先
+                    def model_score(name):
+                        s = 0
+                        n = name.lower()
+                        if 'xl' in n: s += 2
+                        if 'sd' in n: s += 2
+                        if 'flux' in n: s += 3 # Flux 很火
+                        if 'real' in n: s += 1
+                        return s
+                    
+                    potential_models.sort(key=model_score, reverse=True)
+                    
+                    name_without_ext = potential_models[0].rsplit('.', 1)[0]
+                    result['params']['Model'] = name_without_ext
+
+            # 3. 启发式分配提示词并记录节点 ID (精准回传)
             if prompts:
                 # 排序规则：倾向于认为第一个长文本是 Positive
                 prompts.sort(key=lambda x: len(x[1]), reverse=True)

@@ -1,16 +1,17 @@
 import sqlite3
 import os
 import json
+from typing import List, Dict, Any, Optional
 
 class DatabaseManager:
     """
     管理本地 SQLite 数据库，存储图片元数据。
     """
-    def __init__(self, db_path="aimg_metadata.db"):
+    def __init__(self, db_path: str = "aimg_metadata.db") -> None:
         self.db_path = db_path
         self._init_db()
 
-    def _init_db(self):
+    def _init_db(self) -> None:
         """初始化数据库表结构"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -95,7 +96,7 @@ class DatabaseManager:
         
         conn.close()
 
-    def add_image(self, file_path, meta):
+    def add_image(self, file_path: str, meta: Dict[str, Any]) -> None:
         """插入或更新一张图片的元数据"""
         if not meta: return
         
@@ -153,61 +154,77 @@ class DatabaseManager:
         finally:
             conn.close()
 
-    def search_images(self, keyword="", folder_path=None, model=None, lora=None, order_by="time_desc"):
+    def search_images(self, keyword: str = "", folder_path: Optional[str] = None, 
+                     model: Optional[str] = None, lora: Optional[str] = None, 
+                     order_by: str = "time_desc") -> List[str]:
         """搜索图片，支持关键字、模型、LoRA、文件夹过滤和排序"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         # 排序逻辑映射
         order_map = {
-            "time_desc": "file_mtime DESC",
-            "time_asc": "file_mtime ASC",
-            "name_asc": "file_name ASC",
-            "name_desc": "file_name DESC"
+            "time_desc": "i.file_mtime DESC", # 使用别名 i
+            "time_asc": "i.file_mtime ASC",
+            "name_asc": "i.file_name ASC",
+            "name_desc": "i.file_name DESC"
         }
-        order_sql = order_map.get(order_by, 'file_mtime DESC')
+        order_sql = order_map.get(order_by, 'i.file_mtime DESC')
 
         args = []
         
-        # 构建主查询，如果使用 LoRA 过滤，则需要 JOIN
-        if lora:
-            query = "SELECT i.file_path FROM images i JOIN image_loras il ON i.id = il.image_id WHERE il.lora_name = ?"
+        # 基础查询，使用别名 i
+        if lora and lora != "ALL":
+            # 如果按 LoRA 筛选，必须 JOIN image_loras 表
+            query = "SELECT DISTINCT i.file_path FROM images i JOIN image_loras il ON i.id = il.image_id WHERE il.lora_name = ?"
             args.append(lora)
         else:
-            query = "SELECT file_path FROM images WHERE 1=1"
+            query = "SELECT i.file_path FROM images i WHERE 1=1"
 
         if keyword:
-            # 尝试使用 FTS5
+            # 尝试使用 FTS5 (需要小心别名)
+            # FTS5 表通常包含 rowid, prompt, file_name
+            # 我们需要查找符合 keyword 的 rowid，然后在 images 表中过滤
             try:
-                # 检查 FTS5 表是否存在
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='images_fts'")
                 if cursor.fetchone():
-                    # 使用 FTS5 MATCH，结合子查询
-                    query += f" AND id IN (SELECT rowid FROM images_fts WHERE images_fts MATCH ?)"
-                    args.append(keyword)
+                    # FTS5 语法：images_fts MATCH 'keyword'
+                    # 注意：match 参数不能直接用 ? params 绑定到 match 表达式内部，但可以用字符串拼接或者 ? 绑定整个表达式
+                    # 更好的写法：WHERE images_fts MATCH ? -> args: keyword
+                    # 这里我们需要连接 images i
+                    query += " AND i.id IN (SELECT rowid FROM images_fts WHERE images_fts MATCH ?)"
+                    args.append(f'"{keyword}"') # FTS5 建议用引号包裹短语
                 else:
-                    query += " AND (prompt LIKE ? OR file_name LIKE ?)"
+                    query += " AND (i.prompt LIKE ? OR i.file_name LIKE ?)"
                     args.extend([f"%{keyword}%", f"%{keyword}%"])
             except:
-                query += " AND (prompt LIKE ? OR file_name LIKE ?)"
+                query += " AND (i.prompt LIKE ? OR i.file_name LIKE ?)"
                 args.extend([f"%{keyword}%", f"%{keyword}%"])
             
         if folder_path:
-            query += " AND file_path LIKE ?"
-            args.append(f"{folder_path}%")
+            # 统一路径分隔符 (数据库中推荐存 /, 但为了兼容性，我们确保查询时也一致)
+            norm_folder = folder_path.replace("\\", "/")
+            query += " AND i.file_path LIKE ?"
+            args.append(f"{norm_folder}%")
 
         if model and model != "ALL":
-            query += " AND model_name = ?"
+            query += " AND i.model_name = ?"
             args.append(model)
         
         query += f" ORDER BY {order_sql}"
         
-        cursor.execute(query, args)
-        results = [row[0] for row in cursor.fetchall()]
+        try:
+            # DEBUG: 打印查询语句，方便排查 0 结果问题
+            # print(f"[DB] Executing SQL: {query} | Args: {args}")
+            cursor.execute(query, args)
+            results = [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"[DB] Search Error: {e}\nQuery: {query}\nArgs: {args}")
+            results = []
+            
         conn.close()
         return results
 
-    def get_unique_models(self, folder_path=None):
+    def get_unique_models(self, folder_path: Optional[str] = None) -> List[tuple]:
         """获取已索引的所有 Checkpoint 模型及其计数"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -222,21 +239,40 @@ class DatabaseManager:
         conn.close()
         return results
 
-    def get_unique_loras(self, folder_path=None):
-        """获取已索引的所有 LoRA 网络及其计数 (极速版)"""
+    def get_unique_loras(self, folder_path: Optional[str] = None, model_filter: Optional[str] = None) -> List[tuple]:
+        """
+        获取已索引的所有 LoRA 网络及其计数。
+        如果指定了 model_filter，则只返回在该模型生成的图片中使用过的 LoRA。
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        query = "SELECT il.lora_name, COUNT(*) as count FROM image_loras il"
         args = []
+        # 使用 JOIN 来关联 images 表，以便检查 model_name 和 folder_path
+        query = """
+            SELECT il.lora_name, COUNT(*) as count 
+            FROM image_loras il
+            JOIN images i ON il.image_id = i.id
+            WHERE 1=1
+        """
         
         if folder_path:
-            query += " JOIN images i ON il.image_id = i.id WHERE i.file_path LIKE ?"
-            args.append(f"{folder_path}%")
+            norm_folder = folder_path.replace("\\", "/")
+            query += " AND i.file_path LIKE ?"
+            args.append(f"{norm_folder}%")
+            
+        if model_filter and model_filter != "ALL":
+            query += " AND i.model_name = ?"
+            args.append(model_filter)
             
         query += " GROUP BY il.lora_name ORDER BY count DESC"
         
-        cursor.execute(query, args)
-        results = cursor.fetchall()
+        try:
+            cursor.execute(query, args)
+            results = cursor.fetchall()
+        except Exception as e:
+            print(f"[DB] get_unique_loras error: {e}")
+            results = []
+            
         conn.close()
         return results

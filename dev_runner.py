@@ -14,16 +14,9 @@ class RestartHandler(FileSystemEventHandler):
         self.start_process()
 
     def start_process(self):
-        if self.process:
-            try:
-                print(f"[HotReload] 🛑 正在停止旧进程 (PID: {self.process.pid})...")
-                self.process.terminate()
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                print("[HotReload] ⚠️ 进程未响应，强制终止...")
-                self.process.kill()
-            except Exception as e:
-                print(f"[HotReload] 错误: {e}")
+        # 再次检查，防止并发
+        if self.process and self.process.poll() is None:
+            self.stop_process_tree()
         
         print(f"[HotReload] 🚀 正在启动 {self.script_path}...")
         # Use python from current environment
@@ -40,12 +33,38 @@ class RestartHandler(FileSystemEventHandler):
             return
 
         current_time = time.time()
-        if current_time - self.last_restart_time < self.debounce_interval:
+        # 增加防抖时间到 1.5s，避免某些编辑器连续保存触发多次
+        if current_time - self.last_restart_time < 2.0:
             return
 
         self.last_restart_time = current_time
         print(f"\n[HotReload] 🔄 检测到文件变更: {os.path.basename(event.src_path)}")
+        
+        # 确保完全杀死旧进程后再启动
+        if self.process:
+             # 双重保障：先尝试停止
+             self.stop_process_tree()
+             time.sleep(0.5) # 给一点时间让窗口消失
+             
         self.start_process()
+
+    def stop_process_tree(self):
+        """专门提取的停止逻辑"""
+        if not self.process: return
+        try:
+            pid = self.process.pid
+            print(f"[HotReload] 🛑 正在清理旧进程 (PID: {pid})...")
+            if sys.platform == 'win32':
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)], 
+                    stdout=subprocess.DEVNULL, 
+                    stderr=subprocess.DEVNULL
+                )
+            else:
+                self.process.terminate()
+                self.process.wait(timeout=1)
+        except Exception as e:
+            print(f"[HotReload] ⚠️ 清理进程异常: {e}")
 
 if __name__ == "__main__":
     # Ensure we are in the script's directory
