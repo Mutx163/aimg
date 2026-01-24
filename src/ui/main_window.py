@@ -86,12 +86,24 @@ class MainWindow(QMainWindow):
         self.comfy_client.status_changed.connect(lambda msg: self.statusBar().showMessage(f"[Comfy] {msg}", 3000))
         self.comfy_client.progress_updated.connect(self._on_comfy_progress)
         self.comfy_client.prompt_submitted.connect(self._on_prompt_submitted)
+        
+        # 绑定模型列表获取信号
+        self.comfy_client.models_fetched.connect(lambda models: self.param_panel.set_available_models(models))
+        
         self.comfy_client.connect_server()
+        # 尝试获取可用模型
+        QTimer.singleShot(1000, self.comfy_client.fetch_available_models)
         
         # 绑定参数面板的远程生成请求
         self.param_panel.remote_gen_requested.connect(self.on_remote_gen_requested)
         self.comfy_client.execution_start.connect(self._on_comfy_node_start)
         self.comfy_client.execution_done.connect(self._on_comfy_done)
+        
+        # 日志系统:使用定时器轮询param_panel的日志列表
+        self.log_poll_timer = QTimer(self)
+        self.log_poll_timer.timeout.connect(self._poll_logs)
+        self.log_poll_timer.start(500)  # 每500ms检查一次新日志
+        self.last_log_count = 0  # 记录上次已处理的日志数量
 
         
         # 自动加载上次的文件夹
@@ -199,6 +211,27 @@ class MainWindow(QMainWindow):
         box_lay.setSpacing(4) # 再次缩小间距，确保紧凑
         # 移除 box_lay.addStretch()，依靠 addPermanentWidget 自动靠右
         
+        # --- 日志按钮 ---
+        self.log_btn = QPushButton("📜 日志")
+        self.log_btn.setFixedWidth(60)
+        self.log_btn.setFixedHeight(22)
+        self.log_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.log_btn.clicked.connect(self._show_log_dialog)
+        self.log_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: 1px solid palette(mid);
+                border-radius: 4px;
+                color: palette(text);
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: palette(midlight);
+                border-color: palette(highlight);
+            }
+        """)
+        box_lay.addWidget(self.log_btn)
+
         # --- 进度组 (容器内并排放置 Bar 和 取消按钮) ---
         from PyQt6.QtWidgets import QGridLayout
         self.progress_container = QWidget()
@@ -450,6 +483,10 @@ class MainWindow(QMainWindow):
 
     def on_remote_gen_requested(self, workflow):
         """处理远程生成请求 - 使用当前图片的workflow重新生成"""
+        # 清空上一轮日志缓存
+        self.last_gen_logs = ""
+        self.last_log_count = 0
+        
         # 使用当前图片的workflow，但会自动修改随机种子
         print("[Main] 远程生成: 使用当前图片的workflow（随机种子）")
         self.comfy_client.queue_current_prompt(workflow)
@@ -532,7 +569,110 @@ class MainWindow(QMainWindow):
         self.watcher.stop_monitoring()
         super().closeEvent(event)
 
+    def _poll_logs(self):
+        """定时轮询param_panel的日志列表并更新UI"""
+        from src.ui.widgets.param_panel import ParameterPanel
+        
+        current_log_count = len(ParameterPanel.generation_logs)
+        if current_log_count > self.last_log_count:
+            # 有新日志
+            new_logs = ParameterPanel.generation_logs[self.last_log_count:]
+            for log in new_logs:
+                # 不需要再加时间戳,_log已经加过了
+                if not hasattr(self, 'last_gen_logs'):
+                    self.last_gen_logs = ""
+                self.last_gen_logs += log + "\n"
+            
+            self.last_log_count = current_log_count
+            
+            # 如果日志窗口打开,实时更新
+            if hasattr(self, 'log_dialog') and self.log_dialog.isVisible():
+                self.log_text_edit.setPlainText(self.last_gen_logs)
+                sb = self.log_text_edit.verticalScrollBar()
+                sb.setValue(sb.maximum())
+    
+    def _append_log(self, msg: str):
+        """追加日志到缓存"""
+        print(f"[MainWindow._append_log] 收到日志: {msg[:60]}...")
+        
+        if msg == "__CLEAR__":
+            self.last_gen_logs = ""
+            return
+            
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.last_gen_logs += f"[{timestamp}] {msg}\n"
+        
+        # 如果日志窗口是打开的，实时更新内容
+        if hasattr(self, 'log_dialog') and self.log_dialog.isVisible():
+            self.log_text_edit.setPlainText(self.last_gen_logs)
+            # 滚动到底部
+            sb = self.log_text_edit.verticalScrollBar()
+            sb.setValue(sb.maximum())
+        else:
+            if hasattr(self, 'log_dialog'):
+                pass
+            else:
+                pass
 
+    def _show_log_dialog(self):
+        """显示生成日志弹窗 (非模态)"""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QPushButton, QHBoxLayout
+        
+        # 如果已经创建且可见，刷新内容并激活
+        if hasattr(self, 'log_dialog') and self.log_dialog.isVisible():
+            # 刷新日志内容
+            self.log_text_edit.setPlainText(self.last_gen_logs if self.last_gen_logs else "暂无日志...")
+            # 滚动到底部
+            sb = self.log_text_edit.verticalScrollBar()
+            sb.setValue(sb.maximum())
+            # 激活窗口
+            self.log_dialog.raise_()
+            self.log_dialog.activateWindow()
+            return
+            
+        self.log_dialog = QDialog(self)
+        self.log_dialog.setWindowTitle("最近一次生成日志")
+        self.log_dialog.resize(600, 400)
+        # 设置为非模态，允许点击主窗口
+        self.log_dialog.setWindowModality(Qt.WindowModality.NonModal)
+        
+        layout = QVBoxLayout(self.log_dialog)
+        
+        self.log_text_edit = QTextEdit()
+        self.log_text_edit.setReadOnly(True)
+        self.log_text_edit.setPlainText(self.last_gen_logs if self.last_gen_logs else "暂无日志...")
+        self.log_text_edit.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                font-family: Consolas, "Courier New", monospace;
+                font-size: 11px;
+                border: 1px solid #333;
+                border-radius: 4px;
+            }
+        """)
+        
+        layout.addWidget(self.log_text_edit)
+        
+        # 按钮区
+        btn_layout = QHBoxLayout()
+        
+        btn_copy = QPushButton("📋 复制全部")
+        btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_copy.clicked.connect(lambda: QApplication.clipboard().setText(self.last_gen_logs))
+        btn_layout.addWidget(btn_copy)
+        
+        btn_layout.addStretch()
+        
+        btn_close = QPushButton("关闭")
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.clicked.connect(self.log_dialog.close)
+        btn_layout.addWidget(btn_close)
+        
+        layout.addLayout(btn_layout)
+        
+        self.log_dialog.show()
 
     def apply_theme(self):
         """应用界面主题 (Windows 11 Fluent Design 风格)"""

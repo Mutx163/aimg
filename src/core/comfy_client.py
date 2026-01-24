@@ -15,6 +15,7 @@ class ComfyClient(QObject):
     execution_start = pyqtSignal(str, str) # 节点ID, 节点类型/名称
     execution_done = pyqtSignal(str) # 执行完成的图片路径(或ID)
     prompt_submitted = pyqtSignal(str) # 任务提交成功，携带 prompt_id
+    models_fetched = pyqtSignal(list) # 获取到可用模型列表
     
     # 队列管理信号
     queue_updated = pyqtSignal(dict) # 队列状态更新
@@ -43,6 +44,8 @@ class ComfyClient(QObject):
     def _on_connected(self):
         print(f"[Comfy] WebSocket 已连接: {self.server_address}")
         self.status_changed.emit("ComfyUI 已连接")
+        # 连接成功后立即获取可用模型列表
+        self.fetch_available_models()
 
     def _on_error(self, error):
         print(f"[Comfy] WebSocket 错误: {error}")
@@ -97,12 +100,12 @@ class ComfyClient(QObject):
         
         json_data = json.dumps(p).encode('utf-8')
         reply = self.nam.post(request, QByteArray(json_data))
-        reply.finished.connect(lambda: self._handle_prompt_response(reply))
+        reply.finished.connect(lambda: self._handle_prompt_response(reply, workflow_json))
         
         # 在发送前检查队列状态，方便调试 (异步)
         self.check_system_stats()
 
-    def _handle_prompt_response(self, reply: QNetworkReply) -> None:
+    def _handle_prompt_response(self, reply: QNetworkReply, workflow_json: Dict[str, Any] = None) -> None:
         """处理发送任务的响应"""
         try:
             if reply.error() == QNetworkReply.NetworkError.NoError:
@@ -114,7 +117,41 @@ class ComfyClient(QObject):
             else:
                 err_msg = reply.errorString()
                 print(f"[Comfy] 任务提交失败: {err_msg}")
-                self.status_changed.emit(f"提交失败: {err_msg}")
+                
+                # 尝试读取服务器返回的详细错误信息
+                response_body = bytes(reply.readAll()).decode('utf-8')
+                if response_body:
+                    try:
+                        error_data = json.loads(response_body)
+                        if 'error' in error_data:
+                            server_error = error_data['error']
+                            print(f"[Comfy] 服务器错误详情: {server_error}")
+                            
+                            # 尝试提取具体的错误类型
+                            if isinstance(server_error, dict):
+                                error_type = server_error.get('type', '')
+                                error_message = server_error.get('message', '')
+                                error_details = server_error.get('details', '')
+                                
+                                print(f"[Comfy] 错误类型: {error_type}")
+                                print(f"[Comfy] 错误消息: {error_message}")
+                                if error_details:
+                                    print(f"[Comfy] 错误详情: {error_details}")
+                                    
+                                self.status_changed.emit(f"提交失败: {error_message}")
+                            else:
+                                print(f"[Comfy] 原始错误: {server_error}")
+                                self.status_changed.emit(f"提交失败: {server_error}")
+                        else:
+                            print(f"[Comfy] 服务器响应: {response_body}")
+                    except:
+                        print(f"[Comfy] 无法解析错误响应: {response_body}")
+                
+                if workflow_json:
+                    print(f"[Comfy] Debug - 提交的 Payload: {json.dumps(workflow_json, indent=2, ensure_ascii=False)}")
+                
+                if not response_body:
+                    self.status_changed.emit(f"提交失败: {err_msg}")
         except Exception as e:
             print(f"[Comfy] 响应解析失败: {e}")
             self.status_changed.emit(f"响应解析错误: {e}")
@@ -196,13 +233,6 @@ class ComfyClient(QObject):
             latest_prompt_id = list(data.keys())[0]
             latest_entry = data[latest_prompt_id]
             
-            # 提取workflow定义
-            # ComfyUI /history 的结构比较复杂，prompt字段可能不是完整workflow
-            prompt_data = latest_entry.get("prompt")
-            
-            # 调试：打印所有可用字段
-            print(f"[Comfy Debug] latest_entry 的键: {latest_entry.keys()}")
-            
             # 尝试从不同位置获取workflow
             workflow = None
             
@@ -245,6 +275,53 @@ class ComfyClient(QObject):
         finally:
             reply.deleteLater()
     
+    def fetch_available_models(self) -> None:
+        """从ComfyUI获取可用模型列表 (异步)"""
+        url_str = f"http://{self.server_address}/object_info/CheckpointLoaderSimple"
+        print(f"[Comfy] debug: fetch_available_models 调用, URL: {url_str}")
+        
+        url = QUrl(url_str)
+        request = QNetworkRequest(url)
+        # 增加超时设置 (虽不保证NAM生效，但值得尝试)
+        request.setTransferTimeout(5000) 
+        
+        self._model_fetch_reply = self.nam.get(request)
+        self._model_fetch_reply.finished.connect(lambda: self._handle_models_response(self._model_fetch_reply))
+        self._model_fetch_reply.errorOccurred.connect(lambda err: print(f"[Comfy] ⚠️ 模型请求网络错误: {err}"))
+
+    def _handle_models_response(self, reply: QNetworkReply) -> None:
+        """处理模型列表响应"""
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                print(f"[Comfy] 获取模型列表失败: {reply.errorString()}")
+                return
+            
+            data = json.loads(bytes(reply.readAll()).decode('utf-8'))
+            
+            # ComfyUI 返回格式: {"CheckpointLoaderSimple": {"input": {"required": {"ckpt_name": [["model1.ckpt", "model2.safetensors"], ...]}}}}
+            # 注意 ckpt_name 的值是一个由列表组成的元组，第一个元素是模型文件名列表
+            valid_models = []
+            
+            inputs = data.get("CheckpointLoaderSimple", {}).get("input", {}).get("required", {})
+            ckpt_param = inputs.get("ckpt_name")
+            
+            if ckpt_param and isinstance(ckpt_param, list) and len(ckpt_param) > 0:
+                # 第一个元素通常是文件名列表
+                models_list = ckpt_param[0]
+                if isinstance(models_list, list):
+                    valid_models = models_list
+            
+            if valid_models:
+                print(f"[Comfy] 成功获取 {len(valid_models)} 个可用模型")
+                self.models_fetched.emit(valid_models)
+            else:
+                print("[Comfy] 未解析到任何模型")
+                
+        except Exception as e:
+            print(f"[Comfy] 模型列表解析异常: {e}")
+        finally:
+            reply.deleteLater()
+
     def _randomize_seeds(self, workflow: Any) -> Any:
         """
         遍历workflow，将所有KSampler节点的seed随机化

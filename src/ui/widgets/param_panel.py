@@ -7,17 +7,36 @@ from PyQt6.QtGui import QFont
 from typing import List
 import random
 import copy
+from src.assets.default_workflows import DEFAULT_T2I_WORKFLOW
 
-class ParameterPanel(QWidget):
-    """
-    重设计的参数信息面板 - V4.0
-    采用卡片化、层次化设计，参考SD WebUI最佳实践
-    """
-    remote_gen_requested = pyqtSignal(dict) # 发送修改后的工作流
+class ParameterPanel(QScrollArea):
+    # 信号定义
+    remote_gen_requested = pyqtSignal(dict) # 请求远程生成 (带workflow)
+    
+    # 日志系统:使用简单的列表,不用信号
+    generation_logs = []  # 类变量,存储所有生成日志
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.layout = QVBoxLayout(self)
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        
+        # 内部状态
+        self.current_meta = {}
+        self.current_loras = {} # 存储当前选中的LoRA {name: weight}
+        
+        # The original __init__ content should be moved to setup_ui()
+        # For now, I'll keep the original __init__ content and add setup_ui() call.
+        # This might lead to duplicate UI setup if setup_ui() is not defined yet.
+        # However, the instruction only provides a snippet for the beginning of the class and __init__.
+        # I will assume the user intends for the existing UI setup to be part of setup_ui() later.
+        # For this specific instruction, I will just insert the new lines as provided.
+
+        # Create a central widget for the scroll area
+        self._central_widget = QWidget()
+        self.setWidget(self._central_widget)
+        
+        self.layout = QVBoxLayout(self._central_widget) # Layout should be on the central widget
         self.layout.setContentsMargins(5, 5, 5, 5)
         self.layout.setSpacing(8)
         
@@ -482,26 +501,42 @@ class ParameterPanel(QWidget):
         outer_layout.addWidget(self.gen_settings_container)
         
         # --- 3. 底部生成按钮 (从上方移动到这里) ---
-        self.btn_remote_gen = QPushButton("🔥 开始远程生成")
+        # 远程生成按钮行
+        gen_btn_layout = QHBoxLayout()
+        
+        # 始终使用标准模板,不再提供切换选项
+        gen_btn_layout.addStretch()
+        
+        self.btn_remote_gen = QPushButton("🚀 远程生成")
+        self.btn_remote_gen.setMinimumHeight(32)
         self.btn_remote_gen.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_remote_gen.setMinimumHeight(40)
-        self.btn_remote_gen.setObjectName("RemoteGenButton")
         self.btn_remote_gen.setStyleSheet("""
-            QPushButton#RemoteGenButton {
+            QPushButton {
                 background-color: #ff4d00;
                 color: white;
-                border: none;
                 font-weight: bold;
-                font-size: 14px;
-                border-radius: 6px;
-                margin-top: 5px;
+                border-radius: 4px;
+                border: 1px solid #cc3d00;
+                font-size: 13px;
+                padding-left: 20px;
+                padding-right: 20px;
             }
-            QPushButton#RemoteGenButton:hover { background-color: #ff6a00; }
-            QPushButton#RemoteGenButton:pressed { background-color: #e64500; }
-            QPushButton#RemoteGenButton:disabled { background-color: #444; color: #888; }
+            QPushButton:hover {
+                background-color: #ff6a00;
+            }
+            QPushButton:pressed {
+                background-color: #e64600;
+            }
+            QPushButton:disabled {
+                background-color: #555;
+                color: #aaa;
+                border: none;
+            }
         """)
         self.btn_remote_gen.clicked.connect(self._on_remote_gen_click)
-        outer_layout.addWidget(self.btn_remote_gen)
+        gen_btn_layout.addWidget(self.btn_remote_gen)
+        
+        gen_layout.addLayout(gen_btn_layout)
         
         # 将整个外层容器添加到父布局
         parent_layout.addWidget(gen_settings_outer)
@@ -562,7 +597,7 @@ class ParameterPanel(QWidget):
         weight_spin = QDoubleSpinBox()
         weight_spin.setRange(-2.0, 2.0)
         weight_spin.setSingleStep(0.01)  # 步长改为0.01
-        weight_spin.setValue(weight)
+        weight_spin.setValue(round(weight, 2))
         weight_spin.setDecimals(2)  # 显示2位小数
         weight_spin.setMinimumWidth(70)  # 稍微加宽以容纳两位小数
         weight_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
@@ -577,7 +612,7 @@ class ParameterPanel(QWidget):
         # 保存引用到combo box的userData
         lora_combo.setProperty("weight_spin", weight_spin)
         weight_spin.valueChanged.connect(
-            lambda v: self._update_lora_weight_from_combo(lora_combo, v)
+            lambda v: self._update_lora_weight_from_combo(lora_combo, round(v, 2))
         )
         item_layout.addWidget(weight_spin)
         
@@ -642,6 +677,11 @@ class ParameterPanel(QWidget):
         combo.setProperty("selected_lora", text)
         print(f"[UI] 选择LoRA: {text} (权重: {weight})")
     
+    def _log(self, msg: str):
+        """同时打印到控制台和发送信号"""
+        print(msg)
+        self.log_message.emit(msg)
+
     def _update_lora_weight_from_combo(self, combo, weight):
         """从ComboBox更新LoRA权重"""
         lora_name = combo.property("selected_lora")
@@ -684,6 +724,14 @@ class ParameterPanel(QWidget):
         
         self.current_loras.clear()
         print(f"[UI] 清空LoRA列表")
+    
+    def _log(self, msg: str):
+        """记录日志到列表和控制台"""
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {msg}"
+        print(log_entry)
+        ParameterPanel.generation_logs.append(log_entry)
     
     
     def _on_add_lora_click(self):
@@ -953,9 +1001,20 @@ class ParameterPanel(QWidget):
                 name = lora.get('name', '')
                 weight = lora.get('weight', 1.0)
             elif isinstance(lora, str):
+                # 尝试从字符串解析权重 "Name (0.8)"
                 name = lora
+                if '(' in lora and lora.endswith(')'):
+                    try:
+                        parts = lora.rsplit('(', 1)
+                        name_part = parts[0].strip()
+                        weight_part = parts[1].strip(')')
+                        weight = float(weight_part)
+                        name = name_part
+                    except:
+                        pass
+            
             if name:
-                # 简单清理名称（移除括号权重）
+                # 再次清理名称（双重保险）
                 clean_name = name.split('(')[0].strip()
                 self._add_lora_item(clean_name, float(weight))
         
@@ -963,35 +1022,129 @@ class ParameterPanel(QWidget):
 
     def _on_remote_gen_click(self):
         """处理远程生成点击"""
-        if not hasattr(self, 'current_meta') or not self.current_meta:
-            return
+        # 清空上一次的日志
+        ParameterPanel.generation_logs.clear()
+        self._log("========== 开始生成参数准备 ==========")
         
-        raw_workflow = self.current_meta.get('workflow')
-        if not raw_workflow:
+        # 始终使用标准模板workflow (不再参照图片)
+        self._log("[Main] 使用<标准模版>工作流")
+        raw_workflow = DEFAULT_T2I_WORKFLOW
+
+        # 深拷贝以防污染原始数据
+        try:
+            workflow = copy.deepcopy(raw_workflow)
+        except Exception as e:
+            self._log(f"Workflow 深拷贝失败: {e}")
             return
             
-        # 使用深拷贝防止修改内存中的原始元数据副本
-        workflow = copy.deepcopy(raw_workflow)
-            
+        params = self.current_meta.get('params', {}) if self.current_meta else {} 
         # 智能同步修改后的提示词到工作流 (V5.4 精准透明版)
         new_prompt = self.prompt_edit.toPlainText().strip()
         new_neg = self.neg_prompt_edit.toPlainText().strip()
         
+        # 1. 注入提示词 (智能追踪版)
+        def find_prompt_nodes_by_tracing(wf):
+            """
+            通过遍历图结构寻找提示词节点 (KSampler -> positive/negative -> CLIPTextEncode)
+            返回: (pos_id, neg_id)
+            """
+            ks_nodes = []
+            # 1. 找 所有 KSampler
+            for nid, node in wf.items():
+                ctype = node.get('class_type', '').lower()
+                if 'ksampler' in ctype:
+                    ks_nodes.append(node)
+            
+            if not ks_nodes: return None, None
+            
+            # 使用第一个 KSampler 进行追踪
+            ks_node = ks_nodes[0]
+            
+            def trace_back(current_node_id, visited=None):
+                if visited is None: visited = set()
+                if current_node_id in visited: return None
+                visited.add(current_node_id)
+                
+                curr_node = wf.get(str(current_node_id))
+                if not curr_node: return None
+                
+                ctype = curr_node.get('class_type', '').lower()
+                
+                # 找到目标
+                if 'cliptextencode' in ctype:
+                    return str(current_node_id)
+                
+                # 🛑 阻断逻辑：遇到 ZeroOut/SetArea/Avg 等修改/衍生 Conditioning 的节点，停止回溯
+                # 这些节点通常意味着当前的 conditioning 是从另一个 conditioning 衍生出来的（例如把正向转为负向）
+                # 我们不希望追踪到原始的 source (即正向提示词节点)
+                if 'zeroout' in ctype or 'setarea' in ctype or 'combine' in ctype or 'average' in ctype:
+                    return None
+                    
+                # 穿透逻辑 (Conditioning 传递)
+                # 检查 inputs 中是否有连接到其他节点的 conditioning/positive/negative
+                inputs = curr_node.get('inputs', {})
+                for k, v in inputs.items():
+                    # 常见的穿透键名
+                    if k in ['conditioning', 'positive', 'negative', 'clip', 'samples'] or True: # 激进策略：检查所有输入
+                        if isinstance(v, list) and len(v) >= 1:
+                            source_id = str(v[0])
+                            # 递归寻找
+                            res = trace_back(source_id, visited)
+                            if res: return res
+                return None
+
+            # 从 KSampler 的 inputs 开始回溯
+            pos_id = None
+            neg_id = None
+            
+            inputs = ks_node.get('inputs', {})
+            
+            # 找 positive
+            if 'positive' in inputs and isinstance(inputs['positive'], list):
+                pos_id = trace_back(str(inputs['positive'][0]))
+                
+            # 找 negative
+            if 'negative' in inputs and isinstance(inputs['negative'], list):
+                neg_id = trace_back(str(inputs['negative'][0]))
+                
+            return pos_id, neg_id
+
+        # 优先使用 Metadata ID
         pos_node_id = self.current_meta.get('prompt_node_id')
         neg_node_id = self.current_meta.get('negative_prompt_node_id')
         
-        print(f"\n[Comfy] --- 准备提交生成任务 ---")
+        # 如果 ID 无效 或 相同（冲突），尝试智能追踪
+        if not pos_node_id or not neg_node_id or pos_node_id == neg_node_id or \
+           pos_node_id not in workflow or neg_node_id not in workflow:
+            self._log("[Comfy] ⚠️ Prompt ID 无效或冲突(相同)，尝试智能图追踪...")
+            found_pos, found_neg = find_prompt_nodes_by_tracing(workflow)
+            
+            if found_pos:
+                pos_node_id = found_pos
+                self._log(f"[Comfy] -> 追踪到正向提示词节点: {pos_node_id}")
+                
+            if found_neg:
+                neg_node_id = found_neg
+                self._log(f"[Comfy] -> 追踪到反向提示词节点: {neg_node_id}")
+
+        self._log(f"\n[Comfy] --- 准备提交生成任务 ---")
         
-        # 1. 注入提示词
+        # 执行注入
         if pos_node_id and pos_node_id in workflow:
             workflow[pos_node_id]['inputs']['text'] = new_prompt
-            print(f"[Comfy] -> 正向提示词注入节点: {pos_node_id} (CLIPTextEncode)")
-        
+            self._log(f"[Comfy] -> 正向提示词注入节点: {pos_node_id} (CLIPTextEncode)")
+        else:
+            self._log(f"[Comfy] ⚠️ 注入失败: 未找到正向提示词节点")
+
         if neg_node_id and neg_node_id in workflow:
             workflow[neg_node_id]['inputs']['text'] = new_neg
-            print(f"[Comfy] -> 反向提示词注入节点: {neg_node_id} (CLIPTextEncode)")
-        
-        # 2. 读取用户自定义参数
+            self._log(f"[Comfy] -> 反向提示词注入节点: {neg_node_id} (CLIPTextEncode)")
+        else:
+            self._log(f"[Comfy] ⚠️ 注入失败: 未找到反向提示词节点")
+            if new_neg:
+                self._temp_notify("⚠️ 反向提示词无法生效 (此工作流使用自动 ZeroOut 负面条件)")
+
+        # 2. 读取用户自定义参数 (Seed/Res/Steps/CFG/Sampler)
         # Seed - 检查是否随机（-1或勾选checkbox）
         user_seed = None
         if not self.seed_random_checkbox.isChecked():
@@ -1012,17 +1165,17 @@ class ParameterPanel(QWidget):
         user_sampler = self.sampler_combo.currentText()
         
         # 3. 注入用户自定义参数到workflow
-        print(f"\n[Comfy] ========== 参数注入开始 ==========")
-        print(f"[Comfy] 用户参数:")
-        print(f"  → Seed: {user_seed if user_seed is not None else '随机'}")
-        print(f"  → 分辨率: {user_width}x{user_height}")
-        print(f"  → Steps: {user_steps}")
-        print(f"  → CFG: {user_cfg}")
-        print(f"  → Sampler: {user_sampler}")
-        print(f"  → LoRAs: {list(self.current_loras.keys())}")
+        self._log(f"\n[Comfy] ========== 参数注入开始 ==========")
+        self._log(f"[Comfy] 用户参数:")
+        self._log(f"  → Seed: {user_seed if user_seed is not None else '随机'}")
+        self._log(f"  → 分辨率: {user_width}x{user_height}")
+        self._log(f"  → Steps: {user_steps}")
+        self._log(f"  → CFG: {user_cfg}")
+        self._log(f"  → Sampler: {user_sampler}")
+        self._log(f"  → LoRAs: {list(self.current_loras.keys())}")
         
         # 遍历workflow节点注入参数
-        print(f"\n[Comfy] 开始遍历workflow节点...")
+        self._log(f"\n[Comfy] 开始遍历workflow节点...")
         modified_nodes = []
         
         for node_id, node in workflow.items():
@@ -1046,47 +1199,71 @@ class ParameterPanel(QWidget):
                     inputs['seed'] = final_seed
                     # 实时反馈：将生成的随机种子显示在界面上，不再隐藏
                     self.seed_input.setText(str(final_seed))
-                    self.seed_label.setText(str(final_seed)) # 同时更新顶部展示卡片
-                    print(f"[Comfy] -> 注入超随机Seed: 节点 {node_id} -> {final_seed}")
+                    self._log(f"[Comfy] -> 注入超随机Seed: 节点 {node_id} -> {final_seed}")
                 
                 # Steps
                 if 'steps' in inputs:
                     inputs['steps'] = user_steps
-                    print(f"[Comfy] -> 注入Steps: 节点 {node_id} -> {user_steps}")
+                    self._log(f"[Comfy] -> 注入Steps: 节点 {node_id} -> {user_steps}")
                 
                 # CFG
                 if 'cfg' in inputs:
                     inputs['cfg'] = user_cfg
-                    print(f"[Comfy] -> 注入CFG: 节点 {node_id} -> {user_cfg}")
+                    self._log(f"[Comfy] -> 注入CFG: 节点 {node_id} -> {user_cfg}")
                 
                 # Sampler
                 if 'sampler_name' in inputs and user_sampler:
                     inputs['sampler_name'] = user_sampler
-                    print(f"[Comfy] -> 注入Sampler: 节点 {node_id} -> {user_sampler}")
+                    self._log(f"[Comfy] -> 注入Sampler: 节点 {node_id} -> {user_sampler}")
             
-            # LoraLoader节点：注入LoRA名称和权重
-            if 'loraloader' in class_type:
-                # 简单模式：只修改现有LoraLoader节点
-                # 从current_loras中获取第一个LoRA（如果有多个LoraLoader，按顺序分配）
-                if self.current_loras:
-                    lora_list = list(self.current_loras.items())
-                    # 找到这是第几个LoraLoader节点
-                    lora_loader_count = sum(1 for nid, n in workflow.items() 
-                                           if nid < node_id and 'loraloader' in n.get('class_type', '').lower())
+            # CheckpointLoader节点: 注入模型名称
+            if 'checkpointloader' in class_type:
+                if 'ckpt_name' in inputs:
+                    # 从UI Model Label获取当前模型名称 (去除 "🎨 " 前缀)
+                    current_model = self.model_label.text().replace("🎨 ", "").strip()
                     
-                    if lora_loader_count < len(lora_list):
-                        lora_name, lora_weight = lora_list[lora_loader_count]
-                        
-                        # 注入LoRA名称
-                        if 'lora_name' in inputs:
-                            inputs['lora_name'] = lora_name
-                            print(f"[Comfy] -> 注入LoRA名称: 节点 {node_id} -> {lora_name}")
-                        
-                        # 注入LoRA权重
-                        for weight_key in ['strength_model', 'strength_clip']:
-                            if weight_key in inputs:
-                                inputs[weight_key] = lora_weight
-                        print(f"[Comfy] -> 注入LoRA权重: 节点 {node_id} -> {lora_weight}")
+                    if current_model and current_model != "未选择模型":
+                         # 尝试从服务器列表中找到真正的全名
+                         real_model_name = self._find_best_model_match(current_model)
+                         
+                         if real_model_name:
+                             inputs['ckpt_name'] = real_model_name
+                             self._log(f"[Comfy] -> 注入Model (精准匹配): {real_model_name}")
+                         else:
+                             # 回退到启发式补全
+                             if '.' not in current_model:
+                                 current_model += ".safetensors"
+                                 self._log(f"[Comfy] ⚠️ 本地未找到匹配模型，尝试自动补全: {current_model}")
+                             
+                             inputs['ckpt_name'] = current_model
+                             self._log(f"[Comfy] -> 注入Model: 节点 {node_id} -> {current_model}")
+                    else:
+                         self._log(f"[Comfy] ⚠️ 未注入模型: UI未选择有效模型")
+            
+            # UNETLoader节点: 注入UNET模型名称
+            if 'unetloader' in class_type:
+                if 'unet_name' in inputs:
+                    current_model = self.model_label.text().replace("🎨 ", "").strip()
+                    
+                    if current_model and current_model != "未选择模型":
+                         real_model_name = self._find_best_model_match(current_model)
+                         
+                         if real_model_name:
+                             inputs['unet_name'] = real_model_name
+                             self._log(f"[Comfy] -> 注入UNET Model (精准匹配): {real_model_name}")
+                         else:
+                             if '.' not in current_model:
+                                 current_model += ".safetensors"
+                                 self._log(f"[Comfy] ⚠️ 本地未找到匹配UNET模型，尝试自动补全: {current_model}")
+                             
+                             inputs['unet_name'] = current_model
+                             self._log(f"[Comfy] -> 注入UNET Model: 节点 {node_id} -> {current_model}")
+                    else:
+                         self._log(f"[Comfy] ⚠️ 未注入UNET模型: UI未选择有效模型")
+
+            # LoraLoader节点：不再在主循环中处理，改为后处理
+            # LoraLoaderModelOnly节点: 也在后处理中统一处理
+            pass
             
             # Latent节点：注入分辨率（支持多种类型）
             # EmptyLatentImage, EmptySD3LatentImage, EmptySDXLLatentImage等
@@ -1104,13 +1281,199 @@ class ParameterPanel(QWidget):
                     print(f"[Comfy]   {old_width}x{old_height} → {user_width}x{user_height}")
                 else:
                     print(f"[Comfy] ⚠️ 节点缺少width/height字段: {list(inputs.keys())}")
+        
+        # --- 专门处理 LoRA 注入 (更健壮的逻辑) ---
+        if self.current_loras:
+            # 1. 找到所有 LoraLoader 和 LoraLoaderModelOnly 节点
+            lora_nodes = []
+            for nid, node in workflow.items():
+                node_class = node.get('class_type', '').lower()
+                if 'loraloader' in node_class:  # 匹配 LoraLoader 和 LoraLoaderModelOnly
+                    # 尝试将ID转为整数以便正确排序 ('9' < '10')
+                    try:
+                        nid_int = int(nid)
+                    except:
+                        nid_int = 999999
+                    lora_nodes.append((nid_int, nid, node))
+            
+            # 2. 按ID排序，确保顺序一致
+            lora_nodes.sort(key=lambda x: x[0])
+            
+            # 3. 按顺序注入
+            lora_list = list(self.current_loras.items())
+            self._log(f"[Comfy] 找到 {len(lora_nodes)} 个 LoraLoader 节点，UI中有 {len(lora_list)} 个 LoRA")
+            
+            # ⚠️ 警告检测与自动注入
+            if not lora_nodes:
+                self._log(f"[Comfy] ⚠️ 工作流中只有 0 个 LoraLoader，尝试自动注入...")
+                
+                # 尝试自动注入 LoRA 节点
+                # 策略:
+                # 1. 找到 KSampler 的 model 输入源 (通常是 CheckpointLoader)
+                # 2. 在该源节点和所有下游节点之间插入 LoraLoader
+                
+                def try_inject_lora_node(wf, lora_name, lora_weight):
+                    # 1. 寻找核心路径: KSampler -> model input -> Source Node
+                    ks_node = None
+                    for nid, node in wf.items():
+                        if 'ksampler' in node.get('class_type', '').lower():
+                            ks_node = node
+                            break
+                    
+                    if not ks_node: return False
+                    
+                    # 获取模型源连接 [node_id, slot_idx]
+                    model_link = ks_node.get('inputs', {}).get('model')
+                    if not isinstance(model_link, list): return False
+                    
+                    source_id = str(model_link[0])
+                    source_node = wf.get(source_id)
+                    if not source_node: return False
+                    
+                    s_ctype = source_node.get('class_type', '')
+                    self._log(f"[Comfy] 自动注入: 找到模型源节点 {source_id} ({s_ctype})")
+                    
+                    # 🛑 安全检查: 仅支持标准的 CheckpointLoader 节点
+                    # 如果源节点是 Reroute, Primitive, 或其他自定义节点，盲目连接 slot 1 (CLIP) 会导致 'Bad Request'
+                    if 'checkpointloader' not in s_ctype.lower():
+                        self._log(f"[Comfy] ⚠️ 自动注入中止: 源节点类型 '{s_ctype}' 不是标准的 CheckpointLoader，无法确定 CLIP 连接位置。")
+                        self._temp_notify(f"⚠️ 无法自动注入 LoRA: 不支持的节点类型 {s_ctype}")
+                        return False
+                    
+                    # 2. 创建新 LoraLoader 节点
+                    # 寻找可用ID
+                    new_id = str(max([int(k) for k in wf.keys() if k.isdigit()] + [1000]) + 1)
+                    
+                    new_node = {
+                        "inputs": {
+                            "model": [source_id, 0], # 假设 CheckpointLoader 输出 0 是 MODEL
+                            "clip": [source_id, 1],  # 假设 CheckpointLoader 输出 1 是 CLIP
+                            "lora_name": lora_name,
+                            "strength_model": lora_weight,
+                            "strength_clip": lora_weight
+                        },
+                        "class_type": "LoraLoader",
+                        "_meta": {
+                            "title": "Auto Injected LoRA"
+                        }
+                    }
+                    wf[new_id] = new_node
+                    
+                    # 3. 重定向所有引用了 Source Node 的节点
+                    # 我们需要重定向两种连接: MODEL 连接和 CLIP 连接
+                    # MODEL 通常在 slot 0, CLIP 在 slot 1
+                    
+                    redirect_count_m = 0
+                    redirect_count_c = 0
+                    
+                    # 记录 source_nodeModel output (slot 0) and Clip output (slot 1) 
+                    # 严格只重定向连接到 0 或 1 的 link
+                    
+                    for nid, node in wf.items():
+                        if nid == new_id: continue # 跳过自己
+                        
+                        inputs = node.get('inputs', {})
+                        for key, val in inputs.items():
+                            if isinstance(val, list) and len(val) >= 1 and str(val[0]) == source_id:
+                                params_slot = val[1] if len(val) > 1 else 0
+                                
+                                # 策略: 如果连的是 slot 0 (Model)，重定向到 NewNode slot 0 (Model)
+                                # 如果连的是 slot 1 (Clip)，重定向到 NewNode slot 1 (Clip)
+                                # LoraLoader 输出: 0=Model, 1=Clip
+                                
+                                # 其他 slot (如 2=VAE) 不动
+                                if params_slot == 0:
+                                    inputs[key] = [new_id, 0]
+                                    redirect_count_m += 1
+                                elif params_slot == 1:
+                                    inputs[key] = [new_id, 1]
+                                    redirect_count_c += 1
+                                    
+                    self._log(f"[Comfy] 自动注入成功: ID {new_id}, 重定向 Model引用 {redirect_count_m}个, Clip引用 {redirect_count_c}个")
+                    return True
 
+                # 目前只支持注入第一个 LoRA (多 LoRA 链式注入太复杂)
+                if lora_list:
+                    first_lora_name, first_lora_weight = lora_list[0]
+                    if try_inject_lora_node(workflow, first_lora_name, first_lora_weight):
+                        self._temp_notify("✨ 已自动为您即时修补工作流以支持 LoRA")
+                    else:
+                        print(f"[Comfy] ⚠️ 自动注入失败: 无法分析图结构")
+                        self._temp_notify("⚠️ 无法注入 LoRA (结构不支持)")
+            
+            # 如果有节点 (或刚注入了节点)，常规注入参数
+            # 重新扫描一遍节点 (因为可能刚注入了)
+            
+            # ...重新执行原来的注入循环逻辑...
+            # 为简单起见，我们只能在这里复制一遍查找逻辑，或者指望上面的注入已经设置好了参数
+            # 上面的 try_inject_lora_node 已经设置了 lora_name 和 weight。
+            # 如果有多个 LoRA，剩余的会被忽略 (如果只有一个插槽)
+            
+            if not lora_nodes:
+                 pass # 已处理 (要么注入成功，要么失败)
+            else:
+                for i, (nid_int, nid, node) in enumerate(lora_nodes):
+                    inputs = node.get('inputs', {})
+                    if i < len(lora_list):
+                        lora_name, lora_weight = lora_list[i]
+                        
+                        # 注入LoRA名称
+                        if 'lora_name' in inputs:
+                            inputs['lora_name'] = lora_name
+                            self._log(f"[Comfy] -> 注入LoRA名称: 节点 {nid} -> {lora_name}")
+                        
+                        # 注入LoRA权重 (LoraLoader有两个权重, LoraLoaderModelOnly只有一个)
+                        for weight_key in ['strength_model', 'strength_clip']:
+                            if weight_key in inputs:
+                                inputs[weight_key] = lora_weight
+                        self._log(f"[Comfy] -> 注入LoRA权重: 节点 {nid} ({node.get('class_type')}) -> {lora_weight}")
+                    else:
+                        # 关键修复: 多余的 LoRA 节点必须静音 (设为0)，否则会残留原图的 LoRA
+                        self._log(f"[Comfy] 节点 {nid} (LoraLoader) 超出UI列表数量，执行静音 (Strength=0)")
+                        for weight_key in ['strength_model', 'strength_clip']:
+                            if weight_key in inputs:
+                                inputs[weight_key] = 0.0          
         print(f"\n[Comfy] ========== 参数注入完成 ==========")
         print(f"[Comfy] 修改的节点: {modified_nodes}")
         print(f"[Comfy] --- 任务数据准备就绪 ---\n")
         
         # 发送请求信号
         self.remote_gen_requested.emit(workflow)
+
+    def set_available_models(self, models: List[str]):
+        """设置可用模型列表 (来自ComfyUI)"""
+        self.available_models = models
+        print(f"[UI] 已接收可用模型列表: {len(models)} 个")
+
+    def _find_best_model_match(self, ui_name: str) -> str:
+        """在可用模型列表中寻找最佳匹配 (优先精准，后包含)"""
+        if not hasattr(self, 'available_models') or not self.available_models:
+            return None
+            
+        # 0. 预处理：移除潜在的 "🎨 " 前缀 (防守性编程)
+        clean_name = ui_name.replace("🎨 ", "").strip()
+        
+        # 1. 精确匹配
+        if clean_name in self.available_models:
+            return clean_name
+            
+        # 2. 尝试加上 .safetensors 或 .ckpt 后匹配
+        for ext in ['.safetensors', '.ckpt']:
+            if clean_name + ext in self.available_models:
+                return clean_name + ext
+        
+        # 3. 忽略路径匹配 (ui_name = "model.safetensors", available = "SDXL/model.safetensors")
+        for m in self.available_models:
+            if m.endswith(clean_name) or m.endswith(clean_name + ".safetensors"):
+                return m
+                
+        # 4. 模糊包含匹配 (最宽松 - 慎用，但在不匹配时好过没有)
+        # ui_name = "turbo_bf16" -> "z_image_turbo_bf16.safetensors"
+        for m in self.available_models:
+            if clean_name in m:
+                return m
+                
+        return None
 
     def _clear_layout(self, layout):
         """递归清空布局"""
