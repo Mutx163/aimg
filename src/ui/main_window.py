@@ -129,15 +129,15 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Main Toolbar")
         toolbar.setMovable(False)
         toolbar.setIconSize(QSize(20, 20))
-        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         # 移除硬编码样式，改由 apply_theme 统一控制
         self.addToolBar(toolbar)
         
-        action_open = QAction("📂 打开文件夹", self)
+        action_open = QAction("打开文件夹", self)
         action_open.triggered.connect(self.select_folder)
         toolbar.addAction(action_open)
         
-        action_refresh = QAction("🔄 刷新", self)
+        action_refresh = QAction("刷新", self)
         action_refresh.triggered.connect(self.refresh_folder)
         toolbar.addAction(action_refresh)
         
@@ -151,8 +151,8 @@ class MainWindow(QMainWindow):
         self.zoom_combo = QComboBox()
         self.zoom_combo.setMinimumWidth(100)
         # 添加选项 (显示文本, 用户数据)
-        self.zoom_combo.addItem("⛶ 适应窗口", "fit")
-        self.zoom_combo.addItem("🖼 铺满窗口", "fill")
+        self.zoom_combo.addItem("适应窗口", "fit")
+        self.zoom_combo.addItem("铺满窗口", "fill")
         self.zoom_combo.addItem("100% 原始大小", "1.0")
         self.zoom_combo.addItem("50%", "0.5")
         self.zoom_combo.addItem("200%", "2.0")
@@ -163,7 +163,7 @@ class MainWindow(QMainWindow):
         
         toolbar.addSeparator()
         
-        self.action_compare = QAction("⚖ 对比模式", self)
+        self.action_compare = QAction("对比模式", self)
         self.action_compare.setCheckable(True)
         self.action_compare.triggered.connect(self.toggle_comparison_mode)
         toolbar.addAction(self.action_compare)
@@ -177,10 +177,10 @@ class MainWindow(QMainWindow):
         
         self.sort_combo = QComboBox()
         # 移除硬编码样式
-        self.sort_combo.addItem("⚡ 时间倒序 (最新在前)", "time_desc")
-        self.sort_combo.addItem("🔼 时间正序 (最旧在前)", "time_asc")
-        self.sort_combo.addItem("🅰 名称 A-Z", "name_asc")
-        self.sort_combo.addItem("🆉 名称 Z-A", "name_desc")
+        self.sort_combo.addItem("时间倒序 (最新在前)", "time_desc")
+        self.sort_combo.addItem("时间正序 (最旧在前)", "time_asc")
+        self.sort_combo.addItem("名称 A-Z", "name_asc")
+        self.sort_combo.addItem("名称 Z-A", "name_desc")
         
         # 设置当前选中项
         index = self.sort_combo.findData(self.current_sort_by)
@@ -190,7 +190,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.sort_combo)
         
         toolbar.addSeparator()
-        action_settings = QAction("⚙ 设置", self)
+        action_settings = QAction("设置", self)
         action_settings.triggered.connect(self.open_settings)
         toolbar.addAction(action_settings)
         
@@ -304,6 +304,7 @@ class MainWindow(QMainWindow):
         
         # 左侧列表面板 (增加搜索框)
         left_widget = QWidget()
+        left_widget.setFixedWidth(330)  # 严格限制左侧面板宽度 (约容纳两列大图)
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(8, 8, 8, 0)
         left_layout.setSpacing(6)
@@ -462,11 +463,11 @@ class MainWindow(QMainWindow):
     def _load_historical_samplers(self):
         """从数据库加载历史采样器并更新到参数面板"""
         try:
-            print(f"[UI] 开始加载历史采样器...")
+            # print(f"[UI] 开始加载历史采样器...")
             samplers = self.db_manager.get_unique_samplers(self.current_folder)
-            print(f"[UI] 从数据库获取到 {len(samplers)} 个采样器: {samplers}")
+            # print(f"[UI] 从数据库获取到 {len(samplers)} 个采样器: {samplers}")
             self.param_panel._populate_samplers(samplers)
-            print(f"[UI] 已加载 {len(samplers)} 个历史采样器")
+            # print(f"[UI] 已加载 {len(samplers)} 个历史采样器")
         except Exception as e:
             import traceback
             print(f"[UI] 加载历史采样器失败: {e}")
@@ -481,16 +482,16 @@ class MainWindow(QMainWindow):
             self._load_historical_samplers()
 
 
-    def on_remote_gen_requested(self, workflow):
+    def on_remote_gen_requested(self, workflow, batch_count=1):
         """处理远程生成请求 - 使用当前图片的workflow重新生成"""
         # 清空上一轮日志缓存
         self.last_gen_logs = ""
         self.last_log_count = 0
         
         # 使用当前图片的workflow，但会自动修改随机种子
-        print("[Main] 远程生成: 使用当前图片的workflow（随机种子）")
-        self.comfy_client.queue_current_prompt(workflow)
-        self.statusBar().showMessage("已发送生成请求到ComfyUI（使用当前图片参数）", 3000)
+        print(f"[Main] 远程生成: 使用当前图片的workflow（随机种子） x{batch_count}")
+        self.comfy_client.queue_current_prompt(workflow, batch_count)
+        self.statusBar().showMessage(f"已发送 {batch_count} 个生成请求到ComfyUI", 3000)
     def _on_prompt_submitted(self, prompt_id):
         """当任务成功提交到 ComfyUI 后触发"""
         self.statusBar().showMessage(f"请求已提交 (ID: {prompt_id[:8]}...)", 5000)
@@ -509,7 +510,7 @@ class MainWindow(QMainWindow):
         self.param_panel.update_info(meta)
         
         t1 = time.time()
-        print(f"[UI] 图片加载与解析耗时: {(t1 - t0) * 1000:.2f} ms ({os.path.basename(path)})")
+        # print(f"[UI] 图片加载与解析耗时: {(t1 - t0) * 1000:.2f} ms ({os.path.basename(path)})")
         
     def keyPressEvent(self, event):
         """处理全局快捷键"""
@@ -593,7 +594,7 @@ class MainWindow(QMainWindow):
     
     def _append_log(self, msg: str):
         """追加日志到缓存"""
-        print(f"[MainWindow._append_log] 收到日志: {msg[:60]}...")
+        # print(f"[MainWindow._append_log] 收到日志: {msg[:60]}...")
         
         if msg == "__CLEAR__":
             self.last_gen_logs = ""

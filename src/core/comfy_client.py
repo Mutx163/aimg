@@ -1,9 +1,9 @@
 import json
 import uuid
 from typing import Dict, Any, Optional
-from PyQt6.QtCore import QObject, pyqtSignal, QUrl, QByteArray
+from PyQt6.QtCore import QObject, pyqtSignal, QUrl, QByteArray, QTimer
 from PyQt6.QtWebSockets import QWebSocket
-from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply, QAbstractSocket
 
 class ComfyClient(QObject):
     """
@@ -30,26 +30,46 @@ class ComfyClient(QObject):
         
         self.ws = QWebSocket()
         self.ws.connected.connect(self._on_connected)
+        self.ws.disconnected.connect(self._on_disconnected)
         self.ws.textMessageReceived.connect(self._on_message)
         self.ws.errorOccurred.connect(self._on_error)
         self.current_prompt_graph = {} # 存储当前执行的图
         
         self.nam = QNetworkAccessManager() # 用于非阻塞 HTTP 请求
         
+        # 重连定时器
+        self.reconnect_timer = QTimer(self)
+        self.reconnect_timer.setInterval(3000) # 3秒重连一次
+        self.reconnect_timer.timeout.connect(self.connect_server)
+
     def connect_server(self):
         """连接 WebSocket 监听状态"""
+        # 如果已经连接或正在连接，则跳过
+        if self.ws.state() == QAbstractSocket.SocketState.ConnectedState:
+            return
+            
         ws_url = f"ws://{self.server_address}/ws?clientId={self.client_id}"
         self.ws.open(QUrl(ws_url))
 
     def _on_connected(self):
         print(f"[Comfy] WebSocket 已连接: {self.server_address}")
         self.status_changed.emit("ComfyUI 已连接")
+        self.reconnect_timer.stop() # 连接成功，停止重连
         # 连接成功后立即获取可用模型列表
         self.fetch_available_models()
+
+    def _on_disconnected(self):
+        print(f"[Comfy] WebSocket 连接断开")
+        self.status_changed.emit("连接断开，正在重连...")
+        if not self.reconnect_timer.isActive():
+            self.reconnect_timer.start()
 
     def _on_error(self, error):
         print(f"[Comfy] WebSocket 错误: {error}")
         self.status_changed.emit(f"连接失败: {error}")
+        # 发生错误时也尝试重连
+        if not self.reconnect_timer.isActive():
+            self.reconnect_timer.start()
 
     def _on_message(self, message):
         """处理 WebSocket 消息"""
@@ -59,7 +79,7 @@ class ComfyClient(QObject):
             msg_type = data.get("type")
             
             # 打印非心跳消息以调试
-            if msg_type not in ['crystools.monitor', 'status']:
+            if msg_type not in ['crystools.monitor', 'status', 'progress_state', 'progress', 'executing', 'executed']:
                 print(f"[Comfy WS] Type: {msg_type}, Data: {data}")
             
             if msg_type == "status":
@@ -177,7 +197,7 @@ class ComfyClient(QObject):
                 queue_data = json.loads(bytes(reply.readAll()).decode('utf-8'))
                 pending = queue_data.get('queue_pending', [])
                 running = queue_data.get('queue_running', [])
-                print(f"[Comfy] 当前队列: Running={len(running)}, Pending={len(pending)}")
+                # print(f"[Comfy] 当前队列: Running={len(running)}, Pending={len(pending)}")
                 # 可以在这里 emit 信号更新 UI
             else:
                 print(f"[Comfy] 获取队列失败: {reply.errorString()}")
@@ -186,21 +206,26 @@ class ComfyClient(QObject):
         finally:
             reply.deleteLater()
 
-    def queue_current_prompt(self, workflow: Optional[Dict[str, Any]] = None) -> None:
+    def queue_current_prompt(self, workflow: Optional[Dict[str, Any]] = None, batch_count: int = 1) -> None:
         """
         重新提交workflow（修改随机种子）
         如果提供了workflow参数，直接使用；否则从 /history 获取最近的workflow
         """
         if workflow:
             # 直接使用提供的workflow
-            print("[Comfy] 使用提供的workflow")
-            self.status_changed.emit("正在提交workflow...")
-            modified_workflow = self._randomize_seeds(workflow)
-            self.send_prompt(modified_workflow)
+            print(f"[Comfy] 使用提供的workflow (批量: {batch_count})")
+            self.status_changed.emit(f"正在提交 {batch_count} 个任务...")
+            
+            for i in range(batch_count):
+                modified_workflow = self._randomize_seeds(workflow)
+                self.send_prompt(modified_workflow)
         else:
             # 从历史记录获取
             print("[Comfy] queue_current_prompt: 正在获取最近的工作流...")
             self.status_changed.emit("正在获取最近的工作流...")
+            
+            # 存储批量计数，供回调使用
+            self._pending_batch_count = batch_count
         
             # 启动异步请求获取历史记录
             self._fetch_latest_workflow()
@@ -232,6 +257,7 @@ class ComfyClient(QObject):
             # 获取最新的prompt_id (假设dict已按时间排序，或者我们取第一个)
             latest_prompt_id = list(data.keys())[0]
             latest_entry = data[latest_prompt_id]
+            prompt_data = latest_entry.get('prompt')
             
             # 尝试从不同位置获取workflow
             workflow = None
@@ -239,7 +265,7 @@ class ComfyClient(QObject):
             # 方法1: 检查meta字段是否包含workflow
             if "meta" in latest_entry:
                 meta = latest_entry["meta"]
-                print(f"[Comfy Debug] meta字段内容: {meta}")
+                # print(f"[Comfy Debug] meta字段内容: {meta}")
                 if isinstance(meta, dict) and "workflow_api" in meta:
                     workflow = meta["workflow_api"]
                     print("[Comfy] 从meta.workflow_api获取到workflow")
@@ -254,18 +280,23 @@ class ComfyClient(QObject):
             
             if workflow is None:
                 print(f"[Comfy] 无法从历史记录获取完整workflow")
-                print(f"[Comfy] prompt类型: {type(prompt_data)}, 内容: {prompt_data}")
+                # print(f"[Comfy] prompt类型: {type(prompt_data)}, 内容: {prompt_data}")
                 self.status_changed.emit("无法获取完整workflow，请在ComfyUI中保存为API格式")
                 return
             
             print(f"[Comfy] 成功获取workflow (prompt_id: {latest_prompt_id})")
-            self.status_changed.emit("已获取workflow，正在提交...")
             
-            # 修改随机种子避免生成相同图片
-            modified_workflow = self._randomize_seeds(workflow)
+            # 获取批量计数
+            batch_count = getattr(self, '_pending_batch_count', 1)
+            self._pending_batch_count = 1 # Reset
             
-            # 提交到队列
-            self.send_prompt(modified_workflow)
+            self.status_changed.emit(f"已获取workflow，正在提交 {batch_count} 个任务...")
+            
+            for i in range(batch_count):
+                # 修改随机种子避免生成相同图片
+                modified_workflow = self._randomize_seeds(workflow)
+                # 提交到队列
+                self.send_prompt(modified_workflow)
             
         except Exception as e:
             import traceback
@@ -275,10 +306,10 @@ class ComfyClient(QObject):
         finally:
             reply.deleteLater()
     
-    def fetch_available_models(self) -> None:
-        """从ComfyUI获取可用模型列表 (异步)"""
+    def fetch_available_models(self):
+        """获取ComfyUI可用模型列表"""
         url_str = f"http://{self.server_address}/object_info/CheckpointLoaderSimple"
-        print(f"[Comfy] debug: fetch_available_models 调用, URL: {url_str}")
+        # print(f"[Comfy] debug: fetch_available_models 调用, URL: {url_str}")
         
         url = QUrl(url_str)
         request = QNetworkRequest(url)
@@ -363,7 +394,7 @@ class ComfyClient(QObject):
                 # ComfyUI 最大支持范围约为 2^64-1 (18,446,744,073,709,551,615)
                 ultra_random_seed = random.SystemRandom().randint(10**17, 18446744073709551614)
                 inputs["seed"] = ultra_random_seed
-                print(f"[Comfy] 已随机化节点 {node_id} ({class_type}) 的超随机seed: {ultra_random_seed}")
+                # print(f"[Comfy] 已随机化节点 {node_id} ({class_type}) 的超随机seed: {ultra_random_seed}")
 
     # ========== 队列管理方法 ==========
     
@@ -382,7 +413,7 @@ class ComfyClient(QObject):
                 return
             
             data = json.loads(bytes(reply.readAll()).decode())
-            print(f"[Comfy Queue] 当前队列: Running={len(data.get('queue_running', []))}, Pending={len(data.get('queue_pending', []))}")
+            # print(f"[Comfy Queue] 当前队列: Running={len(data.get('queue_running', []))}, Pending={len(data.get('queue_pending', []))}")
             
             # 发送信号
             self.queue_updated.emit(data)

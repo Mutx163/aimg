@@ -102,7 +102,7 @@ class AIPromptOptimizer:
             
         self.model_name = settings.value("ai_model_name", "glm-4.7-flash")
     
-    def optimize_prompt(self, user_input: str, existing_prompt: str = "", is_negative: bool = False) -> tuple[bool, str]:
+    def optimize_prompt(self, user_input: str, existing_prompt: str = "", is_negative: bool = False, stream_callback: Optional[callable] = None) -> tuple[bool, str]:
         """
         优化提示词
         
@@ -110,6 +110,7 @@ class AIPromptOptimizer:
             user_input: 用户输入的需求或修改指令
             existing_prompt: 现有提示词(空则从零生成)
             is_negative: 是否为反向提示词
+            stream_callback: 可选的回调函数，接收流式输出的增量内容 callback(chunk: str)
         
         Returns:
             (success, result): 成功标志和结果(成功时为优化后的提示词,失败时为错误信息)
@@ -134,7 +135,7 @@ class AIPromptOptimizer:
             ]
             
             # 调用API
-            result = self._call_glm_api(messages)
+            result = self._call_glm_api(messages, stream_callback)
             return True, result
             
         except requests.exceptions.Timeout:
@@ -144,7 +145,7 @@ class AIPromptOptimizer:
         except Exception as e:
             return False, f"优化失败: {str(e)}"
     
-    def _call_glm_api(self, messages: list) -> str:
+    def _call_glm_api(self, messages: list, stream_callback: Optional[callable] = None) -> str:
         """
         调用 OpenAI 兼容 API
         """
@@ -163,6 +164,10 @@ class AIPromptOptimizer:
             "temperature": 0.4, # 略微降低随机性，使输出更稳定
         }
         
+        # 启用流式传输
+        if stream_callback:
+            payload["stream"] = True
+        
         # 不同厂商对 max_tokens 的处理不同，有些模型（如推理型）可能需要更大的上下文或不支持显式限制
         if "thinking" not in self.model_name.lower():
              payload["max_tokens"] = 4096
@@ -171,7 +176,7 @@ class AIPromptOptimizer:
         if "glm" in self.model_name.lower():
              payload["thinking"] = {"type": "enabled"}
         
-        print(f"[AIOptimizer] 发起请求: {self.api_endpoint} (模型: {self.model_name})")
+        print(f"[AIOptimizer] 发起请求: {self.api_endpoint} (模型: {self.model_name}, 流式: {bool(stream_callback)})")
         
         # 使用 Session 和重试机制来增强稳定性
         from requests.adapters import HTTPAdapter
@@ -196,9 +201,12 @@ class AIPromptOptimizer:
                 self.api_endpoint,
                 headers=headers,
                 json=payload,
-                timeout=self.TIMEOUT
+                timeout=self.TIMEOUT,
+                stream=bool(stream_callback) # 启用流式响应
             )
-            print(f"[AIOptimizer] 收到响应, 状态码: {response.status_code}")
+            # 流式模式下不直接打印状态码，等到流处理时检查
+            if not stream_callback:
+                print(f"[AIOptimizer] 收到响应, 状态码: {response.status_code}")
 
         except Exception as e:
             # 如果重试后依然失败,由于此时异常已被打印多次,这里做一个汇总输出
@@ -216,7 +224,9 @@ class AIPromptOptimizer:
                 error_msg = f"API 返回 404: 找不到接口。请检查 'API地址' 和 '模型名称' 是否配套。(当前模型: {self.model_name})"
             
             try:
-                error_data = response.json()
+                # 尝试读取部分内容来获取错误信息，注意流式模式下也要小心读取
+                content = response.content
+                error_data = json.loads(content)
                 print(f"[AIOptimizer] 详细错误记录: {error_data}")
                 if "error" in error_data:
                     # 尝试拼接更详细的服务器报错信息
@@ -229,6 +239,43 @@ class AIPromptOptimizer:
             
             raise Exception(error_msg)
         
+        # === 流式处理逻辑 ===
+        if stream_callback:
+            full_content = ""
+            try:
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                        
+                    decoded_line = line.decode('utf-8').strip()
+                    if decoded_line.startswith("data: "):
+                        data_str = decoded_line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        
+                        try:
+                            chunk_data = json.loads(data_str)
+                            if "choices" in chunk_data and len(chunk_data["choices"]) > 0:
+                                delta = chunk_data["choices"][0].get("delta", {})
+                                chunk_content = delta.get("content", "")
+                                
+                                # 忽略 reasoning_content (思考过程)
+                                # 如果需要显示思考过程，可以在这里处理 reasoning_content
+                                
+                                if chunk_content:
+                                    full_content += chunk_content
+                                    stream_callback(chunk_content)
+                        except json.JSONDecodeError:
+                            continue
+                            
+                print(f"[AIOptimizer] 流式生成结束, 总长: {len(full_content)}")
+                return full_content.strip()
+                
+            except Exception as e:
+                print(f"[AIOptimizer] 流式处理中断: {e}")
+                raise Exception(f"流式处理失败: {e}")
+
+        # === 普通处理逻辑 ===
         # 解析响应
         try:
             data = response.json()

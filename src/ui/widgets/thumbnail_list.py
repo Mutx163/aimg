@@ -107,13 +107,14 @@ class ThumbnailList(QListView):
         # 定义基准宽度 (图标128 + 左右内边距)
         base_width = 148 
         min_cols = 1
+        max_cols = 2  # 限制最大列数为2，满足用户"只显示一列或两列"的需求
         
         # 计算当前能容纳的列数
-        cols = max(min_cols, viewport_width // base_width)
+        cols = max(min_cols, min(max_cols, viewport_width // base_width))
         
         # 计算新的单元格宽度，使其填满整行
-        # 减去滚动条可能的误差 (虽然 viewport 应该是不含滚动条的)
-        new_item_width = int(viewport_width / cols) - 2 
+        # 减去微小边距以防止计算误差导致换行
+        new_item_width = int(viewport_width / cols) - 4
         
         # 保持高度不变
         current_grid = self.gridSize()
