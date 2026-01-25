@@ -30,6 +30,8 @@ aimg_metadata.db
 
 # IDEs
 .vscode/
+.agent/
+.claude/
 .idea/
 *.swp
 *.swo
