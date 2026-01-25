@@ -11,7 +11,7 @@ class QueueDialog(QDialog):
         self.queue_data = {}
         
         self.setWindowTitle("ComfyUI 任务队列")
-        self.resize(500, 400)
+        self.resize(560, 440)
         
         self.setup_ui()
         self.setup_connections()
@@ -23,6 +23,8 @@ class QueueDialog(QDialog):
     def setup_ui(self):
         """设置UI"""
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
         
         # 顶部按钮栏
         top_bar = QHBoxLayout()
@@ -37,9 +39,17 @@ class QueueDialog(QDialog):
         top_bar.addWidget(self.clear_btn)
         
         layout.addLayout(top_bar)
+
+        self.summary_label = QLabel("队列加载中...")
+        self.summary_label.setStyleSheet("color: palette(mid); font-size: 11px;")
+        layout.addWidget(self.summary_label)
         
         # 队列列表
         self.queue_list = QListWidget()
+        self.queue_list.setSpacing(6)
+        self.queue_list.setAlternatingRowColors(True)
+        self.queue_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        self.queue_list.setStyleSheet("QListWidget { border: 1px solid palette(mid); border-radius: 6px; }")
         layout.addWidget(self.queue_list)
         
         # 状态标签
@@ -81,6 +91,9 @@ class QueueDialog(QDialog):
         running = self.queue_data.get('queue_running', [])
         pending = self.queue_data.get('queue_pending', [])
         
+        self.interrupt_btn.setEnabled(bool(running))
+        self.clear_btn.setEnabled(bool(running or pending))
+
         # 正在执行
         if running:
             header = QListWidgetItem("● 正在执行")
@@ -110,7 +123,8 @@ class QueueDialog(QDialog):
         
         # 更新状态
         total = len(running) + len(pending)
-        self.status_label.setText(f"总任务: {total} | 执行中: {len(running)} | 等待: {len(pending)}")
+        self.summary_label.setText(f"总任务 {total} · 执行中 {len(running)} · 等待 {len(pending)}")
+        self.status_label.setText("已刷新队列")
     
     def _create_task_item(self, task, is_running):
         """创建任务列表项"""
@@ -124,23 +138,37 @@ class QueueDialog(QDialog):
         # 创建自定义widget
         widget = QWidget()
         layout = QHBoxLayout(widget)
-        layout.setContentsMargins(4, 2, 4, 2)
-        
-        # 任务信息
-        info_label = QLabel(f"Task #{number}: {prompt_id[:12]}...")
-        layout.addWidget(info_label)
-        
-        layout.addStretch()
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(10)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(2)
+
+        title = QLabel(f"任务 #{number}")
+        title.setStyleSheet("font-weight: bold;")
+        left_layout.addWidget(title)
+
+        sub = QLabel(f"ID: {prompt_id}")
+        sub.setStyleSheet("color: palette(mid); font-size: 10px;")
+        left_layout.addWidget(sub)
+
+        layout.addWidget(left, 1)
         
         # 操作按钮
+        status = QLabel("执行中" if is_running else "等待中")
+        status.setStyleSheet("color: palette(highlight); font-size: 10px;" if is_running else "color: palette(mid); font-size: 10px;")
+        layout.addWidget(status)
+
         if is_running:
             btn = QPushButton("中断")
             btn.clicked.connect(lambda: self.comfy_client.interrupt_current())
         else:
             btn = QPushButton("取消")
             btn.clicked.connect(lambda _, pid=prompt_id: self.comfy_client.cancel_task(pid))
-        
-        btn.setMaximumWidth(60)
+
+        btn.setMaximumWidth(70)
         layout.addWidget(btn)
         
         # 创建item并添加到列表

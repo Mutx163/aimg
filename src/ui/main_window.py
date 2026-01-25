@@ -30,7 +30,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AI Image Viewer Pro")
-        self.settings = QSettings("Antigravity", "AIImageViewer")
+        self.settings = QSettings("ComfyUIImageManager", "Settings")
+        legacy_settings = QSettings("Antigravity", "AIImageViewer")
+        legacy_keys = legacy_settings.allKeys()
+        if legacy_keys:
+            for key in legacy_keys:
+                if not self.settings.contains(key):
+                    self.settings.setValue(key, legacy_settings.value(key))
+            self.settings.sync()
         
         # 恢复窗口状态 (优先恢复几何形状)
         if not self.settings.value("window/geometry"):
@@ -553,22 +560,20 @@ class MainWindow(QMainWindow):
     def open_settings(self):
         dlg = SettingsDialog(self)
         old_addr = self.settings.value("comfy_address", "127.0.0.1:8188")
+        old_root = self.settings.value("comfy_root", "")
         if dlg.exec():
             # 重新应用主题以响应设置变化
             new_addr = self.settings.value("comfy_address", "127.0.0.1:8188")
             if new_addr != old_addr:
                 self.comfy_client.server_address = new_addr
                 self.comfy_client.connect_server()
+            new_root = self.settings.value("comfy_root", "")
+            if new_root != old_root and hasattr(self, "param_panel"):
+                self.param_panel._refresh_comfyui_assets()
+                self.param_panel.refresh_lora_options()
+                if new_root:
+                    self.statusBar().showMessage(f"ComfyUI 目录已更新: {new_root}", 3000)
             self.apply_theme()
-
-    def closeEvent(self, event):
-        # 保存窗口状态
-        self.settings.setValue("window/geometry", self.saveGeometry())
-        self.settings.setValue("window/main_splitter", self.splitter.saveState())
-        self.settings.setValue("window/left_splitter", self.left_splitter.saveState())
-        
-        self.watcher.stop_monitoring()
-        super().closeEvent(event)
 
     def _poll_logs(self):
         """定时轮询param_panel的日志列表并更新UI"""
@@ -1092,7 +1097,47 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """窗口关闭时保存状态"""
         print("[Window] closeEvent 被调用，正在保存窗口状态...")
+
+        if hasattr(self, "log_poll_timer") and self.log_poll_timer.isActive():
+            self.log_poll_timer.stop()
+
+        if hasattr(self, "queue_dialog") and self.queue_dialog:
+            self.queue_dialog.close()
+
+        if hasattr(self, "watcher"):
+            self.watcher.stop_monitoring()
+
+        if hasattr(self, "search_controller") and hasattr(self.search_controller, "search_loader"):
+            if self.search_controller.search_loader.isRunning():
+                self.search_controller.search_loader.stop()
+                self.search_controller.search_loader.wait()
+
+        if hasattr(self, "file_controller") and self.file_controller.loader_thread:
+            if self.file_controller.loader_thread.isRunning():
+                self.file_controller.loader_thread.stop()
+                self.file_controller.loader_thread.wait()
+
+        if hasattr(self, "param_panel") and self.param_panel.current_ai_worker:
+            if self.param_panel.current_ai_worker.isRunning():
+                self.param_panel.current_ai_worker.is_cancelled = True
+                self.param_panel.current_ai_worker.wait(3000)
+                if self.param_panel.current_ai_worker.isRunning():
+                    self.param_panel.current_ai_worker.terminate()
+                    self.param_panel.current_ai_worker.wait()
         
+        if hasattr(self, "param_panel") and self.param_panel.current_img_worker:
+            if self.param_panel.current_img_worker.isRunning():
+                self.param_panel.current_img_worker.is_cancelled = True
+                self.param_panel.current_img_worker.wait(3000)
+                if self.param_panel.current_img_worker.isRunning():
+                    self.param_panel.current_img_worker.terminate()
+                    self.param_panel.current_img_worker.wait()
+
+        if hasattr(self, "comfy_client"):
+            if self.comfy_client.reconnect_timer.isActive():
+                self.comfy_client.reconnect_timer.stop()
+            self.comfy_client.ws.close()
+
         # 保存窗口几何形状（位置和大小）
         self.settings.setValue("window/geometry", self.saveGeometry())
         print(f"[Window] 已保存窗口几何形状")
@@ -1111,6 +1156,4 @@ class MainWindow(QMainWindow):
         self.settings.sync()
         print(f"[Window] 设置已同步到磁盘")
         
-        # 继续正常关闭
-        event.accept()
-
+        super().closeEvent(event)

@@ -2,13 +2,15 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QTextEdit, QScrollAre
                              QFrame, QGridLayout, QHBoxLayout, QPushButton, QApplication, 
                              QSplitter, QGroupBox, QSpinBox, QDoubleSpinBox, QSlider, 
                              QComboBox, QLineEdit, QCheckBox, QDialog, QMenu, QToolButton,
-                             QAbstractSpinBox)
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSettings, QThread, QEvent
-from PyQt6.QtGui import QFont, QAction
+                             QAbstractSpinBox, QSizePolicy, QListWidget, QListWidgetItem, QMessageBox)
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSettings, QThread, QEvent, QBuffer, QIODevice, QByteArray
+from PyQt6.QtGui import QFont, QAction, QImage, QGuiApplication
 from typing import List, Dict
 import random
 import copy
 import json
+import base64
+import os
 from src.assets.default_workflows import DEFAULT_T2I_WORKFLOW
 from src.core.ai_prompt_optimizer import AIPromptOptimizer
 
@@ -24,8 +26,11 @@ class AIWorker(QThread):
         self.is_cancelled = False
     
     def run(self):
+        emitted = False
         try:
-            if self.is_cancelled: return
+            if self.is_cancelled:
+                self.finished.emit(False, "已取消")
+                return
             optimizer = AIPromptOptimizer()
             
             def on_stream_callback(chunk):
@@ -38,6 +43,40 @@ class AIWorker(QThread):
                 is_negative=self.is_negative,
                 stream_callback=on_stream_callback
             )
+            if not self.is_cancelled:
+                self.finished.emit(success, result)
+                emitted = True
+            else:
+                self.finished.emit(False, "已取消")
+                emitted = True
+        except Exception as e:
+            if not self.is_cancelled:
+                self.finished.emit(False, f"处理异常: {str(e)}")
+                emitted = True
+        finally:
+            if self.is_cancelled and not emitted:
+                self.finished.emit(False, "已取消")
+
+class ImagePromptWorker(QThread):
+    finished = pyqtSignal(bool, str)
+    stream_update = pyqtSignal(str)
+    
+    def __init__(self, image_b64: str):
+        super().__init__()
+        self.image_b64 = image_b64
+        self.is_cancelled = False
+    
+    def run(self):
+        try:
+            if self.is_cancelled:
+                return
+            optimizer = AIPromptOptimizer()
+            
+            def on_stream_callback(chunk):
+                if not self.is_cancelled:
+                    self.stream_update.emit(chunk)
+            
+            success, result = optimizer.generate_prompt_from_image(self.image_b64, stream_callback=on_stream_callback)
             if not self.is_cancelled:
                 self.finished.emit(success, result)
         except Exception as e:
@@ -258,7 +297,7 @@ class AIPromptDialog(QDialog):
     def get_text(self):
         return self.input_edit.toPlainText().strip()
 
-class ParameterPanel(QScrollArea):
+class ParameterPanel(QWidget):
     # 信号定义
     remote_gen_requested = pyqtSignal(dict, int) # 请求远程生成 (带workflow, 批次数量)
     
@@ -268,23 +307,25 @@ class ParameterPanel(QScrollArea):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.settings = QSettings("ComfyUIImageManager", "Settings")
-        self.setWidgetResizable(True)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         
         # 内部状态
         self.current_meta = {}
         self.current_loras = {} # 存储当前选中的LoRA {name: weight}
         self._ai_is_processing = False # AI处理并发锁
+        self._img_prompt_processing = False
         self.history_manager = AIHistoryManager()
+        self.history_dialogs = {}
         self.current_ai_worker = None
+        self.current_img_worker = None
         
-        # Create a central widget for the scroll area
-        self._central_widget = QWidget()
-        self.setWidget(self._central_widget)
-        
-        self.layout = QVBoxLayout(self._central_widget) # Layout should be on the central widget
+        self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(5, 5, 5, 5)
         self.layout.setSpacing(8)
+        
+        self.main_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.main_splitter.setHandleWidth(2)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.layout.addWidget(self.main_splitter)
         
         # ========== 1. 顶部核心信息卡片 ==========
         self.info_card = QFrame()
@@ -294,7 +335,7 @@ class ParameterPanel(QScrollArea):
         info_card_layout.setContentsMargins(12, 12, 12, 12)
         info_card_layout.setSpacing(10)
         
-        # 第一行：大标题和复制按钮
+        # 第一行：大标题和复制按钮（固定标题栏）
         title_row = QHBoxLayout()
         self.model_label = QLabel("🎨 未选择模型")
         self.model_label.setFont(QFont("", 13, QFont.Weight.Bold))
@@ -329,13 +370,18 @@ class ParameterPanel(QScrollArea):
         # 强制垂直居中对齐，修复按钮高低不平的问题
         title_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         title_row.setContentsMargins(0, 0, 0, 0)
-        info_card_layout.addLayout(title_row)
+        
+        info_header = QWidget()
+        info_header_layout = QVBoxLayout(info_header)
+        info_header_layout.setContentsMargins(12, 12, 12, 6)
+        info_header_layout.setSpacing(6)
+        info_header_layout.addLayout(title_row)
         
         # 分割线
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setObjectName("CardSeparator")
-        info_card_layout.addWidget(line)
+        info_header_layout.addWidget(line)
         
         # 参数网格展示区 (不再使用沉重的 GroupBox)
         self.stats_grid = QGridLayout()
@@ -435,13 +481,49 @@ class ParameterPanel(QScrollArea):
             self.detail_widgets[key] = val
             
         info_card_layout.addLayout(self.details_layout)
+        info_card_layout.addStretch()
         
         # 锁定卡片最小高度，防止切换时的视觉剧烈振荡
         self.info_card.setMinimumHeight(320)
-        self.layout.addWidget(self.info_card)
+        
+        self.info_scroll = QScrollArea()
+        self.info_scroll.setWidgetResizable(True)
+        self.info_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.info_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.info_scroll.setWidget(self.info_card)
+        
+        self.info_outer = QWidget()
+        info_outer_layout = QVBoxLayout(self.info_outer)
+        info_outer_layout.setContentsMargins(0, 0, 0, 0)
+        info_outer_layout.setSpacing(0)
+        info_outer_layout.addWidget(info_header)
+        info_outer_layout.addWidget(self.info_scroll)
+        self.main_splitter.addWidget(self.info_outer)
         
         # ========== 2. 底部专用生成设置区域 (可编辑工作区) ==========
-        self._setup_generation_settings(self.layout)
+        self.gen_settings_outer = self._setup_generation_settings()
+        self.main_splitter.addWidget(self.gen_settings_outer)
+        
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 2)
+        saved_splitter = self.settings.value("param_panel/workspace_splitter")
+        if saved_splitter:
+            self.main_splitter.restoreState(saved_splitter)
+        else:
+            self.main_splitter.setSizes([320, 540])
+        self.main_splitter.splitterMoved.connect(lambda *_: self._save_panel_splitter_state())
+        
+        comfy_root = self.settings.value("comfy_root", "", type=str).strip()
+        if comfy_root:
+            self._refresh_comfyui_assets()
+            self.refresh_lora_options()
+
+    def _save_panel_splitter_state(self):
+        self.settings.setValue("param_panel/workspace_splitter", self.main_splitter.saveState())
+
+    def _save_prompt_splitter_state(self):
+        if hasattr(self, "prompt_splitter"):
+            self.settings.setValue("param_panel/prompt_splitter", self.prompt_splitter.saveState())
 
     def _populate_resolutions(self, preset_res, history_res):
         """填充分辨率下拉框（预设+历史，去重）"""
@@ -538,7 +620,26 @@ class ParameterPanel(QScrollArea):
         finally:
             self.sampler_combo.blockSignals(False)
 
-    def _setup_generation_settings(self, parent_layout):
+    def _populate_model_combo(self, combo: QComboBox, items: List[str], settings_key: str):
+        combo.blockSignals(True)
+        try:
+            current_text = combo.currentText()
+            combo.clear()
+            combo.addItem("自动")
+            if items:
+                for item in items:
+                    combo.addItem(item)
+            target = current_text if current_text and current_text != "自动" else self.settings.value(settings_key, "", type=str)
+            if target:
+                index = combo.findText(target)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+                    return
+            combo.setCurrentIndex(0)
+        finally:
+            combo.blockSignals(False)
+
+    def _setup_generation_settings(self):
         """设置生成参数编辑面板（专用工作区）"""
         gen_settings_outer = QFrame()
         gen_settings_outer.setObjectName("GenWorkspace")
@@ -554,9 +655,43 @@ class ParameterPanel(QScrollArea):
         outer_layout.setContentsMargins(8, 8, 8, 8)
         outer_layout.setSpacing(6)
         
+        header_row = QHBoxLayout()
         header_lbl = QLabel("🛠️ 生成工作区 (在此修改并生成)")
         header_lbl.setStyleSheet("font-weight: bold; font-size: 12px; color: palette(highlight);")
-        outer_layout.addWidget(header_lbl)
+        header_row.addWidget(header_lbl)
+        header_row.addStretch()
+        self.workspace_toggle_btn = QToolButton()
+        self.workspace_toggle_btn.setText("收起")
+        self.workspace_toggle_btn.setCheckable(True)
+        saved_expanded = self.settings.value("gen_workspace_controls_expanded", True, type=bool)
+        self.workspace_toggle_btn.setChecked(saved_expanded)
+        self.workspace_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.workspace_toggle_btn.setFixedSize(52, 22)
+        self.workspace_toggle_btn.setStyleSheet("""
+            QToolButton {
+                background-color: palette(button);
+                border: 1px solid palette(mid);
+                border-radius: 3px;
+                color: palette(text);
+                font-size: 10px;
+            }
+            QToolButton:hover { background-color: palette(midlight); }
+            QToolButton:pressed { background-color: palette(light); }
+        """)
+        self.workspace_toggle_btn.toggled.connect(self._toggle_workspace_controls)
+        header_row.addWidget(self.workspace_toggle_btn)
+        outer_layout.addLayout(header_row)
+        
+        self.workspace_scroll = QScrollArea()
+        self.workspace_scroll.setWidgetResizable(True)
+        self.workspace_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.workspace_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        
+        workspace_content = QWidget()
+        workspace_layout = QVBoxLayout(workspace_content)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(6)
+        self.workspace_scroll.setWidget(workspace_content)
 
         # --- 1. 可编辑文本区 ---
         def create_edit_block(title, placeholder, height):
@@ -576,92 +711,173 @@ class ParameterPanel(QScrollArea):
         self.ai_status_label.setFixedWidth(80)
         prompt_title_row.addWidget(self.ai_status_label)
 
+        history_btn_style = """
+            QPushButton {
+                background-color: palette(button);
+                border: 1px solid palette(mid);
+                border-radius: 3px;
+                color: palette(text);
+                font-size: 10px;
+            }
+            QPushButton:hover { background-color: palette(midlight); }
+            QPushButton:pressed { background-color: palette(light); }
+        """
+
         # 历史记录按钮
-        self.btn_history = QToolButton()
-        self.btn_history.setText("📜")
-        self.btn_history.setToolTip("查看AI修改历史")
+        self.btn_history = QPushButton("历史")
+        self.btn_history.setToolTip("查看正向提示词历史记录")
         self.btn_history.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_history.setStyleSheet("QToolButton { border: none; background: transparent; font-size: 14px; } QToolButton:hover { background: palette(midlight); border-radius: 4px; }")
-        self.btn_history.clicked.connect(lambda: self._show_history_menu('positive'))
+        self.btn_history.setFixedSize(52, 22)
+        self.btn_history.setStyleSheet(history_btn_style)
+        self.btn_history.clicked.connect(lambda: self._show_history_dialog('positive'))
         prompt_title_row.addWidget(self.btn_history)
 
-        # AI优化按钮(放在标题行)
-        self.btn_ai_optimize = QPushButton("✨ AI优化")
+        # AI优化按钮
+        self.btn_ai_optimize = QPushButton("AI优化")
         self.btn_ai_optimize.setToolTip("使用AI优化提示词")
         self.btn_ai_optimize.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_ai_optimize.setFixedSize(80, 24)
+        self.btn_ai_optimize.setFixedSize(72, 24)
         self.btn_ai_optimize.setStyleSheet("""
             QPushButton {
-                background-color: #7c3aed;
+                background-color: #2563eb;
                 color: white;
                 border-radius: 3px;
-                padding: 2px 8px;
                 font-size: 10px;
                 font-weight: bold;
             }
-            QPushButton:hover { background-color: #8b5cf6; }
-            QPushButton:pressed { background-color: #6d28d9; }
+            QPushButton:hover { background-color: #1d4ed8; }
+            QPushButton:pressed { background-color: #1e40af; }
             QPushButton:disabled { background-color: #555; color: #aaa; }
         """)
         self.btn_ai_optimize.clicked.connect(self._on_ai_optimize_click)
-        prompt_title_row.addWidget(self.btn_ai_optimize)
+        
+        self.btn_clipboard_import = QPushButton("剪贴板导入")
+        self.btn_clipboard_import.setToolTip("从剪贴板导入图片生成提示词")
+        self.btn_clipboard_import.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clipboard_import.setFixedSize(88, 24)
+        self.btn_clipboard_import.setStyleSheet("""
+            QPushButton {
+                background-color: #3b82f6;
+                color: white;
+                border-radius: 3px;
+                font-size: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #2563eb; }
+            QPushButton:pressed { background-color: #1d4ed8; }
+            QPushButton:disabled { background-color: #555; color: #aaa; }
+        """)
+        self.btn_clipboard_import.clicked.connect(self._on_clipboard_import_click)
 
-        outer_layout.addLayout(prompt_title_row)
+        self.btn_file_import = QPushButton("文件导入")
+        self.btn_file_import.setToolTip("从文件导入图片生成提示词")
+        self.btn_file_import.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_file_import.setFixedSize(72, 24)
+        self.btn_file_import.setStyleSheet("""
+            QPushButton {
+                background-color: #3b82f6;
+                color: white;
+                border-radius: 3px;
+                font-size: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #2563eb; }
+            QPushButton:pressed { background-color: #1d4ed8; }
+            QPushButton:disabled { background-color: #555; color: #aaa; }
+        """)
+        self.btn_file_import.clicked.connect(self._on_file_import_click)
+
+        prompt_container = QWidget()
+        prompt_layout = QVBoxLayout(prompt_container)
+        prompt_layout.setContentsMargins(0, 0, 0, 0)
+        prompt_layout.setSpacing(4)
+        prompt_layout.addLayout(prompt_title_row)
+        
+        prompt_action_row = QHBoxLayout()
+        prompt_action_row.setSpacing(6)
+        prompt_action_row.addStretch()
+        prompt_action_row.addWidget(self.btn_file_import)
+        prompt_action_row.addWidget(self.btn_clipboard_import)
+        prompt_action_row.addWidget(self.btn_ai_optimize)
+        prompt_layout.addLayout(prompt_action_row)
 
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setPlaceholderText("输入新的提示词进行创作...")
-        self.prompt_edit.setMaximumHeight(prompt_height)
+        self.prompt_edit.setMinimumHeight(prompt_height)
         self.prompt_edit.setStyleSheet("background-color: palette(base); border: 1px solid palette(mid); border-radius: 4px; padding: 4px;")
-        outer_layout.addWidget(self.prompt_edit)
+        prompt_layout.addWidget(self.prompt_edit)
 
         # 反向提示词
         neg_title_row, neg_height = create_edit_block("🚫 反向提示词", "输入过滤词...", 60)
 
         # AI优化反向提示词按钮
-        self.btn_neg_ai_optimize = QPushButton("✨ AI优化")
-        self.btn_neg_ai_optimize.setToolTip("使���AI优化反向提示词")
+        self.btn_neg_ai_optimize = QPushButton("AI优化")
+        self.btn_neg_ai_optimize.setToolTip("使用AI优化反向提示词")
         self.btn_neg_ai_optimize.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_neg_ai_optimize.setFixedSize(80, 24)
+        self.btn_neg_ai_optimize.setFixedSize(72, 24)
         self.btn_neg_ai_optimize.setStyleSheet("""
             QPushButton {
-                background-color: #7c3aed;
+                background-color: #2563eb;
                 color: white;
                 border-radius: 3px;
-                padding: 2px 8px;
                 font-size: 10px;
                 font-weight: bold;
             }
-            QPushButton:hover { background-color: #8b5cf6; }
-            QPushButton:pressed { background-color: #6d28d9; }
+            QPushButton:hover { background-color: #1d4ed8; }
+            QPushButton:pressed { background-color: #1e40af; }
             QPushButton:disabled { background-color: #555; color: #aaa; }
         """)
         self.btn_neg_ai_optimize.clicked.connect(self._on_neg_ai_optimize_click)
 
         # 反向历史记录按钮
-        self.btn_neg_history = QToolButton()
-        self.btn_neg_history.setText("📜")
-        self.btn_neg_history.setToolTip("查看反向提示词修改历史")
+        self.btn_neg_history = QPushButton("历史")
+        self.btn_neg_history.setToolTip("查看反向提示词历史记录")
         self.btn_neg_history.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_neg_history.setStyleSheet("QToolButton { border: none; background: transparent; font-size: 14px; } QToolButton:hover { background: palette(midlight); border-radius: 4px; }")
-        self.btn_neg_history.clicked.connect(lambda: self._show_history_menu('negative'))
+        self.btn_neg_history.setFixedSize(52, 22)
+        self.btn_neg_history.setStyleSheet(history_btn_style)
+        self.btn_neg_history.clicked.connect(lambda: self._show_history_dialog('negative'))
 
         # AI处理状态标签(反向提示词)
         self.neg_ai_status_label = QLabel("")
         self.neg_ai_status_label.setStyleSheet("color: #8b5cf6; font-size: 10px;")
         self.neg_ai_status_label.setFixedWidth(80)
         
-        # Reorder: Status -> History -> AI Button (Right aligned)
+        # Reorder: Status -> History (Right aligned)
         neg_title_row.addWidget(self.neg_ai_status_label)
         neg_title_row.addWidget(self.btn_neg_history)
-        neg_title_row.addWidget(self.btn_neg_ai_optimize)
 
-        outer_layout.addLayout(neg_title_row)
+        neg_container = QWidget()
+        neg_layout = QVBoxLayout(neg_container)
+        neg_layout.setContentsMargins(0, 0, 0, 0)
+        neg_layout.setSpacing(4)
+        neg_layout.addLayout(neg_title_row)
+        
+        neg_action_row = QHBoxLayout()
+        neg_action_row.setSpacing(6)
+        neg_action_row.addStretch()
+        neg_action_row.addWidget(self.btn_neg_ai_optimize)
+        neg_layout.addLayout(neg_action_row)
 
         self.neg_prompt_edit = QTextEdit()
         self.neg_prompt_edit.setPlaceholderText("输入过滤词...")
-        self.neg_prompt_edit.setMaximumHeight(neg_height)
+        self.neg_prompt_edit.setMinimumHeight(neg_height)
         self.neg_prompt_edit.setStyleSheet("background-color: palette(base); border: 1px solid palette(mid); border-radius: 4px; padding: 4px;")
-        outer_layout.addWidget(self.neg_prompt_edit)
+        neg_layout.addWidget(self.neg_prompt_edit)
+
+        self.prompt_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.prompt_splitter.setChildrenCollapsible(False)
+        self.prompt_splitter.setHandleWidth(2)
+        self.prompt_splitter.addWidget(prompt_container)
+        self.prompt_splitter.addWidget(neg_container)
+        self.prompt_splitter.setStretchFactor(0, 1)
+        self.prompt_splitter.setStretchFactor(1, 1)
+        saved_prompt_splitter = self.settings.value("param_panel/prompt_splitter")
+        if saved_prompt_splitter:
+            self.prompt_splitter.restoreState(saved_prompt_splitter)
+        else:
+            self.prompt_splitter.setSizes([prompt_height + 80, neg_height + 70])
+        self.prompt_splitter.splitterMoved.connect(lambda *_: self._save_prompt_splitter_state())
+        workspace_layout.addWidget(self.prompt_splitter)
         
 
         # --- 2. 其他参数设置 ---
@@ -669,9 +885,6 @@ class ParameterPanel(QScrollArea):
         gen_layout = QVBoxLayout(self.gen_settings_container)
         gen_layout.setContentsMargins(0, 0, 0, 0)
         gen_layout.setSpacing(6)
-
-        # 将整个外层容器添加到父布局
-        parent_layout.addWidget(gen_settings_outer)
 
         # ===== Seed行 =====
         seed_row = QHBoxLayout()
@@ -809,7 +1022,83 @@ class ParameterPanel(QScrollArea):
 
         gen_layout.addLayout(sampler_row)
 
+        self.model_row_widget = QWidget()
+        model_row = QHBoxLayout(self.model_row_widget)
+        model_row.setContentsMargins(0, 0, 0, 0)
+        model_row.setSpacing(6)
+
+        self.lbl_model = QLabel("模型:")
+        self.lbl_model.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 60px;")
+        model_row.addWidget(self.lbl_model)
+
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(160)
+        self.model_combo.setStyleSheet("padding: 3px; font-size: 11px;")
+        model_row.addWidget(self.model_combo)
+        model_row.addStretch()
+
+        gen_layout.addWidget(self.model_row_widget)
+        self.model_row_widget.setVisible(False)
+
+        unet_row = QHBoxLayout()
+        unet_row.setSpacing(6)
+
+        self.lbl_unet = QLabel("UNET:")
+        self.lbl_unet.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 60px;")
+        unet_row.addWidget(self.lbl_unet)
+        self.lbl_unet.setText("模型(UNET):")
+
+        self.unet_combo = QComboBox()
+        self.unet_combo.setMinimumWidth(160)
+        self.unet_combo.setStyleSheet("padding: 3px; font-size: 11px;")
+        unet_row.addWidget(self.unet_combo)
+        unet_row.addStretch()
+
+        gen_layout.addLayout(unet_row)
+
+        vae_row = QHBoxLayout()
+        vae_row.setSpacing(6)
+
+        lbl_vae = QLabel("AE:")
+        lbl_vae.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 60px;")
+        vae_row.addWidget(lbl_vae)
+
+        self.vae_combo = QComboBox()
+        self.vae_combo.setMinimumWidth(160)
+        self.vae_combo.setStyleSheet("padding: 3px; font-size: 11px;")
+        vae_row.addWidget(self.vae_combo)
+        vae_row.addStretch()
+
+        gen_layout.addLayout(vae_row)
+
+        clip_row = QHBoxLayout()
+        clip_row.setSpacing(6)
+
+        lbl_clip = QLabel("CLIP模型:")
+        lbl_clip.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 60px;")
+        clip_row.addWidget(lbl_clip)
+
+        self.clip_combo = QComboBox()
+        self.clip_combo.setMinimumWidth(160)
+        self.clip_combo.setStyleSheet("padding: 3px; font-size: 11px;")
+        clip_row.addWidget(self.clip_combo)
+        clip_row.addStretch()
+
+        gen_layout.addLayout(clip_row)
+        self._refresh_model_selectors()
+
+        self.workspace_controls_container = QWidget()
+        controls_layout = QVBoxLayout(self.workspace_controls_container)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(6)
+        controls_layout.addWidget(self.gen_settings_container)
+
         # ===== LoRA管理区域 =====
+        self.lora_section_container = QWidget()
+        lora_section_layout = QVBoxLayout(self.lora_section_container)
+        lora_section_layout.setContentsMargins(0, 0, 0, 0)
+        lora_section_layout.setSpacing(6)
+
         lora_header_row = QHBoxLayout()
         lora_header_row.setSpacing(6)
 
@@ -817,7 +1106,6 @@ class ParameterPanel(QScrollArea):
         lbl_loras.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 60px; font-weight: bold;")
         lora_header_row.addWidget(lbl_loras)
 
-        # 添加LoRA按钮放在标题行
         add_lora_btn = QPushButton("+ 添加")
         add_lora_btn.setFixedSize(60, 22)
         add_lora_btn.setStyleSheet("""
@@ -834,9 +1122,8 @@ class ParameterPanel(QScrollArea):
         lora_header_row.addWidget(add_lora_btn)
         lora_header_row.addStretch()
 
-        gen_layout.addLayout(lora_header_row)
+        lora_section_layout.addLayout(lora_header_row)
 
-        # LoRA列表容器（滚动区域）
         self.lora_scroll = QScrollArea()
         self.lora_scroll.setWidgetResizable(True)
         self.lora_scroll.setMaximumHeight(100)
@@ -849,16 +1136,17 @@ class ParameterPanel(QScrollArea):
         self.lora_layout.addStretch()
 
         self.lora_scroll.setWidget(self.lora_container)
-        gen_layout.addWidget(self.lora_scroll)
+        lora_section_layout.addWidget(self.lora_scroll)
 
-        # 存储LoRA数据: {name: weight}
         self.current_loras = {}
-
-        outer_layout.addWidget(self.gen_settings_container)
+        
+        workspace_layout.addWidget(self.workspace_controls_container)
+        workspace_layout.addWidget(self.lora_section_container)
+        workspace_layout.addStretch()
 
         # --- 3. 底部生成按钮 (从上方移动到这里) ---
-        # 远程生成按钮行
-        gen_btn_layout = QHBoxLayout()
+        self.gen_btn_container = QWidget()
+        gen_btn_layout = QHBoxLayout(self.gen_btn_container)
 
         # 始终使用标准模板,不再提供切换选项
         gen_btn_layout.addStretch()
@@ -924,13 +1212,20 @@ class ParameterPanel(QScrollArea):
         self.btn_remote_gen.clicked.connect(self._on_remote_gen_click)
         gen_btn_layout.addWidget(self.btn_remote_gen)
         
-        gen_layout.addLayout(gen_btn_layout)
-
-        # 将整个外层容器添加到父布局
-        parent_layout.addWidget(gen_settings_outer)
+        outer_layout.addWidget(self.workspace_scroll, 1)
+        outer_layout.addWidget(self.gen_btn_container)
         
         # 初始化持久化逻辑
         self._init_workspace_persistence()
+        self._toggle_workspace_controls(self.workspace_toggle_btn.isChecked())
+        return gen_settings_outer
+
+    def _toggle_workspace_controls(self, expanded):
+        if hasattr(self, "workspace_controls_container"):
+            self.workspace_controls_container.setVisible(expanded)
+        if hasattr(self, "workspace_toggle_btn"):
+            self.workspace_toggle_btn.setText("收起" if expanded else "展开")
+        self.settings.setValue("gen_workspace_controls_expanded", expanded)
     
     
     def _add_lora_item(self, name: str = "", weight: float = 1.0):
@@ -940,16 +1235,7 @@ class ParameterPanel(QScrollArea):
             print("[UI] 已达到LoRA数量上限（5个）")
             return
         
-        # 获取所有可用的LoRA
-        main_window = self.window()
-        all_loras = []
-        if hasattr(main_window, 'db_manager'):
-            all_loras_raw = main_window.db_manager.get_unique_loras()
-            for item in all_loras_raw:
-                if isinstance(item, tuple):
-                    all_loras.append(item[0] if item else "")
-                else:
-                    all_loras.append(str(item))
+        all_loras = self._get_all_loras()
         
         item_widget = QWidget()
         item_layout = QHBoxLayout(item_widget)
@@ -1033,6 +1319,205 @@ class ParameterPanel(QScrollArea):
             self.current_loras[name] = weight
             lora_combo.setProperty("selected_lora", name)  # 设置属性，防止重复检测
             # print(f"[UI] 添加LoRA: {name} (权重: {weight})")
+
+    def _get_all_loras(self):
+        main_window = self.window()
+        all_loras = []
+        comfy_loras = self._get_comfyui_loras()
+        if comfy_loras is not None and len(comfy_loras) >= 0:
+            for name in comfy_loras:
+                if name and name not in all_loras:
+                    all_loras.append(name)
+            if self.settings.value("comfy_root", "", type=str):
+                return all_loras
+        for name in comfy_loras:
+            if name and name not in all_loras:
+                all_loras.append(name)
+        comfy_basenames = set()
+        for name in comfy_loras:
+            base = os.path.basename(name).lower()
+            comfy_basenames.add(base)
+            comfy_basenames.add(os.path.splitext(base)[0])
+        if hasattr(main_window, 'db_manager'):
+            all_loras_raw = main_window.db_manager.get_unique_loras()
+            for item in all_loras_raw:
+                if isinstance(item, tuple):
+                    name = item[0] if item else ""
+                else:
+                    name = str(item)
+                if name:
+                    base = os.path.basename(name).lower()
+                    base_no = os.path.splitext(base)[0]
+                    if base in comfy_basenames or base_no in comfy_basenames:
+                        continue
+                if name and name not in all_loras:
+                    all_loras.append(name)
+        return all_loras
+
+    def _resolve_comfyui_models_root(self):
+        base = self.settings.value("comfy_root", "", type=str).strip()
+        if not base:
+            return ""
+        base_lower = os.path.basename(base).lower()
+        if base_lower == "models":
+            return base
+        has_models_subdir = any(
+            os.path.isdir(os.path.join(base, name))
+            for name in ("checkpoints", "loras", "unet", "vae", "clip")
+        )
+        if has_models_subdir:
+            return base
+        models_dir = os.path.join(base, "models")
+        if os.path.isdir(models_dir):
+            return models_dir
+        return base
+
+    def _get_comfyui_loras(self):
+        base = self.settings.value("comfy_root", "", type=str).strip()
+        if not base:
+            self._last_comfyui_lora_status = "未设置 ComfyUI 目录"
+            return []
+        models_root = self._resolve_comfyui_models_root()
+        lora_dir = os.path.join(models_root, "loras") if models_root else ""
+        if not lora_dir or not os.path.isdir(lora_dir):
+            target_path = lora_dir if lora_dir else os.path.join(base, "models", "loras")
+            self._last_comfyui_lora_status = f"未找到目录: {target_path}"
+            return []
+        results = []
+        exts = (".safetensors", ".ckpt", ".pt", ".sft")
+        for root, _, files in os.walk(lora_dir):
+            for fname in files:
+                if fname.lower().endswith(exts):
+                    full_path = os.path.join(root, fname)
+                    rel_path = os.path.relpath(full_path, lora_dir).replace("\\", "/")
+                    if rel_path not in results:
+                        results.append(rel_path)
+        self.available_loras = results
+        if results:
+            self._last_comfyui_lora_status = f"已读取 {len(results)} 个 LoRA"
+        else:
+            self._last_comfyui_lora_status = "LoRA 目录为空"
+        return results
+
+    def _get_comfyui_models(self, subdir):
+        base = self.settings.value("comfy_root", "", type=str).strip()
+        if not base:
+            if not hasattr(self, "_last_comfyui_model_status"):
+                self._last_comfyui_model_status = {}
+            self._last_comfyui_model_status[subdir] = "未设置 ComfyUI 目录"
+            return []
+        models_root = self._resolve_comfyui_models_root()
+        if not models_root:
+            if not hasattr(self, "_last_comfyui_model_status"):
+                self._last_comfyui_model_status = {}
+            self._last_comfyui_model_status[subdir] = "未设置 ComfyUI 目录"
+            return []
+        alias_map = {
+            "checkpoints": ["checkpoints", "checkpoint", "diffusion_models", "stable_diffusion", "stable-diffusion"],
+            "unet": ["unet", "unets", "diffusion_models"],
+            "vae": ["vae", "vaes", "vae_approx"],
+            "clip": ["clip", "text_encoders", "clip_vision", "llm"]
+        }
+        dir_candidates = alias_map.get(subdir, [subdir])
+        results = []
+        exts = (".safetensors", ".ckpt", ".pt", ".sft", ".pth", ".bin", ".gguf")
+        searched_dirs = []
+        existing_dirs = []
+        for name in dir_candidates:
+            target_dir = os.path.join(models_root, name)
+            searched_dirs.append(target_dir)
+            if not os.path.isdir(target_dir):
+                continue
+            existing_dirs.append(target_dir)
+            for root, _, files in os.walk(target_dir):
+                for fname in files:
+                    if fname.lower().endswith(exts):
+                        full_path = os.path.join(root, fname)
+                        rel_path = os.path.relpath(full_path, target_dir).replace("\\", "/")
+                        if rel_path not in results:
+                            results.append(rel_path)
+        if not hasattr(self, "_last_comfyui_model_status"):
+            self._last_comfyui_model_status = {}
+        if results:
+            self._last_comfyui_model_status[subdir] = f"已读取 {len(results)} 个模型"
+        else:
+            if not existing_dirs:
+                self._last_comfyui_model_status[subdir] = f"未找到目录: {', '.join(searched_dirs)}"
+            else:
+                self._last_comfyui_model_status[subdir] = f"目录为空: {existing_dirs[0]}"
+        return results
+
+    def _refresh_comfyui_assets(self):
+        self.available_loras = self._get_comfyui_loras()
+        self.available_checkpoints = self._get_comfyui_models("checkpoints")
+        self.available_unets = self._get_comfyui_models("unet")
+        self.available_vaes = self._get_comfyui_models("vae")
+        self.available_clips = self._get_comfyui_models("clip")
+        self._refresh_model_selectors()
+        status_map = getattr(self, "_last_comfyui_model_status", {})
+        if status_map:
+            if not hasattr(self, "_last_comfyui_model_popup"):
+                self._last_comfyui_model_popup = {}
+            for subdir, status in status_map.items():
+                if status.startswith("未设置 ComfyUI 目录") or status.startswith("未找到目录"):
+                    last_popup = self._last_comfyui_model_popup.get(subdir, "")
+                    if last_popup != status:
+                        QMessageBox.warning(self, "ComfyUI 目录无效", status)
+                        self._last_comfyui_model_popup[subdir] = status
+
+    def _refresh_model_selectors(self):
+        if hasattr(self, "model_combo"):
+            self._populate_model_combo(self.model_combo, getattr(self, "available_checkpoints", []), "gen_model")
+        if hasattr(self, "unet_combo"):
+            self._populate_model_combo(self.unet_combo, getattr(self, "available_unets", []), "gen_unet")
+        if hasattr(self, "vae_combo"):
+            self._populate_model_combo(self.vae_combo, getattr(self, "available_vaes", []), "gen_vae")
+        if hasattr(self, "clip_combo"):
+            self._populate_model_combo(self.clip_combo, getattr(self, "available_clips", []), "gen_clip")
+        if hasattr(self, "model_row_widget") and hasattr(self, "lbl_unet") and hasattr(self, "lbl_model"):
+            self.model_row_widget.setVisible(False)
+            self.lbl_unet.setText("模型(UNET):")
+
+    def refresh_lora_options(self):
+        all_loras = self._get_all_loras()
+        status = getattr(self, "_last_comfyui_lora_status", "")
+        if status:
+            if status.startswith("未设置 ComfyUI 目录") or status.startswith("未找到目录"):
+                last_popup = getattr(self, "_last_comfyui_lora_popup", "")
+                if last_popup != status:
+                    QMessageBox.warning(self, "ComfyUI 目录无效", status)
+                    self._last_comfyui_lora_popup = status
+            else:
+                self._temp_notify(status)
+                self._last_comfyui_lora_popup = ""
+        if not all_loras:
+            return
+        for i in range(self.lora_layout.count() - 1):
+            item = self.lora_layout.itemAt(i)
+            if not item or not item.widget():
+                continue
+            widget = item.widget()
+            lora_combo = widget.findChild(QComboBox)
+            if not lora_combo:
+                continue
+            selected = lora_combo.property("selected_lora")
+            if not selected:
+                current_text = lora_combo.currentText()
+                if current_text and current_text != "选择LoRA...":
+                    selected = current_text
+            lora_combo.blockSignals(True)
+            lora_combo.clear()
+            lora_combo.addItem("选择LoRA...")
+            for lora in all_loras:
+                lora_combo.addItem(lora)
+            if selected:
+                index = lora_combo.findText(selected)
+                if index < 0:
+                    lora_combo.addItem(selected)
+                    index = lora_combo.findText(selected)
+                if index >= 0:
+                    lora_combo.setCurrentIndex(index)
+            lora_combo.blockSignals(False)
     
     def _on_lora_selection_changed(self, widget, text, combo):
         """当LoRA选择改变时"""
@@ -1138,41 +1623,317 @@ class ParameterPanel(QScrollArea):
         """处理反向提示词AI优化按钮点击"""
         self._run_prompt_ai_optimization(is_negative=True)
 
-    def _show_history_menu(self, prompt_type):
-        menu = QMenu(self)
+    def _on_clipboard_import_click(self):
+        if self._ai_is_processing or self._img_prompt_processing:
+            self._temp_notify("当前已有AI任务在执行")
+            return
+        
+        clipboard = QGuiApplication.clipboard()
+        image = clipboard.image()
+        if image and not image.isNull():
+            image_b64 = self._qimage_to_base64(image)
+            if image_b64:
+                self._run_image_to_prompt(image_b64)
+                return
+        
+        mime = clipboard.mimeData()
+        if mime and mime.hasUrls():
+            for url in mime.urls():
+                path = url.toLocalFile()
+                if path and self._is_image_file(path):
+                    image_b64 = self._image_file_to_base64(path)
+                    if image_b64:
+                        self._run_image_to_prompt(image_b64)
+                        return
+        
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.warning(self, "剪贴板无图片", "未检测到可用的图片内容")
+
+    def _on_file_import_click(self):
+        if self._ai_is_processing or self._img_prompt_processing:
+            self._temp_notify("当前已有AI任务在执行")
+            return
+        
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", "图片文件 (*.png *.jpg *.jpeg *.webp)")
+        if not file_path:
+            return
+        
+        image_b64 = self._image_file_to_base64(file_path)
+        if not image_b64:
+            QMessageBox.warning(self, "图片读取失败", "未能读取或解析该图片")
+            return
+        self._run_image_to_prompt(image_b64)
+
+    def _run_image_to_prompt(self, image_b64: str):
+        if self._ai_is_processing or self._img_prompt_processing:
+            self._temp_notify("当前已有AI任务在执行")
+            return
+        self._img_prompt_processing = True
+        self.ai_status_label.setText("⏳ 识图中...")
+        self.btn_clipboard_import.setEnabled(False)
+        self.btn_file_import.setEnabled(False)
+        self.btn_ai_optimize.setEnabled(False)
+        self.btn_neg_ai_optimize.setEnabled(False)
+        
+        original_prompt = self.prompt_edit.toPlainText().strip()
+        self.current_img_worker = ImagePromptWorker(image_b64)
+        self._img_stream_started = False
+        self.current_img_worker.stream_update.connect(self._on_img_stream_update)
+        self.current_img_worker.finished.connect(lambda s, r: self._on_image_prompt_finished(s, r, original_prompt))
+        self.current_img_worker.start()
+
+    def _on_img_stream_update(self, chunk):
+        if not self._img_prompt_processing:
+            return
+        if not hasattr(self, "_img_stream_started") or not self._img_stream_started:
+            self.prompt_edit.clear()
+            self._img_stream_started = True
+        self.prompt_edit.insertPlainText(chunk)
+        cursor = self.prompt_edit.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.prompt_edit.setTextCursor(cursor)
+
+    def _on_image_prompt_finished(self, success, result, original_prompt):
+        if not self._img_prompt_processing:
+            return
+        self._img_prompt_processing = False
+        self.btn_clipboard_import.setEnabled(True)
+        self.btn_file_import.setEnabled(True)
+        self.btn_ai_optimize.setEnabled(True)
+        self.btn_neg_ai_optimize.setEnabled(True)
+        self.current_img_worker = None
+        
+        if success:
+            self.ai_status_label.setText("✅ 识图完成")
+            QTimer.singleShot(3000, lambda: self.ai_status_label.setText(""))
+            self.prompt_edit.setPlainText(result)
+            self.history_manager.add_record("positive", original_prompt, result)
+        else:
+            self.ai_status_label.setText("❌ 识图失败")
+            QTimer.singleShot(3000, lambda: self.ai_status_label.setText(""))
+            if hasattr(self, "_img_stream_started") and self._img_stream_started:
+                self.prompt_edit.setPlainText(original_prompt)
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "图生文失败", result)
+
+    def _is_image_file(self, path: str) -> bool:
+        ext = os.path.splitext(path)[1].lower()
+        return ext in [".png", ".jpg", ".jpeg", ".webp", ".bmp"]
+
+    def _image_file_to_base64(self, path: str) -> str:
+        image = QImage(path)
+        if image.isNull():
+            return ""
+        return self._qimage_to_base64(image)
+
+    def _qimage_to_base64(self, image: QImage) -> str:
+        if image is None or image.isNull():
+            return ""
+        byte_array = QByteArray()
+        buffer = QBuffer(byte_array)
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        image.save(buffer, "PNG")
+        buffer.close()
+        return base64.b64encode(bytes(byte_array)).decode("utf-8")
+
+    def _show_history_dialog(self, prompt_type):
+        if prompt_type not in self.history_dialogs:
+            self.history_dialogs[prompt_type] = self._build_history_dialog(prompt_type)
+        dialog = self.history_dialogs[prompt_type]
+        self._refresh_history_dialog(dialog, prompt_type)
+        if dialog.isVisible():
+            dialog.raise_()
+            dialog.activateWindow()
+        else:
+            dialog.show()
+
+    def _build_history_dialog(self, prompt_type):
+        dialog = QDialog(self)
+        title = "正向提示词历史记录" if prompt_type == "positive" else "反向提示词历史记录"
+        dialog.setWindowTitle(title)
+        dialog.resize(720, 480)
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        
+        layout = QVBoxLayout(dialog)
+        
+        header_row = QHBoxLayout()
+        header_label = QLabel(title)
+        header_label.setStyleSheet("font-weight: bold; font-size: 12px; color: palette(text);")
+        header_row.addWidget(header_label)
+        header_row.addStretch()
+        count_label = QLabel("")
+        count_label.setStyleSheet("color: palette(mid); font-size: 10px;")
+        header_row.addWidget(count_label)
+        layout.addLayout(header_row)
+        
+        body_splitter = QSplitter(Qt.Orientation.Horizontal)
+        body_splitter.setChildrenCollapsible(False)
+        
+        left_widget = QWidget()
+        left_col = QVBoxLayout(left_widget)
+        left_col.setContentsMargins(0, 0, 0, 0)
+        left_label = QLabel("系列")
+        left_label.setStyleSheet("color: palette(mid); font-size: 10px;")
+        left_col.addWidget(left_label)
+        session_list = QListWidget()
+        session_list.setMinimumWidth(260)
+        left_col.addWidget(session_list)
+        body_splitter.addWidget(left_widget)
+        
+        right_widget = QWidget()
+        right_col = QVBoxLayout(right_widget)
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_label = QLabel("版本")
+        right_label.setStyleSheet("color: palette(mid); font-size: 10px;")
+        right_col.addWidget(right_label)
+        version_list = QListWidget()
+        right_col.addWidget(version_list)
+        body_splitter.addWidget(right_widget)
+        
+        body_splitter.setStretchFactor(0, 2)
+        body_splitter.setStretchFactor(1, 3)
+        layout.addWidget(body_splitter)
+        
+        preview_label = QLabel("预览")
+        preview_label.setStyleSheet("color: palette(mid); font-size: 10px;")
+        layout.addWidget(preview_label)
+        preview_edit = QTextEdit()
+        preview_edit.setReadOnly(True)
+        preview_edit.setMinimumHeight(140)
+        preview_edit.setStyleSheet("background-color: palette(base); border: 1px solid palette(mid); border-radius: 4px; padding: 6px;")
+        layout.addWidget(preview_edit)
+        
+        btn_row = QHBoxLayout()
+        apply_btn = QPushButton("应用到提示词")
+        apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_btn = QPushButton("复制")
+        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        delete_btn = QPushButton("删除系列")
+        delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        delete_btn.setStyleSheet("color: #dc2626;")
+        btn_row.addWidget(apply_btn)
+        btn_row.addWidget(copy_btn)
+        btn_row.addWidget(delete_btn)
+        btn_row.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(dialog.close)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+        
+        dialog.session_list = session_list
+        dialog.version_list = version_list
+        dialog.preview_edit = preview_edit
+        dialog.apply_btn = apply_btn
+        dialog.copy_btn = copy_btn
+        dialog.delete_btn = delete_btn
+        dialog.count_label = count_label
+        dialog.selected_text = ""
+        
+        session_list.currentItemChanged.connect(lambda item: self._on_history_session_selected(dialog, item))
+        version_list.currentItemChanged.connect(lambda item: self._on_history_version_selected(dialog, item))
+        version_list.itemDoubleClicked.connect(lambda _: self._apply_history_selection(prompt_type, dialog))
+        apply_btn.clicked.connect(lambda: self._apply_history_selection(prompt_type, dialog))
+        copy_btn.clicked.connect(lambda: self._copy_history_selection(dialog))
+        delete_btn.clicked.connect(lambda: self._delete_history_session(prompt_type, dialog))
+        return dialog
+
+    def _refresh_history_dialog(self, dialog, prompt_type):
         sessions = self.history_manager.get_sessions(prompt_type)
+        dialog.session_list.clear()
+        dialog.version_list.clear()
+        dialog.preview_edit.clear()
+        dialog.selected_text = ""
         
         if not sessions:
-            action = QAction("暂无历史记录", self)
-            action.setEnabled(False)
-            menu.addAction(action)
-        else:
-            # Reverse order (newest first)
-            for i, session in enumerate(reversed(sessions)):
-                base = session['base']
-                chain = session['chain']
-                
-                # Title for the session
-                base_preview = (base[:20] + '...') if len(base) > 20 else (base or "空提示词")
-                
-                # Submenu for this session
-                session_menu = menu.addMenu(f"系列 {len(sessions)-i}: {base_preview}")
-                
-                # Add Original
-                action_orig = QAction(f"原始: {base_preview}", self)
-                action_orig.triggered.connect(lambda checked, t=base: self._restore_history(prompt_type, t))
-                session_menu.addAction(action_orig)
-                
-                # Add Versions
-                for j, ver in enumerate(chain):
-                    ver_preview = (ver[:30] + '...') if len(ver) > 30 else ver
-                    action = QAction(f"V{j+1}: {ver_preview}", self)
-                    action.triggered.connect(lambda checked, t=ver: self._restore_history(prompt_type, t))
-                    session_menu.addAction(action)
+            dialog.session_list.setEnabled(False)
+            dialog.version_list.setEnabled(False)
+            dialog.apply_btn.setEnabled(False)
+            dialog.copy_btn.setEnabled(False)
+            dialog.delete_btn.setEnabled(False)
+            dialog.preview_edit.setPlainText("暂无历史记录")
+            dialog.count_label.setText("0 条")
+            return
+        
+        dialog.session_list.setEnabled(True)
+        dialog.version_list.setEnabled(True)
+        dialog.apply_btn.setEnabled(True)
+        dialog.copy_btn.setEnabled(True)
+        dialog.delete_btn.setEnabled(True)
+        dialog.count_label.setText(f"{len(sessions)} 条")
+        
+        import datetime
+        total = len(sessions)
+        for i, session in enumerate(reversed(sessions)):
+            base = session.get("base", "")
+            ts = session.get("timestamp", 0)
+            time_str = datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+            base_preview = (base[:24] + "...") if len(base) > 24 else (base or "空提示词")
+            item = QListWidgetItem(f"系列 {total - i} · {time_str} · {base_preview}")
+            item.setData(Qt.ItemDataRole.UserRole, session)
+            dialog.session_list.addItem(item)
+        dialog.session_list.setCurrentRow(0)
 
-        # Show menu at button position
-        btn = self.btn_history if prompt_type == 'positive' else self.btn_neg_history
-        menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+    def _on_history_session_selected(self, dialog, item):
+        dialog.version_list.clear()
+        dialog.preview_edit.clear()
+        dialog.selected_text = ""
+        if not item:
+            return
+        session = item.data(Qt.ItemDataRole.UserRole)
+        if not session:
+            return
+        base = session.get("base", "")
+        chain = session.get("chain", [])
+        item_base = QListWidgetItem("原始版本")
+        item_base.setData(Qt.ItemDataRole.UserRole, base)
+        dialog.version_list.addItem(item_base)
+        for idx, ver in enumerate(chain):
+            item_ver = QListWidgetItem(f"版本 {idx + 1}")
+            item_ver.setData(Qt.ItemDataRole.UserRole, ver)
+            dialog.version_list.addItem(item_ver)
+        dialog.version_list.setCurrentRow(0)
+
+    def _on_history_version_selected(self, dialog, item):
+        if not item:
+            return
+        text = item.data(Qt.ItemDataRole.UserRole)
+        dialog.selected_text = text or ""
+        dialog.preview_edit.setPlainText(dialog.selected_text)
+
+    def _apply_history_selection(self, prompt_type, dialog):
+        text = dialog.selected_text
+        if not text:
+            return
+        self._restore_history(prompt_type, text)
+
+    def _copy_history_selection(self, dialog):
+        text = dialog.selected_text
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+
+    def _delete_history_session(self, prompt_type, dialog):
+        item = dialog.session_list.currentItem()
+        if not item:
+            return
+        session = item.data(Qt.ItemDataRole.UserRole)
+        if not session:
+            return
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self,
+            "删除历史系列",
+            "确定删除当前系列吗？此操作不可恢复。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        sessions = self.history_manager.sessions.get(prompt_type, [])
+        if session in sessions:
+            sessions.remove(session)
+        self._refresh_history_dialog(dialog, prompt_type)
 
     def _restore_history(self, prompt_type, text):
         target_edit = self.prompt_edit if prompt_type == 'positive' else self.neg_prompt_edit
@@ -1201,7 +1962,10 @@ class ParameterPanel(QScrollArea):
         target_edit = self.neg_prompt_edit if is_negative else self.prompt_edit
         
         # Check if cancelled (should be handled by cancellation flag but good to double check)
-        if not self._ai_is_processing: return
+        if not self._ai_is_processing:
+            if self.current_ai_worker is self.sender():
+                self.current_ai_worker = None
+            return
 
         self._ai_is_processing = False
         target_btn.setText("✨ AI优化")
@@ -1235,11 +1999,14 @@ class ParameterPanel(QScrollArea):
         target_btn = self.btn_neg_ai_optimize if is_negative else self.btn_ai_optimize
         status_label = self.neg_ai_status_label if is_negative else self.ai_status_label
         
+        if self._img_prompt_processing:
+            self._temp_notify("当前正在执行图生文任务")
+            return
+        
         # 1. Cancel Logic
         if self._ai_is_processing:
             if self.current_ai_worker:
                 self.current_ai_worker.is_cancelled = True
-                self.current_ai_worker = None
             
             # Reset UI
             self._ai_is_processing = False
@@ -1580,6 +2347,16 @@ class ParameterPanel(QScrollArea):
                 if idx >= 0: self.sampler_combo.setCurrentIndex(idx)
         except: pass
 
+        try:
+            model_name = self.model_label.text().replace("🎨 ", "").strip()
+            if model_name and model_name not in ["未选择模型", "未知模型"]:
+                resolved = self._find_best_model_match(model_name)
+                target = resolved or model_name
+                idx = self.model_combo.findText(target)
+                if idx >= 0:
+                    self.model_combo.setCurrentIndex(idx)
+        except: pass
+
         # 6. LoRAs
         # 清空当前LoRA
         self._clear_lora_list(persist=False)
@@ -1703,6 +2480,19 @@ class ParameterPanel(QScrollArea):
         )
         # Note: Loading is handled in _populate_samplers
 
+        self.model_combo.currentTextChanged.connect(
+            lambda t: self.settings.setValue("gen_model", t)
+        )
+        self.unet_combo.currentTextChanged.connect(
+            lambda t: self.settings.setValue("gen_unet", t)
+        )
+        self.vae_combo.currentTextChanged.connect(
+            lambda t: self.settings.setValue("gen_vae", t)
+        )
+        self.clip_combo.currentTextChanged.connect(
+            lambda t: self.settings.setValue("gen_clip", t)
+        )
+
         # 8. LoRAs
         self._load_loras()
 
@@ -1730,6 +2520,7 @@ class ParameterPanel(QScrollArea):
             self._log(f"Workflow 深拷贝失败: {e}")
             _restore_btn()
             return
+        self._refresh_comfyui_assets()
             
         params = self.current_meta.get('params', {}) if self.current_meta else {} 
         # 智能同步修改后的提示词到工作流 (V5.4 精准透明版)
@@ -1913,47 +2704,75 @@ class ParameterPanel(QScrollArea):
             # CheckpointLoader节点: 注入模型名称
             if 'checkpointloader' in class_type:
                 if 'ckpt_name' in inputs:
-                    # 从UI Model Label获取当前模型名称 (去除 "🎨 " 前缀)
-                    current_model = self.model_label.text().replace("🎨 ", "").strip()
+                    selected_model = None
+                    if hasattr(self, "model_combo"):
+                        selected_model = self.model_combo.currentText()
+                    current_model = selected_model if selected_model and selected_model != "自动" else self.model_label.text().replace("🎨 ", "").strip()
                     
-                    if current_model and current_model != "未选择模型":
-                         # 尝试从服务器列表中找到真正的全名
-                         real_model_name = self._find_best_model_match(current_model)
-                         
-                         if real_model_name:
-                             inputs['ckpt_name'] = real_model_name
-                             self._log(f"[Comfy] -> 注入Model (精准匹配): {real_model_name}")
-                         else:
-                             # 回退到启发式补全
-                             if '.' not in current_model:
-                                 current_model += ".safetensors"
-                                 self._log(f"[Comfy] ⚠️ 本地未找到匹配模型，尝试自动补全: {current_model}")
-                             
-                             inputs['ckpt_name'] = current_model
-                             self._log(f"[Comfy] -> 注入Model: 节点 {node_id} -> {current_model}")
+                    if current_model and current_model not in ["未选择模型", "未知模型"]:
+                        real_model_name = self._find_best_model_match(current_model)
+                        
+                        if real_model_name:
+                            inputs['ckpt_name'] = real_model_name
+                            self._log(f"[Comfy] -> 注入Model (精准匹配): {real_model_name}")
+                        else:
+                            if '.' not in current_model:
+                                current_model += ".safetensors"
+                                self._log(f"[Comfy] ⚠️ 本地未找到匹配模型，尝试自动补全: {current_model}")
+                            
+                            inputs['ckpt_name'] = current_model
+                            self._log(f"[Comfy] -> 注入Model: 节点 {node_id} -> {current_model}")
                     else:
-                         self._log(f"[Comfy] ⚠️ 未注入模型: UI未选择有效模型")
+                        fallback_model = None
+                        if hasattr(self, 'available_models') and self.available_models:
+                            fallback_model = self.available_models[0]
+                        
+                        if fallback_model:
+                            inputs['ckpt_name'] = fallback_model
+                            self._log(f"[Comfy] -> 注入Model (默认回退): {fallback_model}")
+                        else:
+                            self._log(f"[Comfy] ⚠️ 未注入模型: UI未选择有效模型且未获取可用模型列表")
             
             # UNETLoader节点: 注入UNET模型名称
             if 'unetloader' in class_type:
                 if 'unet_name' in inputs:
+                    selected_unet = None
+                    if hasattr(self, "unet_combo"):
+                        selected_unet = self.unet_combo.currentText()
                     current_model = self.model_label.text().replace("🎨 ", "").strip()
-                    
-                    if current_model and current_model != "未选择模型":
-                         real_model_name = self._find_best_model_match(current_model)
-                         
-                         if real_model_name:
-                             inputs['unet_name'] = real_model_name
-                             self._log(f"[Comfy] -> 注入UNET Model (精准匹配): {real_model_name}")
-                         else:
-                             if '.' not in current_model:
-                                 current_model += ".safetensors"
-                                 self._log(f"[Comfy] ⚠️ 本地未找到匹配UNET模型，尝试自动补全: {current_model}")
-                             
-                             inputs['unet_name'] = current_model
-                             self._log(f"[Comfy] -> 注入UNET Model: 节点 {node_id} -> {current_model}")
+                    desired_unet = selected_unet if selected_unet and selected_unet != "自动" else (current_model if current_model and current_model not in ["未选择模型", "未知模型"] else inputs.get("unet_name"))
+                    resolved_unet = self._find_best_unet_match(desired_unet) if desired_unet else None
+                    if resolved_unet:
+                        inputs['unet_name'] = resolved_unet
+                        self._log(f"[Comfy] -> 注入UNET Model: 节点 {node_id} -> {resolved_unet}")
                     else:
-                         self._log(f"[Comfy] ⚠️ 未注入UNET模型: UI未选择有效模型")
+                        self._log(f"[Comfy] ⚠️ 未注入UNET模型: 未找到匹配项")
+
+            if 'vaeloader' in class_type:
+                if 'vae_name' in inputs:
+                    selected_vae = None
+                    if hasattr(self, "vae_combo"):
+                        selected_vae = self.vae_combo.currentText()
+                    desired_vae = selected_vae if selected_vae and selected_vae != "自动" else inputs.get("vae_name")
+                    resolved_vae = self._find_best_vae_match(desired_vae) if desired_vae else None
+                    if resolved_vae:
+                        inputs['vae_name'] = resolved_vae
+                        self._log(f"[Comfy] -> 注入VAE: 节点 {node_id} -> {resolved_vae}")
+                    else:
+                        self._log(f"[Comfy] ⚠️ 未注入VAE: 未找到匹配项")
+
+            if 'cliploader' in class_type:
+                if 'clip_name' in inputs:
+                    selected_clip = None
+                    if hasattr(self, "clip_combo"):
+                        selected_clip = self.clip_combo.currentText()
+                    desired_clip = selected_clip if selected_clip and selected_clip != "自动" else inputs.get("clip_name")
+                    resolved_clip = self._find_best_clip_match(desired_clip) if desired_clip else None
+                    if resolved_clip:
+                        inputs['clip_name'] = resolved_clip
+                        self._log(f"[Comfy] -> 注入CLIP: 节点 {node_id} -> {resolved_clip}")
+                    else:
+                        self._log(f"[Comfy] ⚠️ 未注入CLIP: 未找到匹配项")
 
             # LoraLoader节点：不再在主循环中处理，改为后处理
             # LoraLoaderModelOnly节点: 也在后处理中统一处理
@@ -1979,6 +2798,7 @@ class ParameterPanel(QScrollArea):
         
         # --- 专门处理 LoRA 注入 (更健壮的逻辑) ---
         if self.current_loras:
+            missing_loras = set()
             # 1. 找到所有 LoraLoader 和 LoraLoaderModelOnly 节点
             lora_nodes = []
             for nid, node in workflow.items():
@@ -2111,11 +2931,19 @@ class ParameterPanel(QScrollArea):
                     inputs = node.get('inputs', {})
                     if i < len(lora_list):
                         lora_name, lora_weight = lora_list[i]
-                        
-                        # 注入LoRA名称
+                        resolved_lora_name = self._find_best_lora_match(lora_name)
                         if 'lora_name' in inputs:
-                            inputs['lora_name'] = lora_name
-                            self._log(f"[Comfy] -> 注入LoRA名称: 节点 {nid} -> {lora_name}")
+                            if resolved_lora_name:
+                                inputs['lora_name'] = resolved_lora_name
+                                self._log(f"[Comfy] -> 注入LoRA名称: 节点 {nid} -> {resolved_lora_name}")
+                            else:
+                                if 'strength_model' in inputs:
+                                    inputs['strength_model'] = 0.0
+                                if 'strength_clip' in inputs:
+                                    inputs['strength_clip'] = 0.0
+                                lora_weight = 0.0
+                                self._log(f"[Comfy] ⚠️ LoRA 未找到，未写入: {lora_name}")
+                                missing_loras.add(lora_name)
                         
                         # 注入LoRA权重 (LoraLoader有两个权重, LoraLoaderModelOnly只有一个)
                         for weight_key in ['strength_model', 'strength_clip']:
@@ -2131,6 +2959,13 @@ class ParameterPanel(QScrollArea):
         # print(f"\n[Comfy] ========== 参数注入完成 ==========")
         # print(f"[Comfy] 修改的节点: {modified_nodes}")
         # print(f"[Comfy] --- 任务数据准备就绪 ---\n")
+        if self.current_loras:
+            try:
+                if missing_loras:
+                    missing_text = "、".join(sorted(missing_loras))
+                    self._temp_notify(f"⚠️ LoRA 未匹配到: {missing_text}")
+            except:
+                pass
         
         # 发送请求信号
         batch_count = self.batch_count_spin.value()
@@ -2144,32 +2979,109 @@ class ParameterPanel(QScrollArea):
 
     def _find_best_model_match(self, ui_name: str) -> str:
         """在可用模型列表中寻找最佳匹配 (优先精准，后包含)"""
-        if not hasattr(self, 'available_models') or not self.available_models:
+        available = []
+        if hasattr(self, 'available_models') and self.available_models:
+            available = self.available_models
+        elif hasattr(self, 'available_checkpoints') and self.available_checkpoints:
+            available = self.available_checkpoints
+        if not available:
             return None
             
         # 0. 预处理：移除潜在的 "🎨 " 前缀 (防守性编程)
         clean_name = ui_name.replace("🎨 ", "").strip()
         
         # 1. 精确匹配
-        if clean_name in self.available_models:
+        if clean_name in available:
             return clean_name
             
         # 2. 尝试加上 .safetensors 或 .ckpt 后匹配
-        for ext in ['.safetensors', '.ckpt']:
-            if clean_name + ext in self.available_models:
+        for ext in ['.safetensors', '.ckpt', '.pt', '.sft']:
+            if clean_name + ext in available:
                 return clean_name + ext
         
         # 3. 忽略路径匹配 (ui_name = "model.safetensors", available = "SDXL/model.safetensors")
-        for m in self.available_models:
+        for m in available:
             if m.endswith(clean_name) or m.endswith(clean_name + ".safetensors"):
                 return m
                 
         # 4. 模糊包含匹配 (最宽松 - 慎用，但在不匹配时好过没有)
         # ui_name = "turbo_bf16" -> "z_image_turbo_bf16.safetensors"
-        for m in self.available_models:
+        for m in available:
             if clean_name in m:
                 return m
                 
+        return None
+
+    def _find_best_lora_match(self, ui_name: str) -> str:
+        if not hasattr(self, 'available_loras') or not self.available_loras:
+            return None
+        clean_name = ui_name.replace("🎨 ", "").strip()
+        if clean_name in self.available_loras:
+            return clean_name
+        for ext in ['.safetensors', '.ckpt', '.pt', '.sft']:
+            if clean_name + ext in self.available_loras:
+                return clean_name + ext
+        base_clean = os.path.basename(clean_name).lower()
+        base_no_ext = os.path.splitext(base_clean)[0]
+        candidates = []
+        for m in self.available_loras:
+            base = os.path.basename(m).lower()
+            base_no = os.path.splitext(base)[0]
+            if base == base_clean or base_no == base_no_ext:
+                candidates.append(m)
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    def _find_best_unet_match(self, ui_name: str) -> str:
+        if not hasattr(self, 'available_unets') or not self.available_unets:
+            return None
+        clean_name = ui_name.replace("🎨 ", "").strip()
+        if clean_name in self.available_unets:
+            return clean_name
+        for ext in ['.safetensors', '.ckpt', '.pt', '.sft']:
+            if clean_name + ext in self.available_unets:
+                return clean_name + ext
+        for m in self.available_unets:
+            if m.endswith(clean_name) or m.endswith(clean_name + ".safetensors"):
+                return m
+        for m in self.available_unets:
+            if clean_name in m:
+                return m
+        return None
+
+    def _find_best_vae_match(self, ui_name: str) -> str:
+        if not hasattr(self, 'available_vaes') or not self.available_vaes:
+            return None
+        clean_name = ui_name.replace("🎨 ", "").strip()
+        if clean_name in self.available_vaes:
+            return clean_name
+        for ext in ['.safetensors', '.ckpt', '.pt', '.sft']:
+            if clean_name + ext in self.available_vaes:
+                return clean_name + ext
+        for m in self.available_vaes:
+            if m.endswith(clean_name) or m.endswith(clean_name + ".safetensors"):
+                return m
+        for m in self.available_vaes:
+            if clean_name in m:
+                return m
+        return None
+
+    def _find_best_clip_match(self, ui_name: str) -> str:
+        if not hasattr(self, 'available_clips') or not self.available_clips:
+            return None
+        clean_name = ui_name.replace("🎨 ", "").strip()
+        if clean_name in self.available_clips:
+            return clean_name
+        for ext in ['.safetensors', '.ckpt', '.pt', '.sft']:
+            if clean_name + ext in self.available_clips:
+                return clean_name + ext
+        for m in self.available_clips:
+            if m.endswith(clean_name) or m.endswith(clean_name + ".safetensors"):
+                return m
+        for m in self.available_clips:
+            if clean_name in m:
+                return m
         return None
 
     def _clear_layout(self, layout):

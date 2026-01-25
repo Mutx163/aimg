@@ -1,6 +1,4 @@
 
-# 基于用户实际使用的z-image turbo workflow架构
-# 使用分离加载器: UNETLoader + VAELoader + CLIPLoader + LoraLoaderModelOnly + ModelSamplingAuraFlow
 DEFAULT_T2I_WORKFLOW = {
   "3": {
     "inputs": {

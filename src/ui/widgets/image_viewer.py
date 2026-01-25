@@ -106,7 +106,7 @@ class ImageViewer(QGraphicsView):
     def wheelEvent(self, event: QWheelEvent):
         """处理滚轮"""
         from PyQt6.QtCore import QSettings
-        settings = QSettings("Antigravity", "AIImageViewer")
+        settings = QSettings("ComfyUIImageManager", "Settings")
         wheel_action = settings.value("wheel_action", "zoom")
         
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:

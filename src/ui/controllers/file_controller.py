@@ -67,6 +67,8 @@ class FileController(QObject):
         models = self.main.db_manager.get_unique_models(self.main.current_folder)
         loras = self.main.db_manager.get_unique_loras(self.main.current_folder)
         self.main.model_explorer.update_models(models, loras)
+        if hasattr(self.main, "param_panel"):
+            self.main.param_panel.refresh_lora_options()
 
     def delete_current_image(self) -> None:
         """删除当前选中的图片"""
