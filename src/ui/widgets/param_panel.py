@@ -1,13 +1,117 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QTextEdit, QScrollArea,
                              QFrame, QGridLayout, QHBoxLayout, QPushButton, QApplication, 
                              QSplitter, QGroupBox, QSpinBox, QDoubleSpinBox, QSlider, 
-                             QComboBox, QLineEdit, QCheckBox)
+                             QComboBox, QLineEdit, QCheckBox, QDialog)
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from typing import List
 import random
 import copy
 from src.assets.default_workflows import DEFAULT_T2I_WORKFLOW
+
+class SmartTextEdit(QTextEdit):
+    """支持回车提交，Shift+回车换行的文本框"""
+    submitted = pyqtSignal()
+    
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                # Shift + Enter: 正常换行
+                super().keyPressEvent(event)
+            else:
+                # 仅 Enter: 触发提交
+                self.submitted.emit()
+            return
+        super().keyPressEvent(event)
+
+class AIPromptDialog(QDialog):
+    """自定义 AI 提示词输入对话框，支持预设标签"""
+    def __init__(self, title, label_text, preset_tags, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(500)
+        self.resize(550, 400)
+        
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        
+        # 顶部提示
+        layout.addWidget(QLabel(label_text))
+        
+        # 预设标签区域 (FlowLayout 模拟效果)
+        tags_container = QWidget()
+        tags_layout = QHBoxLayout(tags_container) # 简单布局，后续可用 FlowLayout
+        tags_layout.setContentsMargins(0, 0, 0, 0)
+        tags_layout.setSpacing(8)
+        
+        # 使用 QFrame + 自动换行或简单的按钮组
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMaximumHeight(100)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        
+        tag_widget = QWidget()
+        self.tag_layout = QHBoxLayout(tag_widget) # 暂时横向
+        self.tag_layout.setContentsMargins(2, 2, 2, 2)
+        self.tag_layout.addStretch() # 让按钮靠左
+        
+        for tag in preset_tags:
+            btn = QPushButton(tag)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: palette(alternate-base);
+                    border: 1px solid palette(mid);
+                    border-radius: 12px;
+                    padding: 4px 12px;
+                    font-size: 11px;
+                }
+                QPushButton:hover {
+                    background-color: #7c3aed;
+                    color: white;
+                    border-color: #7c3aed;
+                }
+            """)
+            btn.clicked.connect(lambda checked, t=tag: self._on_tag_clicked(t))
+            self.tag_layout.insertWidget(self.tag_layout.count() - 1, btn)
+            
+        scroll.setWidget(tag_widget)
+        layout.addWidget(scroll)
+        
+        # 输入框
+        self.input_edit = SmartTextEdit()
+        self.input_edit.setPlaceholderText("在此输入或点击上方标签...\n(提示: Enter 确定优化, Shift+Enter 换行)")
+        self.input_edit.setStyleSheet("background-color: palette(base); border: 1px solid palette(mid); border-radius: 4px; padding: 8px;")
+        self.input_edit.submitted.connect(self.accept)
+        layout.addWidget(self.input_edit)
+        
+        # 底部按钮
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        self.btn_ok = QPushButton("确定优化")
+        self.btn_ok.setMinimumSize(100, 32)
+        self.btn_ok.setStyleSheet("background-color: #7c3aed; color: white; font-weight: bold; border-radius: 4px;")
+        self.btn_ok.clicked.connect(self.accept)
+        
+        self.btn_cancel = QPushButton("取消")
+        self.btn_cancel.setMinimumSize(80, 32)
+        self.btn_cancel.clicked.connect(self.reject)
+        
+        btn_layout.addWidget(self.btn_cancel)
+        btn_layout.addWidget(self.btn_ok)
+        layout.addLayout(btn_layout)
+
+    def _on_tag_clicked(self, tag):
+        current_text = self.input_edit.toPlainText().strip()
+        if current_text:
+            self.input_edit.setPlainText(f"{current_text}，{tag}")
+        else:
+            self.input_edit.setPlainText(tag)
+        self.input_edit.setFocus()
+
+    def get_text(self):
+        return self.input_edit.toPlainText().strip()
 
 class ParameterPanel(QScrollArea):
     # 信号定义
@@ -24,6 +128,7 @@ class ParameterPanel(QScrollArea):
         # 内部状态
         self.current_meta = {}
         self.current_loras = {} # 存储当前选中的LoRA {name: weight}
+        self._ai_is_processing = False # AI处理并发锁
         
         # The original __init__ content should be moved to setup_ui()
         # For now, I'll keep the original __init__ content and add setup_ui() call.
@@ -298,8 +403,80 @@ class ParameterPanel(QScrollArea):
             return edit
 
         self.prompt_edit = create_edit_block("✨ 正向提示词", "输入新的提示词进行创作...", 100)
+        
+        # AI优化按钮(放在提示词框下方)
+        ai_optimize_layout = QHBoxLayout()
+        self.btn_ai_optimize = QPushButton("✨ AI优化")
+        self.btn_ai_optimize.setToolTip("使用AI优化提示词\n可从零生成或优化现有提示词")
+        self.btn_ai_optimize.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ai_optimize.setMinimumHeight(28)
+        self.btn_ai_optimize.setStyleSheet("""
+            QPushButton {
+                background-color: #7c3aed;
+                color: white;
+                border-radius: 4px;
+                padding: 4px 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #8b5cf6;
+            }
+            QPushButton:pressed {
+                background-color: #6d28d9;
+            }
+            QPushButton:disabled {
+                background-color: #555;
+                color: #aaa;
+            }
+        """)
+        self.btn_ai_optimize.clicked.connect(self._on_ai_optimize_click)
+        ai_optimize_layout.addWidget(self.btn_ai_optimize)
+        
+        # AI处理状态标签
+        self.ai_status_label = QLabel("")
+        self.ai_status_label.setStyleSheet("color: #8b5cf6; font-size: 11px;")
+        ai_optimize_layout.addWidget(self.ai_status_label)
+        ai_optimize_layout.addStretch()
+        outer_layout.addLayout(ai_optimize_layout)
+        
         self.neg_prompt_edit = create_edit_block("🚫 反向提示词", "输入过滤词...", 80)
         
+        # AI优化反向提示词按钮(放在反向提示词框下方)
+        ai_neg_optimize_layout = QHBoxLayout()
+        self.btn_neg_ai_optimize = QPushButton("✨ AI优化")
+        self.btn_neg_ai_optimize.setToolTip("使用AI优化反向提示词\n可从零生成或优化现有反向提示词")
+        self.btn_neg_ai_optimize.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_neg_ai_optimize.setMinimumHeight(28)
+        self.btn_neg_ai_optimize.setStyleSheet("""
+            QPushButton {
+                background-color: #7c3aed;
+                color: white;
+                border-radius: 4px;
+                padding: 4px 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #8b5cf6;
+            }
+            QPushButton:pressed {
+                background-color: #6d28d9;
+            }
+            QPushButton:disabled {
+                background-color: #555;
+                color: #aaa;
+            }
+        """)
+        self.btn_neg_ai_optimize.clicked.connect(self._on_neg_ai_optimize_click)
+        ai_neg_optimize_layout.addWidget(self.btn_neg_ai_optimize)
+        
+        # AI处理状态标签(反向提示词)
+        self.neg_ai_status_label = QLabel("")
+        self.neg_ai_status_label.setStyleSheet("color: #8b5cf6; font-size: 11px;")
+        ai_neg_optimize_layout.addWidget(self.neg_ai_status_label)
+        ai_neg_optimize_layout.addStretch()
+        outer_layout.addLayout(ai_neg_optimize_layout)
+        
+
         # --- 2. 其他参数设置 ---
         self.gen_settings_container = QWidget()
         gen_layout = QVBoxLayout(self.gen_settings_container)
@@ -734,7 +911,131 @@ class ParameterPanel(QScrollArea):
         ParameterPanel.generation_logs.append(log_entry)
     
     
+    def _on_ai_optimize_click(self):
+        """处理正向提示词AI优化按钮点击"""
+        self._run_prompt_ai_optimization(is_negative=False)
+
+    def _on_neg_ai_optimize_click(self):
+        """处理反向提示词AI优化按钮点击"""
+        self._run_prompt_ai_optimization(is_negative=True)
+
+    def _run_prompt_ai_optimization(self, is_negative=False):
+        """执行API优化通用流程"""
+        from PyQt6.QtWidgets import QMessageBox
+        from PyQt6.QtCore import QThread, pyqtSignal, QSettings
+        from src.core.ai_prompt_optimizer import AIPromptOptimizer
+        
+        # 检查并发
+        if self._ai_is_processing:
+            QMessageBox.information(self, "请稍候", "AI 正在全神贯注处理中，请不要同时发起多个请求。")
+            return
+
+        # 0. 检查API Key是否配置
+        settings = QSettings("ComfyUIImageManager", "Settings")
+        api_key = settings.value("glm_api_key", "")
+        api_url = settings.value("ai_base_url", "")
+        
+        # 判断是否是本地或局域网地址
+        is_local = any(x in api_url for x in ["localhost", "127.0.0.1", "192.168.", "10."])
+        
+        if not api_key and not is_local:
+            reply = QMessageBox.question(
+                self,
+                "未配置API Key",
+                "当前配置的不是本地模型，使用AI功能建议配置 API Key。\n\n"
+                "如果您使用的是本地免密模型(如Ollama)，请点击'继续'。\n"
+                "否则，是否现在前往设置配置 Key?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Ignore
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.ai_status_label.setText("请在设置中配置GLM API Key")
+                QTimer.singleShot(3000, lambda: self.ai_status_label.setText(""))
+                return
+        
+        # 1. 弹出自定义对话框,询问用户需求
+        target_edit = self.neg_prompt_edit if is_negative else self.prompt_edit
+        target_btn = self.btn_neg_ai_optimize if is_negative else self.btn_ai_optimize
+        status_label = self.neg_ai_status_label if is_negative else self.ai_status_label
+        
+        existing_prompt = target_edit.toPlainText().strip()
+        label_prefix = "反向" if is_negative else ""
+        
+        # 预设标签
+        if is_negative:
+            preset_tags = ["一键优化", "去除马赛克", "去除水印/文字", "提升清晰度", "修正肢体崩坏", "过滤低质量"]
+        else:
+            preset_tags = ["一键优化", "换背景", "丰富画面细节", "改为夜景风格", "电影级光影", "质感提升", "增加环境描述"]
+
+        if existing_prompt:
+            dialog_title = f"优化{label_prefix}提示词"
+            dialog_label = f"请描述您的修改需求（点击标签可快速填入）："
+        else:
+            dialog_title = f"AI生成{label_prefix}提示词"
+            dialog_label = f"请描述您想要的{label_prefix}图片内容（点击标签可快速填入）："
+            
+        dialog = AIPromptDialog(dialog_title, dialog_label, preset_tags, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+            
+        user_input = dialog.get_text()
+        if not user_input.strip():
+            return
+        
+        # 2. 锁定并显示处理状态
+        self._ai_is_processing = True
+        target_btn.setEnabled(False)
+        status_label.setText("⏳ AI正在处理...")
+        
+        # 3. 在后台线程调用API(避免UI冻结)
+        class AIWorker(QThread):
+            finished = pyqtSignal(bool, str)  # (success, result)
+            
+            def __init__(self, user_input, existing_prompt, is_negative):
+                super().__init__()
+                self.user_input = user_input
+                self.existing_prompt = existing_prompt
+                self.is_negative = is_negative
+            
+            def run(self):
+                try:
+                    optimizer = AIPromptOptimizer()
+                    success, result = optimizer.optimize_prompt(
+                        self.user_input, 
+                        self.existing_prompt,
+                        is_negative=self.is_negative
+                    )
+                    self.finished.emit(success, result)
+                except Exception as e:
+                    self.finished.emit(False, f"处理异常: {str(e)}")
+        
+        def on_ai_finished(success, result):
+            # 4. 处理完成,恢复状态
+            self._ai_is_processing = False
+            target_btn.setEnabled(True)
+            status_label.setText("")
+            
+            if success:
+                # 成功:更新提示词
+                target_edit.setPlainText(result)
+                status_label.setText("✅ 优化成功")
+                # 3秒后清空状态
+                QTimer.singleShot(3000, lambda: status_label.setText(""))
+            else:
+                # 失败:显示错误
+                QMessageBox.warning(
+                    self,
+                    "AI优化失败",
+                    result,
+                    QMessageBox.StandardButton.Ok
+                )
+        
+        # 启动worker线程
+        self.ai_worker = AIWorker(user_input, existing_prompt, is_negative)
+        self.ai_worker.finished.connect(on_ai_finished)
+        self.ai_worker.start()
+    
     def _on_add_lora_click(self):
+
         """添加新的LoRA行"""
         # 直接添加空的LoRA项（用户从下拉框选择）
         self._add_lora_item("", 1.0)
