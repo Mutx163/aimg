@@ -84,6 +84,14 @@ class ComfyClient(QObject):
             
             if msg_type == "status":
                 queue_remaining = data["data"]["status"]["exec_info"]["queue_remaining"]
+                
+                # [Real-time] 检测队列余量变化
+                if hasattr(self, "_last_queue_remaining"):
+                    if queue_remaining != self._last_queue_remaining:
+                        # 队列余量变化（可能有新任务或任务完成），立即刷新完整队列数据
+                        self.get_queue()
+                self._last_queue_remaining = queue_remaining
+                
                 if queue_remaining > 0:
                     self.status_changed.emit(f"队列待处理: {queue_remaining}")
             
@@ -95,9 +103,16 @@ class ComfyClient(QObject):
                         node_type = self.current_prompt_graph[node_id].get('class_type', 'Unknown')
                     self.execution_start.emit(node_id, node_type)
                 else:
+                    # [Real-time] node 为 None 表示当前 Prompt 整体执行完毕
                     self.status_changed.emit("所有任务已完成")
                     self.execution_done.emit("")
+                    QTimer.singleShot(500, self.get_queue) # 稍作延迟确保后端状态已更新
             
+            elif msg_type == "execution_error":
+                # [Real-time] 执行报错也需要刷新队列（任务可能被强行中止）
+                print(f"[Comfy] 采样过程中发生错误")
+                self.get_queue()
+
             elif msg_type == "progress":
                 value = data["data"]["value"]
                 max_val = data["data"]["max"]

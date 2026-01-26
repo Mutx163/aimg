@@ -15,7 +15,7 @@ class ThumbnailList(QListView):
         self.setResizeMode(QListView.ResizeMode.Adjust)
         self.setMovement(QListView.Movement.Static)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.setSpacing(6)
+        self.setSpacing(4)
         self.setWordWrap(True)
         self.setWrapping(True)
         
@@ -25,7 +25,7 @@ class ThumbnailList(QListView):
         
         # 图标大小 (逻辑上由网格控制，但这里设置基准)
         self.setIconSize(QSize(128, 128))
-        self.setGridSize(QSize(148, 170)) # 紧凑网格 (160->148, 190->170)
+        self.setGridSize(QSize(140, 190)) # 固定紧凑网格 (宽140=128+12, 高190确保文件名显示)
         
         # 初始化模型
         self.image_model = ImageModel(self)
@@ -98,28 +98,7 @@ class ThumbnailList(QListView):
         path = self.image_model.get_path(row)
         return MockItem(path) if path else None
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        # 响应式网格调整：根据当前宽度自动计算最合适的 GridSize，消除右侧留白
-        viewport_width = self.viewport().width()
-        if viewport_width <= 0: return
-
-        # 定义基准宽度 (图标128 + 左右内边距)
-        base_width = 148 
-        min_cols = 1
-        max_cols = 2  # 限制最大列数为2，满足用户"只显示一列或两列"的需求
-        
-        # 计算当前能容纳的列数
-        cols = max(min_cols, min(max_cols, viewport_width // base_width))
-        
-        # 计算新的单元格宽度，使其填满整行
-        # 减去微小边距以防止计算误差导致换行
-        new_item_width = int(viewport_width / cols) - 4
-        
-        # 保持高度不变
-        current_grid = self.gridSize()
-        if new_item_width != current_grid.width():
-            self.setGridSize(QSize(new_item_width, 170))
+    # resizeEvent 已移除，不再动态调整网格大小，避免出现超大间距
 
     def wheelEvent(self, event):
         """重写滚轮事件以实现细腻顺滑的滚动体验"""

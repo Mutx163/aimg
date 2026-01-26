@@ -20,6 +20,7 @@ class FileController(QObject):
         self.main.viewer.clear_view()
         self.main.param_panel.clear_info()
         self.main.statusBar().showMessage(f"正在加载: {folder}...")
+        self.main._is_scanning = True # 开启扫描锁
         
         if self.loader_thread and self.loader_thread.isRunning():
             self.loader_thread.stop()
@@ -43,16 +44,20 @@ class FileController(QObject):
             self.main.thumbnail_list.setCurrentRow(0)
             self.main.on_image_selected(path)
             
-        # 增量刷新模型筛选器：每加载 30 张图片刷新一次，让用户尽早看到 LoRA 列表
+        # 增量更新状态栏进度
         count = self.main.thumbnail_list.count()
-        if count > 0 and count % 30 == 0:
-            self.refresh_model_explorer()
+        if count % 100 == 0:
+            self.main.statusBar().showMessage(f"正在加载: {count} 张图片...")
 
     def _on_loader_image_found(self, path):
         # 线程回调：添加单张图片 (无缩略图)
         self.main.thumbnail_list.add_image(path)
         
     def _on_loader_finished(self):
+        # 释放扫描锁
+        self.main._is_scanning = False
+        self.main.statusBar().showMessage(f"加载完成，共 {self.main.thumbnail_list.count()} 张图片", 5000)
+        
         # 刷新模型浏览器数据
         self.refresh_model_explorer()
         # 刷新历史参数 (分辨率/采样器)

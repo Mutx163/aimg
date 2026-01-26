@@ -139,7 +139,29 @@ class QueueDialog(QDialog):
         widget = QWidget()
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(10)
+        layout.setSpacing(12) # 增加间距
+
+        # 尝试提取 Lora 名称 (通用模糊匹配算法)
+        lora_names = []
+        try:
+            # task[2] 通常是 prompt JSON 数据
+            if isinstance(task, list) and len(task) >= 3:
+                prompt_graph = task[2]
+                if isinstance(prompt_graph, dict):
+                    for node_id, node_data in prompt_graph.items():
+                        c_type = str(node_data.get('class_type', '')).lower()
+                        # 核心逻辑：包含 lora 且包含 loader 的节点通常就是目标
+                        if 'lora' in c_type and 'loader' in c_type:
+                            inputs = node_data.get('inputs', {})
+                            for k, v in inputs.items():
+                                # 如果值是字符串且包含常见的模型后缀，认定为 LoRA 名称
+                                if isinstance(v, str) and v.lower().endswith(('.safetensors', '.ckpt', '.pt')):
+                                    # 只保留文件名部分，去除路径
+                                    l_name = v.replace('\\', '/').split('/')[-1]
+                                    if l_name not in lora_names:
+                                        lora_names.append(l_name)
+        except Exception as e:
+            print(f"[Queue] 提取 LoRA 失败: {e}")
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -149,6 +171,15 @@ class QueueDialog(QDialog):
         title = QLabel(f"任务 #{number}")
         title.setStyleSheet("font-weight: bold;")
         left_layout.addWidget(title)
+        
+        # 添加 Lora 信息显示 (置于 ID 之上，更醒目)
+        if lora_names:
+            lora_text = "Lora: " + ", ".join(lora_names)
+            lora_lbl = QLabel(lora_text)
+            # 使用更鲜亮的颜色，并在背景色较浅时也能清晰可见
+            lora_lbl.setStyleSheet("color: #d15100; font-size: 11px; font-weight: bold;")
+            lora_lbl.setWordWrap(True)
+            left_layout.addWidget(lora_lbl)
 
         sub = QLabel(f"ID: {prompt_id}")
         sub.setStyleSheet("color: palette(mid); font-size: 10px;")

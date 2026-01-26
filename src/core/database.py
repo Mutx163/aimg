@@ -27,6 +27,7 @@ class DatabaseManager:
                 seed TEXT,
                 steps INTEGER,
                 sampler TEXT,
+                scheduler TEXT,
                 cfg_scale REAL,
                 model_name TEXT,
                 model_hash TEXT,
@@ -87,6 +88,12 @@ class DatabaseManager:
         
         conn.commit()
         
+        try:
+            cursor.execute("SELECT scheduler FROM images LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE images ADD COLUMN scheduler TEXT")
+            conn.commit()
+        
         # 属性迁移
         try:
             cursor.execute("SELECT file_mtime FROM images LIMIT 1")
@@ -113,9 +120,9 @@ class DatabaseManager:
             cursor.execute('''
                 INSERT OR REPLACE INTO images (
                     file_path, file_name, prompt, negative_prompt, 
-                    seed, steps, sampler, cfg_scale, 
+                    seed, steps, sampler, scheduler, cfg_scale, 
                     model_name, model_hash, tool, loras, tech_info, raw_metadata, file_mtime
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 file_path,
                 os.path.basename(file_path),
@@ -124,6 +131,7 @@ class DatabaseManager:
                 str(params.get('Seed', params.get('seed', ""))),
                 params.get('Steps', params.get('steps')),
                 params.get('Sampler', params.get('sampler_name')),
+                params.get('Scheduler', params.get('scheduler')),
                 params.get('CFG scale', params.get('cfg')),
                 params.get('Model', ""),
                 params.get('Model hash', ""),
@@ -336,3 +344,29 @@ class DatabaseManager:
         
         conn.close()
         return sorted(list(set(samplers)))
+
+    def get_unique_schedulers(self, folder_path: Optional[str] = None) -> List[str]:
+        """获取所有使用过的调度器名称"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        args = []
+        
+        # 直接从scheduler列读取
+        query = """
+            SELECT DISTINCT scheduler
+            FROM images
+            WHERE scheduler IS NOT NULL AND scheduler != ''
+        """
+        
+        if folder_path:
+            norm_folder = folder_path.replace("\\", "/")
+            query += " AND file_path LIKE ?"
+            args.append(f"{norm_folder}%")
+        
+        cursor.execute(query, args)
+        
+        # 提取调度器名称并排序
+        schedulers = [row[0] for row in cursor.fetchall()]
+        
+        conn.close()
+        return sorted(list(set(schedulers)))

@@ -23,8 +23,8 @@ from src.core.comfy_client import ComfyClient
 from src.ui.settings_dialog import SettingsDialog
 from src.core.cache import ThumbnailCache
 from src.ui.controllers.file_controller import FileController
-
 from src.ui.controllers.search_controller import SearchController
+from src.ui.dialogs.image_gallery_dialog import ImageGalleryDialog
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -55,6 +55,7 @@ class MainWindow(QMainWindow):
         # 核心组件初始化
         self.watcher = FileWatcher()
         self.current_sort_by = self.settings.value("sort_by", "time_desc")
+        self._is_scanning = False # 扫描状态锁
         
         # 控制器初始化
         self.search_controller = SearchController(self)
@@ -101,6 +102,11 @@ class MainWindow(QMainWindow):
         # 尝试获取可用模型
         QTimer.singleShot(1000, self.comfy_client.fetch_available_models)
         
+        # 监听队列状态以更新右下角计数
+        self.comfy_client.queue_updated.connect(self._update_queue_button)
+        # 初始获取一次队列
+        QTimer.singleShot(2000, self.comfy_client.get_queue)
+        
         # 绑定参数面板的远程生成请求
         self.param_panel.remote_gen_requested.connect(self.on_remote_gen_requested)
         self.comfy_client.execution_start.connect(self._on_comfy_node_start)
@@ -111,6 +117,13 @@ class MainWindow(QMainWindow):
         self.log_poll_timer.timeout.connect(self._poll_logs)
         self.log_poll_timer.start(500)  # 每500ms检查一次新日志
         self.last_log_count = 0  # 记录上次已处理的日志数量
+
+        # 图片选择同步定时器 (解决快速切换不跟手 bug)
+        self._selection_timer = QTimer(self)
+        self._selection_timer.setSingleShot(True)
+        self._selection_timer.timeout.connect(self._sync_image_selection)
+        self._pending_selection_path = None
+        self._last_selection_time = 0
 
         
         # 自动加载上次的文件夹
@@ -124,6 +137,9 @@ class MainWindow(QMainWindow):
             
             # 从数据库加载历史采样器并更新到param_panel
             self._load_historical_samplers()
+            
+            # 从数据库加载历史调度器并更新到param_panel
+            self._load_historical_schedulers()
             
             # 启动监控
             if self.watcher.start_monitoring(last_folder):
@@ -311,7 +327,8 @@ class MainWindow(QMainWindow):
         
         # 左侧列表面板 (增加搜索框)
         left_widget = QWidget()
-        left_widget.setFixedWidth(330)  # 严格限制左侧面板宽度 (约容纳两列大图)
+        left_widget.setMinimumWidth(320)
+        left_widget.setMaximumWidth(340) # 限制最大宽度，防止右侧出现过多空白 (适配 140x190 网格双列)
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(8, 8, 8, 0)
         left_layout.setSpacing(6)
@@ -323,6 +340,13 @@ class MainWindow(QMainWindow):
         self.search_bar.setPlaceholderText("🔍 搜索提示词/模型/文件名...")
         self.search_bar.textChanged.connect(self.search_controller.on_search_changed)
         search_layout.addWidget(self.search_bar)
+        
+        btn_gallery = QPushButton("展开图库")
+        btn_gallery.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_gallery.setToolTip("展开全屏图库浏览")
+        btn_gallery.setFixedWidth(70)
+        btn_gallery.clicked.connect(self.show_image_gallery)
+        search_layout.addWidget(btn_gallery)
         
         btn_reset = QPushButton("Reset")
         btn_reset.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -369,11 +393,15 @@ class MainWindow(QMainWindow):
         
         self.splitter.addWidget(self.view_stack)
         
-        # 右侧：参数面板
         self.param_panel = ParameterPanel()
         self.param_panel.setMinimumWidth(380)
         self.param_panel.setMaximumWidth(600)
         self.splitter.addWidget(self.param_panel)
+        
+        # 设置伸缩因子：只允许中间的内容区 (index 1) 随窗口缩放，左右侧边栏固定
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setStretchFactor(2, 0)
         
         # 设置 Splitter 初始比例
         if not self.settings.value("window/main_splitter"):
@@ -389,6 +417,7 @@ class MainWindow(QMainWindow):
         """
         动态调整左右面板宽度，使中间 Viewer 的比例尽可能贴合图片。
         """
+        if self._is_scanning: return # 正在扫描时禁止布局自动调整，防止界面跳动
         try:
             if not hasattr(self, 'viewer') or self.viewer.pixmap_item.pixmap().isNull():
                 return
@@ -450,7 +479,10 @@ class MainWindow(QMainWindow):
         """刷新当前文件夹 - 使用数据库查询而非重新扫描"""
         if self.current_folder:
             self.search_controller.perform_search()
-            self.statusBar().showMessage("已刷新列表", 2000)
+            # 同时也刷新参数面板里的可用资源 (LoRA 等)
+            self.param_panel._refresh_comfyui_assets()
+            self.param_panel.refresh_lora_options()
+            self.statusBar().showMessage("已刷新列表与可用资源", 2000)
 
     def _load_historical_resolutions(self):
         """从数据库加载历史分辨率并更新到参数面板"""
@@ -470,23 +502,27 @@ class MainWindow(QMainWindow):
     def _load_historical_samplers(self):
         """从数据库加载历史采样器并更新到参数面板"""
         try:
-            # print(f"[UI] 开始加载历史采样器...")
             samplers = self.db_manager.get_unique_samplers(self.current_folder)
-            # print(f"[UI] 从数据库获取到 {len(samplers)} 个采样器: {samplers}")
             self.param_panel._populate_samplers(samplers)
-            # print(f"[UI] 已加载 {len(samplers)} 个历史采样器")
         except Exception as e:
-            import traceback
             print(f"[UI] 加载历史采样器失败: {e}")
-            print(f"[UI] 错误堆栈: {traceback.format_exc()}")
-            # 即使失败也填充默认采样器
             self.param_panel._populate_samplers([])
 
+    def _load_historical_schedulers(self):
+        """从数据库加载历史调度器并更新到参数面板"""
+        try:
+            schedulers = self.db_manager.get_unique_schedulers(self.current_folder)
+            self.param_panel._populate_schedulers(schedulers)
+        except Exception as e:
+            print(f"[UI] 加载历史调度器失败: {e}")
+            self.param_panel._populate_schedulers([])
+
     def refresh_historical_params(self):
-        """刷新历史分辨率和采样器列表"""
+        """刷新历史分辨率、采样器和调度器列表"""
         if self.current_folder:
             self._load_historical_resolutions()
             self._load_historical_samplers()
+            self._load_historical_schedulers()
 
 
     def on_remote_gen_requested(self, workflow, batch_count=1):
@@ -504,20 +540,47 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"请求已提交 (ID: {prompt_id[:8]}...)", 5000)
 
     def on_image_selected(self, path):
-        """用户点击缩略图或自动跳转"""
-        import time
+        """记录选中的图片路径，并启动同步定时器"""
+        if not path: return
+        
+        self._pending_selection_path = path # 始终记录最后一次选中的路径
+        
+        # [Performance] 图片选择同步策略：
+        # 1. 如果还在扫描中，使用较长的延迟减少 UI 负担
+        # 2. 如果是正常浏览，使用极短延迟（50ms）或立即响应
+        
+        delay = 150 if self._is_scanning else 30
+        
+        curr_time = time.time()
+        # 如果距离上次加载超过 300ms 且不处于扫描中，立即响应一次以保证手感
+        if not self._is_scanning and (curr_time - self._last_selection_time > 0.3):
+             self._sync_image_selection()
+        else:
+             # 否则，重置定时器，保证“最后一次”点击生效
+             self._selection_timer.start(delay)
+
+    def _sync_image_selection(self):
+        """执行实际的图片加载和参数解析"""
+        path = self._pending_selection_path
+        if not path or not os.path.exists(path):
+            return
+            
+        # 记录本次加载时间
+        self._last_selection_time = time.time()
+        
         t0 = time.time()
-        
+        # 1. 核心图片显示
         self.viewer.load_image(path)
-        # 切换图片时，重置手动缩放状态，应用当前的缩放选项
-        self._on_zoom_changed(self.zoom_combo.currentIndex())
         
-        # 解析并显示参数
+        # 2. 只有在单图模式下才重置缩放（对比模式由其自己管理）
+        if self.view_stack.currentIndex() == 0:
+            self._on_zoom_changed(self.zoom_combo.currentIndex())
+        
+        # 3. 解析并显示参数 (优化：如果是扫描阶段，参数更新可以更慢)
         meta = MetadataParser.parse_image(path)
         self.param_panel.update_info(meta)
         
-        t1 = time.time()
-        # print(f"[UI] 图片加载与解析耗时: {(t1 - t0) * 1000:.2f} ms ({os.path.basename(path)})")
+        # print(f"[UI] 图片同步切换耗时: {(time.time() - t0) * 1000:.1f} ms -> {os.path.basename(path)}")
         
     def keyPressEvent(self, event):
         """处理全局快捷键"""
@@ -679,6 +742,21 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_layout)
         
         self.log_dialog.show()
+
+    def show_image_gallery(self):
+        """显示全屏图片库弹窗"""
+        dlg = ImageGalleryDialog(self.thumbnail_list.image_model, self)
+        dlg.image_selected.connect(self._on_gallery_image_selected)
+        dlg.exec()
+
+    def _on_gallery_image_selected(self, path):
+        """处理画廊选中的图片：定位并加载"""
+        # 在主列表中找到索引并选中
+        for i in range(self.thumbnail_list.image_model.rowCount()):
+            if self.thumbnail_list.image_model.get_path(i) == path:
+                self.thumbnail_list.setCurrentRow(i)
+                break
+        self.on_image_selected(path)
 
     def apply_theme(self):
         """应用界面主题 (Windows 11 Fluent Design 风格)"""
@@ -945,10 +1023,15 @@ class MainWindow(QMainWindow):
             }}
             QComboBox QAbstractItemView {{
                 background-color: {colors['bg_card']};
-                border: 1px solid {colors['border']};
+                border: 1px solid {colors['accent']}; /* 使用主题色边框增加区分度 */
                 selection-background-color: {colors['accent']};
                 selection-color: white;
                 outline: none;
+                padding: 2px;
+            }}
+            QComboBox QAbstractItemView::item {{
+                min-height: 28px; /* 增加项高度，更易点选 */
+                padding-left: 8px;
             }}
         """
         self.setStyleSheet(qss)
@@ -1056,6 +1139,29 @@ class MainWindow(QMainWindow):
         # 如果队列窗口打开，刷新它
         if hasattr(self, 'queue_dialog') and self.queue_dialog and self.queue_dialog.isVisible():
             self.queue_dialog.refresh_queue()
+        # 同时触发主界面的队列查询以更新计数
+        self.comfy_client.get_queue()
+
+    def _update_queue_button(self, data):
+        """更新状态栏队列按钮的任务计数"""
+        running = data.get('queue_running', [])
+        pending = data.get('queue_pending', [])
+        total = len(running) + len(pending)
+        
+        if total > 0:
+            self.queue_btn.setText(f"📋 队列 ({total})")
+            # 强化视觉反馈 (发现有任务时变色)
+            self.queue_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: palette(highlight);
+                    color: white;
+                    border: 1px solid palette(highlight);
+                    font-weight: bold;
+                }
+            """)
+        else:
+            self.queue_btn.setText("📋 队列")
+            self.queue_btn.setStyleSheet("") # 恢复默认样式
 
     def _on_comfy_node_start(self, node_id, node_type):
         """处理节点开始执行"""

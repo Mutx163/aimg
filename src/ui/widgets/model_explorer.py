@@ -19,6 +19,7 @@ class ModelExplorer(QWidget):
         model_layout = QHBoxLayout()
         model_layout.addWidget(QLabel("模型:"))
         self.combo_model = QComboBox()
+        self.combo_model.setMinimumWidth(260) # 加宽
         self.combo_model.setEditable(False)
         self.combo_model.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.combo_model.currentIndexChanged.connect(self._on_model_selected)
@@ -29,6 +30,7 @@ class ModelExplorer(QWidget):
         lora_layout = QHBoxLayout()
         lora_layout.addWidget(QLabel("LoRA:"))
         self.combo_lora = QComboBox()
+        self.combo_lora.setMinimumWidth(260) # 加宽
         self.combo_lora.setEditable(False)
         self.combo_lora.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.combo_lora.currentIndexChanged.connect(self._on_lora_selected)

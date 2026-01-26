@@ -14,6 +14,79 @@ import os
 from src.assets.default_workflows import DEFAULT_T2I_WORKFLOW
 from src.core.ai_prompt_optimizer import AIPromptOptimizer
 
+class LoraSelectorWidget(QWidget):
+    selection_changed = pyqtSignal(str) # Emits new path
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        layout.setSpacing(2)
+        
+        self.label = QLineEdit() # Use ReadOnly LineEdit for display
+        self.label.setReadOnly(True)
+        self.label.setPlaceholderText("点击选择 LoRA...")
+        self.label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.label.installEventFilter(self)
+        self.label.setStyleSheet("""
+            QLineEdit {
+                border: 1px solid palette(mid);
+                background-color: palette(base);
+                border-radius: 3px;
+                padding: 2px 4px;
+                color: palette(text);
+            }
+            QLineEdit:hover {
+                border-color: palette(highlight);
+                background-color: palette(alternate-base);
+            }
+        """)
+        
+        layout.addWidget(self.label)
+        
+        self._current_path = ""
+        self._all_loras_getter = None # Function to get all loras
+        
+    def set_data_source(self, getter_func):
+        self._all_loras_getter = getter_func
+        
+    def set_current_lora(self, path):
+        self._current_path = path
+        self.label.setText(os.path.basename(path) if path else "")
+        self.label.setToolTip(path)
+        # self.setProperty("selected_lora", path) # REMOVED: Managed by controller (ParamPanel) to track changes
+        
+    def get_current_lora(self):
+        return self._current_path
+        
+    def _open_dialog(self):
+        if not self._all_loras_getter: return
+        try:
+            loras = self._all_loras_getter()
+            # print(f"[DEBUG] LoraSelector opened with {len(loras)} loras")
+            from src.ui.dialogs.lora_selection_dialog import LoraSelectionDialog
+            dlg = LoraSelectionDialog(loras, self)
+            
+            # Pre-select if available
+            # (Dialog logic to expand to current would be nice but optional)
+            
+            if dlg.exec():
+                selected = dlg.selected_lora
+                if selected:
+                    self.set_current_lora(selected)
+                    self.selection_changed.emit(selected)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打开LoRA选择窗口失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    def eventFilter(self, source, event):
+        if source is self.label and event.type() == QEvent.Type.MouseButtonRelease:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._open_dialog()
+                return True
+        return super().eventFilter(source, event)
+
 class AIWorker(QThread):
     finished = pyqtSignal(bool, str)  # (success, result)
     stream_update = pyqtSignal(str)   # (chunk)
@@ -82,6 +155,14 @@ class ImagePromptWorker(QThread):
         except Exception as e:
             if not self.is_cancelled:
                 self.finished.emit(False, f"处理异常: {str(e)}")
+
+class AutoRefreshComboBox(QComboBox):
+    """支持点击时自动触发刷新的下拉框"""
+    about_to_show = pyqtSignal()
+    
+    def showPopup(self):
+        self.about_to_show.emit()
+        super().showPopup()
 
 class AIHistoryManager:
     """管理AI提示词修改历史 (Session-based)"""
@@ -416,37 +497,61 @@ class ParameterPanel(QWidget):
         add_stat(2, 0, "STEPS", "steps_label")
         add_stat(2, 2, "CFG", "cfg_label")
 
-        # 第四行：LoRAs (改为和SEED一样的独占行显示)
+        # 第四行：调度器 + 重绘幅度 (Denoise)
+        add_stat(3, 0, "调度器", "info_scheduler_label")
+        add_stat(3, 2, "重绘幅度", "info_denoise_label")
+
+        # 第五行：LoRAs (改为独占行显示)
         lbl_lora = QLabel("LORAS")
         lbl_lora.setStyleSheet(self._label_style)
         lbl_lora.setFixedWidth(self._fixed_label_width) # 强制对齐
         self.info_lora_val = QLabel("-")
         self.info_lora_val.setStyleSheet(self._value_style)
         self.info_lora_val.setWordWrap(True)
-        self.stats_grid.addWidget(lbl_lora, 3, 0)
-        self.stats_grid.addWidget(self.info_lora_val, 3, 1, 1, 3)
+        self.stats_grid.addWidget(lbl_lora, 4, 0)
+        self.stats_grid.addWidget(self.info_lora_val, 4, 1, 1, 3)
         
         info_card_layout.addLayout(self.stats_grid)
 
         # --- 新增：原始提示词滚动查看区 (样式向SEED看齐) ---
         def add_scroll_info(label_text, attr_name, height):
-            lay = QHBoxLayout()
-            lay.setSpacing(20) # 提升至 20，与 stats_grid 的 HorizontalSpacing 保持一致
+            outer = QVBoxLayout()
+            outer.setSpacing(4)
+            
+            header = QHBoxLayout()
             lbl = QLabel(label_text)
             lbl.setStyleSheet(self._label_style)
-            lbl.setFixedWidth(self._fixed_label_width) # 强力对齐
-            lbl.setAlignment(Qt.AlignmentFlag.AlignTop)
+            lbl.setFixedWidth(self._fixed_label_width)
+            header.addWidget(lbl)
+            header.addStretch()
+            
+            # 增加按钮
+            btn_use = QPushButton("调用")
+            btn_use.setFixedSize(45, 20)
+            btn_use.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_use.setStyleSheet("""
+                QPushButton {
+                    background-color: transparent; border: 1px solid palette(highlight);
+                    border-radius: 2px; font-size: 10px; color: palette(highlight);
+                }
+                QPushButton:hover { background-color: palette(highlight); color: white; }
+            """)
+            if "反向" in label_text:
+                btn_use.clicked.connect(self._use_selected_neg_prompt)
+            else:
+                btn_use.clicked.connect(self._use_selected_prompt)
+            header.addWidget(btn_use)
             
             edit = QTextEdit()
             edit.setReadOnly(True)
+            edit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             edit.setMaximumHeight(height)
-            # 统一提示词区域样式：与上方数值项的“灰色框框”保持一致
             edit.setStyleSheet("background-color: palette(alternate-base); border-radius: 4px; padding: 5px; font-size: 11px; color: palette(text); border: none;")
             setattr(self, attr_name, edit)
             
-            lay.addWidget(lbl)
-            lay.addWidget(edit)
-            info_card_layout.addLayout(lay)
+            outer.addLayout(header)
+            outer.addWidget(edit)
+            info_card_layout.addLayout(outer)
 
         info_card_layout.addSpacing(5)
         add_scroll_info("提示词", "info_prompt_val", 80)
@@ -527,14 +632,25 @@ class ParameterPanel(QWidget):
 
     def _populate_resolutions(self, preset_res, history_res):
         """填充分辨率下拉框（预设+历史，去重）"""
+        self.last_preset_res = preset_res # 缓存以便管理窗口使用
+        self.last_history_res = history_res
+        
         # 暂时阻塞信号，防止清除/添加过程触发自动保存导致配置丢失
         self.resolution_combo.blockSignals(True)
         try:
             # 记录当前选中内容，以便刷新后恢复
             current_res = self.resolution_combo.currentData()
             
-            # 合并并去重
-            all_res = set(preset_res + history_res)
+            # 合并自定义、预设和历史分辨率并去重
+            custom_res = []
+            custom_strs = self.settings.value("custom_resolutions", [], type=list)
+            for res_str in custom_strs:
+                try:
+                    w_s, h_s = res_str.split('x')
+                    custom_res.append((int(w_s), int(h_s)))
+                except: continue
+                
+            all_res = set(preset_res + history_res + custom_res)
             # 排序：先按宽度，再按高度
             sorted_res = sorted(list(all_res), key=lambda x: (x[0], x[1]))
             
@@ -577,32 +693,52 @@ class ParameterPanel(QWidget):
         finally:
             self.resolution_combo.blockSignals(False)
 
+    def _open_resolution_manager(self):
+        """打开分辨率管理对话框"""
+        from src.ui.dialogs.resolution_manager_dialog import ResolutionManagerDialog
+        
+        preset = getattr(self, "last_preset_res", [])
+        history = getattr(self, "last_history_res", [])
+        
+        dlg = ResolutionManagerDialog(preset, history, self)
+        if dlg.exec():
+            # 刷新一次显示
+            main_window = self.window()
+            if hasattr(main_window, "refresh_historical_params"):
+                main_window.refresh_historical_params()
+            else:
+                # 备选：如果找不到主窗口刷新方法，尝试手动填充预设
+                preset = [(512, 512), (768, 768), (1024, 1024), (512, 768), (768, 512), (1024, 768), (768, 1024)]
+                self._populate_resolutions(preset, [])
+
     def _populate_samplers(self, samplers: List[str]):
         """填充采样器下拉框"""
-        # print(f"[UI] _populate_samplers被调用，采样器列表: {samplers}")
-        
-        # 暂时阻塞信号，防止清除过程触发自动保存(存为空值)导致配置丢失
         self.sampler_combo.blockSignals(True)
         try:
-            # 记录当前选中
             current_sampler = self.sampler_combo.currentText()
             self.sampler_combo.clear()
             
+            # 基础常用采样器列表 (ComfyUI 标准集)
+            all_samplers = [
+                "euler", "euler_ancestral", "heun", "heunpp2", "dpm_2", "dpm_2_ancestral", 
+                "lms", "dpmpp_2s_ancestral", "dpmpp_sde", "dpmpp_sde_gpu", "dpmpp_2m", 
+                "dpmpp_2m_sde", "dpmpp_2m_sde_gpu", "dpmpp_3m_sde", "dpmpp_3m_sde_gpu", 
+                "ddim", "uni_pc", "uni_pc_bh2", "deis"
+            ]
+            
+            # 合并历史采样器 (去重)
             if samplers:
-                for sampler in samplers:
-                    self.sampler_combo.addItem(sampler)
-                    # print(f"[UI] 添加采样器: {sampler}")
-            else:
-                # 如果没有历史记录，添加一些常用采样器
-                default_samplers = ["euler", "euler_ancestral", "dpmpp_2m", "dpmpp_sde"]
-                # print(f"[UI] 没有历史采样器，使用默认列表: {default_samplers}")
-                for sampler in default_samplers:
-                    self.sampler_combo.addItem(sampler)
+                for s in samplers:
+                    if s and s not in all_samplers:
+                        all_samplers.append(s)
+            
+            for sampler in all_samplers:
+                self.sampler_combo.addItem(sampler)
             
             # 优先恢复之前的选择
             target_sampler = current_sampler
             if not target_sampler:
-                target_sampler = self.settings.value("gen_sampler", "", type=str)
+                target_sampler = self.settings.value("gen_sampler", "euler", type=str)
 
             if target_sampler:
                 index = self.sampler_combo.findText(target_sampler)
@@ -610,15 +746,48 @@ class ParameterPanel(QWidget):
                     self.sampler_combo.setCurrentIndex(index)
                     return
 
-            # 默认选择第一个
             if self.sampler_combo.count() > 0:
                 self.sampler_combo.setCurrentIndex(0)
-                # print(f"[UI] 采样器下拉框已填充，共 {self.sampler_combo.count()} 项")
-            else:
-                # print(f"[UI] 警告：采样器下拉框为空！")
-                pass
         finally:
             self.sampler_combo.blockSignals(False)
+
+    def _populate_schedulers(self, schedulers: List[str]):
+        """填充调度器下拉框"""
+        self.scheduler_combo.blockSignals(True)
+        try:
+            current_scheduler = self.scheduler_combo.currentText()
+            self.scheduler_combo.clear()
+            
+            # 基础常用调度器列表 (ComfyUI 标准集)
+            all_schedulers = [
+                "normal", "karras", "exponential", "sgm_uniform", "simple", 
+                "ddim_uniform", "beta", "linear_quadratic", "ddpm"
+            ]
+            
+            # 合并历史调度器 (去重)
+            if schedulers:
+                for s in schedulers:
+                    if s and s not in all_schedulers:
+                        all_schedulers.append(s)
+            
+            for scheduler in all_schedulers:
+                self.scheduler_combo.addItem(scheduler)
+            
+            # 优先恢复选择
+            target_scheduler = current_scheduler
+            if not target_scheduler:
+                target_scheduler = self.settings.value("gen_scheduler", "normal", type=str)
+
+            if target_scheduler:
+                index = self.scheduler_combo.findText(target_scheduler)
+                if index >= 0:
+                    self.scheduler_combo.setCurrentIndex(index)
+                    return
+
+            if self.scheduler_combo.count() > 0:
+                self.scheduler_combo.setCurrentIndex(0)
+        finally:
+            self.scheduler_combo.blockSignals(False)
 
     def _populate_model_combo(self, combo: QComboBox, items: List[str], settings_key: str):
         combo.blockSignals(True)
@@ -686,6 +855,9 @@ class ParameterPanel(QWidget):
         self.workspace_scroll.setWidgetResizable(True)
         self.workspace_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.workspace_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # 禁用焦点触发的自动垂直滚动（防止跳转）
+        self.workspace_scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.workspace_scroll.verticalScrollBar().setFocusPolicy(Qt.FocusPolicy.NoFocus)
         
         workspace_content = QWidget()
         workspace_layout = QVBoxLayout(workspace_content)
@@ -695,21 +867,25 @@ class ParameterPanel(QWidget):
 
         # --- 1. 可编辑文本区 ---
         def create_edit_block(title, placeholder, height):
-            # 标题和AI按钮放在同一行
+            # 纯净标题布局，由调用者决定按钮位置
             title_row = QHBoxLayout()
-            title_row.setSpacing(8)
-            title_row.addWidget(QLabel(title, styleSheet=self._label_style))
-            title_row.addStretch()
+            title_row.setContentsMargins(0, 0, 0, 0)
+            title_row.setSpacing(4)
+            
+            lbl = QLabel(title)
+            lbl.setStyleSheet(self._label_style)
+            title_row.addWidget(lbl)
+            
             return title_row, height
 
         # 正向提示词
         prompt_title_row, prompt_height = create_edit_block("✨ 正向提示词", "输入新的提示词进行创作...", 70)
 
-        # AI处理状态标签
+        # AI处理状态标签 (不再设置固定宽度，避免空隙)
         self.ai_status_label = QLabel("")
         self.ai_status_label.setStyleSheet("color: #8b5cf6; font-size: 10px;")
-        self.ai_status_label.setFixedWidth(80)
-        prompt_title_row.addWidget(self.ai_status_label)
+        # 移除 setFixedWidth(80)
+        # prompt_title_row.addWidget(self.ai_status_label) # 移入下方容器或暂时隐藏，避免占据左侧空间
 
         history_btn_style = """
             QPushButton {
@@ -730,7 +906,7 @@ class ParameterPanel(QWidget):
         self.btn_history.setFixedSize(52, 22)
         self.btn_history.setStyleSheet(history_btn_style)
         self.btn_history.clicked.connect(lambda: self._show_history_dialog('positive'))
-        prompt_title_row.addWidget(self.btn_history)
+        # prompt_title_row.addWidget(self.btn_history) # 移至右侧按钮组
 
         # AI优化按钮
         self.btn_ai_optimize = QPushButton("AI优化")
@@ -787,19 +963,36 @@ class ParameterPanel(QWidget):
         """)
         self.btn_file_import.clicked.connect(self._on_file_import_click)
 
+        # 压缩按钮尺寸以适应窄边栏
+        self.btn_ai_optimize.setFixedSize(65, 22)
+        self.btn_clipboard_import.setFixedSize(75, 22)
+        self.btn_file_import.setFixedSize(65, 22)
+        self.btn_history.setFixedSize(45, 22)
+        
+        # 组装正向提示词标题栏：[标签] -> [按钮组容器(强制右对齐)]
+        # 创建独立的按钮容器，彻底解决 addStretch 跳动问题
+        btn_container = QWidget()
+        btn_layout = QHBoxLayout(btn_container)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(4)
+        btn_layout.setAlignment(Qt.AlignmentFlag.AlignRight) # 强制右对齐
+        
+        # 将按钮加入独立容器
+        # 彻底移除 ai_status_label，防止其占据空间导致左侧出现空隙
+        # btn_layout.addWidget(self.ai_status_label) # 将状态标签也移出
+        btn_layout.addWidget(self.btn_history)
+        btn_layout.addWidget(self.btn_file_import)
+        btn_layout.addWidget(self.btn_clipboard_import)
+        btn_layout.addWidget(self.btn_ai_optimize)
+        
+        # 将容器加入主行，并赋予伸缩能力使其占据剩余空间
+        prompt_title_row.addWidget(btn_container, 1)
+
         prompt_container = QWidget()
         prompt_layout = QVBoxLayout(prompt_container)
         prompt_layout.setContentsMargins(0, 0, 0, 0)
         prompt_layout.setSpacing(4)
         prompt_layout.addLayout(prompt_title_row)
-        
-        prompt_action_row = QHBoxLayout()
-        prompt_action_row.setSpacing(6)
-        prompt_action_row.addStretch()
-        prompt_action_row.addWidget(self.btn_file_import)
-        prompt_action_row.addWidget(self.btn_clipboard_import)
-        prompt_action_row.addWidget(self.btn_ai_optimize)
-        prompt_layout.addLayout(prompt_action_row)
 
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setPlaceholderText("输入新的提示词进行创作...")
@@ -840,23 +1033,31 @@ class ParameterPanel(QWidget):
         # AI处理状态标签(反向提示词)
         self.neg_ai_status_label = QLabel("")
         self.neg_ai_status_label.setStyleSheet("color: #8b5cf6; font-size: 10px;")
-        self.neg_ai_status_label.setFixedWidth(80)
+        # 移除 setFixedWidth
+        # neg_title_row.addWidget(self.neg_ai_status_label) # 移除反向状态标签
         
-        # Reorder: Status -> History (Right aligned)
-        neg_title_row.addWidget(self.neg_ai_status_label)
-        neg_title_row.addWidget(self.btn_neg_history)
+        self.btn_neg_ai_optimize.setFixedSize(65, 22)
+        self.btn_neg_history.setFixedSize(45, 22)
+        
+        # 组装反向提示词标题栏
+        # 同样使用独立容器封装
+        neg_btn_container = QWidget()
+        neg_btn_layout = QHBoxLayout(neg_btn_container)
+        neg_btn_layout.setContentsMargins(0, 0, 0, 0)
+        neg_btn_layout.setSpacing(4)
+        neg_btn_layout.setAlignment(Qt.AlignmentFlag.AlignRight)
+        
+        # 彻底移除 status label，消除间隙
+        neg_btn_layout.addWidget(self.btn_neg_history)
+        neg_btn_layout.addWidget(self.btn_neg_ai_optimize)
+        
+        neg_title_row.addWidget(neg_btn_container, 1)
 
         neg_container = QWidget()
         neg_layout = QVBoxLayout(neg_container)
         neg_layout.setContentsMargins(0, 0, 0, 0)
         neg_layout.setSpacing(4)
         neg_layout.addLayout(neg_title_row)
-        
-        neg_action_row = QHBoxLayout()
-        neg_action_row.setSpacing(6)
-        neg_action_row.addStretch()
-        neg_action_row.addWidget(self.btn_neg_ai_optimize)
-        neg_layout.addLayout(neg_action_row)
 
         self.neg_prompt_edit = QTextEdit()
         self.neg_prompt_edit.setPlaceholderText("输入过滤词...")
@@ -949,6 +1150,27 @@ class ParameterPanel(QWidget):
         self._populate_resolutions(preset_resolutions, [])
 
         res_row.addWidget(self.resolution_combo)
+
+        # 分辨率管理按钮
+        self.manage_res_btn = QPushButton("⚙️")
+        self.manage_res_btn.setFixedSize(24, 24)
+        self.manage_res_btn.setToolTip("管理自定义分辨率")
+        self.manage_res_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.manage_res_btn.setStyleSheet("""
+            QPushButton {
+                background: transparent;
+                border: 1px solid palette(mid);
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                border-color: palette(highlight);
+                color: palette(highlight);
+            }
+        """)
+        self.manage_res_btn.clicked.connect(self._open_resolution_manager)
+        res_row.addWidget(self.manage_res_btn)
+
         res_row.addStretch()
 
         gen_layout.addLayout(res_row)
@@ -1006,21 +1228,33 @@ class ParameterPanel(QWidget):
 
         gen_layout.addLayout(steps_cfg_row)
         
-        # ===== 采样器行 =====
-        sampler_row = QHBoxLayout()
-        sampler_row.setSpacing(6)
+        # ===== 采样器和调度器行 =====
+        sampler_scheduler_row = QHBoxLayout()
+        sampler_scheduler_row.setSpacing(6)
 
         lbl_sampler = QLabel("采样器:")
         lbl_sampler.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 60px;")
-        sampler_row.addWidget(lbl_sampler)
+        sampler_scheduler_row.addWidget(lbl_sampler)
 
         self.sampler_combo = QComboBox()
-        self.sampler_combo.setMinimumWidth(160)
+        self.sampler_combo.setMinimumWidth(100)
         self.sampler_combo.setStyleSheet("padding: 3px; font-size: 11px;")
-        sampler_row.addWidget(self.sampler_combo)
-        sampler_row.addStretch()
+        sampler_scheduler_row.addWidget(self.sampler_combo)
 
-        gen_layout.addLayout(sampler_row)
+        sampler_scheduler_row.addSpacing(10)
+
+        lbl_scheduler = QLabel("调度器:")
+        lbl_scheduler.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 40px;")
+        sampler_scheduler_row.addWidget(lbl_scheduler)
+
+        self.scheduler_combo = QComboBox()
+        self.scheduler_combo.setMinimumWidth(80)
+        self.scheduler_combo.setStyleSheet("padding: 3px; font-size: 11px;")
+        sampler_scheduler_row.addWidget(self.scheduler_combo)
+
+        sampler_scheduler_row.addStretch()
+
+        gen_layout.addLayout(sampler_scheduler_row)
 
         self.model_row_widget = QWidget()
         model_row = QHBoxLayout(self.model_row_widget)
@@ -1032,7 +1266,8 @@ class ParameterPanel(QWidget):
         model_row.addWidget(self.lbl_model)
 
         self.model_combo = QComboBox()
-        self.model_combo.setMinimumWidth(160)
+        self.model_combo.setMinimumWidth(150)
+        self.model_combo.setMaximumWidth(260) # 限制最大宽度，防止长名字撑爆边栏
         self.model_combo.setStyleSheet("padding: 3px; font-size: 11px;")
         model_row.addWidget(self.model_combo)
         model_row.addStretch()
@@ -1049,7 +1284,8 @@ class ParameterPanel(QWidget):
         self.lbl_unet.setText("模型(UNET):")
 
         self.unet_combo = QComboBox()
-        self.unet_combo.setMinimumWidth(160)
+        self.unet_combo.setMinimumWidth(150)
+        self.unet_combo.setMaximumWidth(260)
         self.unet_combo.setStyleSheet("padding: 3px; font-size: 11px;")
         unet_row.addWidget(self.unet_combo)
         unet_row.addStretch()
@@ -1079,13 +1315,20 @@ class ParameterPanel(QWidget):
         clip_row.addWidget(lbl_clip)
 
         self.clip_combo = QComboBox()
-        self.clip_combo.setMinimumWidth(160)
+        self.clip_combo.setMinimumWidth(150)
+        self.clip_combo.setMaximumWidth(260)
         self.clip_combo.setStyleSheet("padding: 3px; font-size: 11px;")
         clip_row.addWidget(self.clip_combo)
         clip_row.addStretch()
 
         gen_layout.addLayout(clip_row)
         self._refresh_model_selectors()
+
+        # 禁止滚轮切换选项（除了批量输入框）
+        for w in [self.resolution_combo, self.steps_value, self.cfg_value, 
+                  self.sampler_combo, self.scheduler_combo, self.model_combo,
+                  self.unet_combo, self.vae_combo, self.clip_combo]:
+            w.wheelEvent = lambda e: e.ignore()
 
         self.workspace_controls_container = QWidget()
         controls_layout = QVBoxLayout(self.workspace_controls_container)
@@ -1124,19 +1367,14 @@ class ParameterPanel(QWidget):
 
         lora_section_layout.addLayout(lora_header_row)
 
-        self.lora_scroll = QScrollArea()
-        self.lora_scroll.setWidgetResizable(True)
-        self.lora_scroll.setMaximumHeight(100)
-        self.lora_scroll.setStyleSheet("QScrollArea { border: 1px solid palette(mid); border-radius: 3px; background-color: palette(base); }")
-
+        # 直接使用内容容器，不再嵌套 QScrollArea，避免滚动冲突
         self.lora_container = QWidget()
         self.lora_layout = QVBoxLayout(self.lora_container)
-        self.lora_layout.setContentsMargins(3, 3, 3, 3)
+        self.lora_layout.setContentsMargins(0, 0, 0, 0)
         self.lora_layout.setSpacing(3)
         self.lora_layout.addStretch()
 
-        self.lora_scroll.setWidget(self.lora_container)
-        lora_section_layout.addWidget(self.lora_scroll)
+        lora_section_layout.addWidget(self.lora_container)
 
         self.current_loras = {}
         
@@ -1229,41 +1467,32 @@ class ParameterPanel(QWidget):
     
     
     def _add_lora_item(self, name: str = "", weight: float = 1.0):
-        """添加一个LoRA项到列表（下拉框模式）"""
+        """添加一个LoRA项到列表（弹出窗口模式）"""
         # 限制最多5个LoRA
         if len(self.current_loras) >= 5:
             print("[UI] 已达到LoRA数量上限（5个）")
             return
-        
-        all_loras = self._get_all_loras()
         
         item_widget = QWidget()
         item_layout = QHBoxLayout(item_widget)
         item_layout.setContentsMargins(4, 2, 4, 2)
         item_layout.setSpacing(8)
         
-        # LoRA下拉选择框
-        lora_combo = QComboBox()
-        lora_combo.setMinimumWidth(200)
-        lora_combo.addItem("选择LoRA...")  # 默认提示项
-        for lora in all_loras:
-            if lora:
-                lora_combo.addItem(lora)
+        # LoRA选择器 (弹出窗口版)
+        lora_selector = LoraSelectorWidget()
+        lora_selector.setMinimumWidth(150)
+        lora_selector.setMaximumWidth(260)
+        lora_selector.set_data_source(self._get_all_loras)
         
         if name:
-            index = lora_combo.findText(name)
-            if index < 0:
-                lora_combo.addItem(name)
-                index = lora_combo.findText(name)
-            if index >= 0:
-                lora_combo.setCurrentIndex(index)
+            lora_selector.set_current_lora(name)
         
         # 当选择改变时更新数据
-        lora_combo.currentTextChanged.connect(
-            lambda text: self._on_lora_selection_changed(item_widget, text, lora_combo)
+        lora_selector.selection_changed.connect(
+            lambda text: self._on_lora_selection_changed(item_widget, text, lora_selector)
         )
         
-        item_layout.addWidget(lora_combo)
+        item_layout.addWidget(lora_selector)
         
         # 权重标签
         weight_label = QLabel("权重:")
@@ -1286,11 +1515,12 @@ class ParameterPanel(QWidget):
                 border-radius: 2px;
             }
         """)
-        # 保存引用到combo box的userData
-        lora_combo.setProperty("weight_spin", weight_spin)
+        # 保存引用到selector的userData
+        lora_selector.setProperty("weight_spin", weight_spin)
         weight_spin.valueChanged.connect(
-            lambda v: self._update_lora_weight_from_combo(lora_combo, round(v, 2))
+            lambda v: self._update_lora_weight_from_combo(lora_selector, round(v, 2))
         )
+        weight_spin.wheelEvent = lambda e: e.ignore() # 禁止滚轮切换
         item_layout.addWidget(weight_spin)
         
         # 删除按钮
@@ -1307,7 +1537,7 @@ class ParameterPanel(QWidget):
                 color: red;
             }
         """)
-        del_btn.clicked.connect(lambda: self._remove_lora_item_widget(item_widget, lora_combo))
+        del_btn.clicked.connect(lambda: self._remove_lora_item_widget(item_widget, lora_selector))
         item_layout.addWidget(del_btn)
         
         # 插入到stretch之前
@@ -1317,8 +1547,7 @@ class ParameterPanel(QWidget):
         # 如果指定了名称，添加到数据并设置属性
         if name and name != "选择LoRA...":
             self.current_loras[name] = weight
-            lora_combo.setProperty("selected_lora", name)  # 设置属性，防止重复检测
-            # print(f"[UI] 添加LoRA: {name} (权重: {weight})")
+            lora_selector.setProperty("selected_lora", name)  # 设置属性，防止重复检测
 
     def _get_all_loras(self):
         main_window = self.window()
@@ -1479,95 +1708,61 @@ class ParameterPanel(QWidget):
             self.lbl_unet.setText("模型(UNET):")
 
     def refresh_lora_options(self):
+        # 记录外层滚动条位置
+        v_bar = self.workspace_scroll.verticalScrollBar()
+        old_pos = v_bar.value()
+        
         all_loras = self._get_all_loras()
         status = getattr(self, "_last_comfyui_lora_status", "")
-        if status:
-            if status.startswith("未设置 ComfyUI 目录") or status.startswith("未找到目录"):
-                last_popup = getattr(self, "_last_comfyui_lora_popup", "")
-                if last_popup != status:
-                    QMessageBox.warning(self, "ComfyUI 目录无效", status)
-                    self._last_comfyui_lora_popup = status
-            else:
-                self._temp_notify(status)
-                self._last_comfyui_lora_popup = ""
-        if not all_loras:
-            return
-        for i in range(self.lora_layout.count() - 1):
-            item = self.lora_layout.itemAt(i)
-            if not item or not item.widget():
-                continue
-            widget = item.widget()
-            lora_combo = widget.findChild(QComboBox)
-            if not lora_combo:
-                continue
-            selected = lora_combo.property("selected_lora")
-            if not selected:
-                current_text = lora_combo.currentText()
-                if current_text and current_text != "选择LoRA...":
-                    selected = current_text
-            lora_combo.blockSignals(True)
-            lora_combo.clear()
-            lora_combo.addItem("选择LoRA...")
-            for lora in all_loras:
-                lora_combo.addItem(lora)
-            if selected:
-                index = lora_combo.findText(selected)
-                if index < 0:
-                    lora_combo.addItem(selected)
-                    index = lora_combo.findText(selected)
-                if index >= 0:
-                    lora_combo.setCurrentIndex(index)
-            lora_combo.blockSignals(False)
+        
+    def refresh_lora_options(self):
+        """刷新LoRA选项（不再更新Dropdown，仅用于保留接口或特殊逻辑）"""
+        pass # LoraSelectorWidget 自动处理数据源，这里不再需要手动填充
     
-    def _on_lora_selection_changed(self, widget, text, combo):
+    def _on_lora_selection_changed(self, widget, text, selector):
         """当LoRA选择改变时"""
-        if text == "选择LoRA..." or not text:
+        if not text:
             # 从数据中移除（如果之前有选择）
-            old_data = combo.property("selected_lora")
+            old_data = selector.property("selected_lora")
             if old_data and old_data in self.current_loras:
                 del self.current_loras[old_data]
-            combo.setProperty("selected_lora", None)
+            selector.setProperty("selected_lora", None)
             self._save_loras()
             return
         
         # 检查是否重复
         if text in self.current_loras:
             # 恢复之前的选择或重置
-            old_data = combo.property("selected_lora")
-            if old_data:
-                index = combo.findText(old_data)
-                if index >= 0:
-                    combo.setCurrentIndex(index)
-            else:
-                combo.setCurrentIndex(0)
+            old_data = selector.property("selected_lora")
+            selector.set_current_lora(old_data if old_data else "")
             # print(f"[UI] LoRA '{text}' 已被使用")
             return
         
         # 更新数据
-        old_name = combo.property("selected_lora")
+        old_name = selector.property("selected_lora")
         if old_name and old_name in self.current_loras:
             del self.current_loras[old_name]
         
-        weight_spin = combo.property("weight_spin")
+        weight_spin = selector.property("weight_spin")
         weight = weight_spin.value() if weight_spin else 1.0
         self.current_loras[text] = weight
-        combo.setProperty("selected_lora", text)
+        selector.setProperty("selected_lora", text)
         self._save_loras()
         # print(f"[UI] 选择LoRA: {text} (权重: {weight})")
     
     # [Removed redundant _log method that was overwritten]
 
-    def _update_lora_weight_from_combo(self, combo, weight):
-        """从ComboBox更新LoRA权重"""
-        lora_name = combo.property("selected_lora")
+    def _update_lora_weight_from_combo(self, selector, weight):
+        """从Selector更新LoRA权重"""
+        lora_name = selector.property("selected_lora")
         if lora_name and lora_name in self.current_loras:
             self.current_loras[lora_name] = weight
             self._save_loras()
             # print(f"[UI] 更新LoRA权重: {lora_name} -> {weight}")
     
-    def _remove_lora_item_widget(self, widget, combo):
-        """删除LoRA项（ComboBox模式）"""
-        lora_name = combo.property("selected_lora")
+    def _remove_lora_item_widget(self, widget, selector):
+        """删除LoRA项"""
+        lora_name = selector.property("selected_lora")
         if lora_name and lora_name in self.current_loras:
             del self.current_loras[lora_name]
             # print(f"[UI] 删除LoRA: {lora_name}")
@@ -1629,13 +1824,17 @@ class ParameterPanel(QWidget):
             return
         
         clipboard = QGuiApplication.clipboard()
+        
+        # 1. 优先尝试识别图片
         image = clipboard.image()
         if image and not image.isNull():
             image_b64 = self._qimage_to_base64(image)
             if image_b64:
+                self._temp_notify("🎨 正在从剪贴板读取图片进行识图...")
                 self._run_image_to_prompt(image_b64)
                 return
         
+        # 2. 检查是否有本地图片文件链接
         mime = clipboard.mimeData()
         if mime and mime.hasUrls():
             for url in mime.urls():
@@ -1643,11 +1842,36 @@ class ParameterPanel(QWidget):
                 if path and self._is_image_file(path):
                     image_b64 = self._image_file_to_base64(path)
                     if image_b64:
+                        self._temp_notify(f"📁 正在识图: {os.path.basename(path)}")
                         self._run_image_to_prompt(image_b64)
                         return
+                        
+        # 3. 如果不是图片，尝试导入文本
+        if mime and mime.hasText():
+            text = mime.text().strip()
+            if text:
+                # 确定要粘贴到的目标编辑器
+                target_edit = self.prompt_edit
+                focus_widget = QApplication.focusWidget()
+                
+                # 如果当前焦点在反向提示词框，则粘贴到那里
+                if focus_widget == self.neg_prompt_edit:
+                    target_edit = self.neg_prompt_edit
+                
+                # 执行覆盖粘贴
+                target_edit.setPlainText(text)
+                
+                # 移动光标到末尾并滚动
+                cursor = target_edit.textCursor()
+                cursor.movePosition(cursor.MoveOperation.End)
+                target_edit.setTextCursor(cursor)
+                target_edit.ensureCursorVisible()
+                
+                self._temp_notify("📋 剪贴板文本已导入（已覆盖旧内容）")
+                return
         
         from PyQt6.QtWidgets import QMessageBox
-        QMessageBox.warning(self, "剪贴板无图片", "未检测到可用的图片内容")
+        QMessageBox.warning(self, "剪贴板无有效内容", "未检测到图片或文本内容")
 
     def _on_file_import_click(self):
         if self._ai_is_processing or self._img_prompt_processing:
@@ -1670,7 +1894,8 @@ class ParameterPanel(QWidget):
             self._temp_notify("当前已有AI任务在执行")
             return
         self._img_prompt_processing = True
-        self.ai_status_label.setText("⏳ 识图中...")
+        # self.ai_status_label.setText("⏳ 识图中...")
+        self.btn_file_import.setText("⏳") # 简略显示状态
         self.btn_clipboard_import.setEnabled(False)
         self.btn_file_import.setEnabled(False)
         self.btn_ai_optimize.setEnabled(False)
@@ -1700,18 +1925,21 @@ class ParameterPanel(QWidget):
         self._img_prompt_processing = False
         self.btn_clipboard_import.setEnabled(True)
         self.btn_file_import.setEnabled(True)
+        self.btn_file_import.setText("文件导入") # 恢复文字
         self.btn_ai_optimize.setEnabled(True)
         self.btn_neg_ai_optimize.setEnabled(True)
         self.current_img_worker = None
         
         if success:
-            self.ai_status_label.setText("✅ 识图完成")
-            QTimer.singleShot(3000, lambda: self.ai_status_label.setText(""))
+            # self.ai_status_label.setText("✅ 识图完成")
+            # QTimer.singleShot(3000, lambda: self.ai_status_label.setText(""))
+            self._temp_notify("✅ 识图完成")
             self.prompt_edit.setPlainText(result)
             self.history_manager.add_record("positive", original_prompt, result)
         else:
-            self.ai_status_label.setText("❌ 识图失败")
-            QTimer.singleShot(3000, lambda: self.ai_status_label.setText(""))
+            # self.ai_status_label.setText("❌ 识图失败")
+            # QTimer.singleShot(3000, lambda: self.ai_status_label.setText(""))
+            self._temp_notify("❌ 识图失败")
             if hasattr(self, "_img_stream_started") and self._img_stream_started:
                 self.prompt_edit.setPlainText(original_prompt)
             from PyQt6.QtWidgets import QMessageBox
@@ -1769,8 +1997,9 @@ class ParameterPanel(QWidget):
         
         body_splitter = QSplitter(Qt.Orientation.Horizontal)
         body_splitter.setChildrenCollapsible(False)
-        
+        # 左侧列表面板 (增加搜索框)
         left_widget = QWidget()
+        left_widget.setMinimumWidth(380) # 加宽以确保您的原始设计（右侧按钮）能完整显示
         left_col = QVBoxLayout(left_widget)
         left_col.setContentsMargins(0, 0, 0, 0)
         left_label = QLabel("系列")
@@ -1968,21 +2197,23 @@ class ParameterPanel(QWidget):
             return
 
         self._ai_is_processing = False
-        target_btn.setText("✨ AI优化")
+        target_btn.setText("AI优化") # Removed emoji
         target_btn.setEnabled(True)
         self.current_ai_worker = None
         self._ai_original_prompt = None
         
         if success:
-            status_label.setText("✅ 优化成功")
-            QTimer.singleShot(3000, lambda: status_label.setText(""))
+            # status_label.setText("✅ 优化成功") # Label removed
+            # QTimer.singleShot(3000, lambda: status_label.setText(""))
+            self._temp_notify("✅ AI优化成功")
             target_edit.setPlainText(result)
             
             # Record History
             p_type = 'negative' if is_negative else 'positive'
             self.history_manager.add_record(p_type, original_prompt, result)
         else:
-            status_label.setText("❌ 失败")
+            # status_label.setText("❌ 失败")
+            self._temp_notify("❌ 优化失败")
             # 如果流式输出已经修改了内容，需要恢复原始内容
             if hasattr(self, '_ai_stream_started') and self._ai_stream_started:
                 target_edit.setPlainText(original_prompt)
@@ -2010,9 +2241,10 @@ class ParameterPanel(QWidget):
             
             # Reset UI
             self._ai_is_processing = False
-            target_btn.setText("✨ AI优化")
-            status_label.setText("🚫 已取消")
-            QTimer.singleShot(2000, lambda: status_label.setText(""))
+            target_btn.setText("AI优化")
+            # status_label.setText("🚫 已取消") # Label removed
+            if hasattr(self, '_temp_notify'): self._temp_notify("🚫 已取消")
+            # QTimer.singleShot(2000, lambda: status_label.setText(""))
             target_btn.setEnabled(True)
             self.btn_ai_optimize.setEnabled(True)
             self.btn_neg_ai_optimize.setEnabled(True)
@@ -2040,8 +2272,9 @@ class ParameterPanel(QWidget):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Ignore
             )
             if reply == QMessageBox.StandardButton.Yes:
-                status_label.setText("请在设置中配置GLM API Key")
-                QTimer.singleShot(3000, lambda: status_label.setText(""))
+                # status_label.setText("请在设置中配置GLM API Key")
+                # QTimer.singleShot(3000, lambda: status_label.setText(""))
+                self._temp_notify("请在设置中配置GLM API Key")
                 return
         
         # 1. 弹出自定义对话框,询问用户需求
@@ -2071,8 +2304,8 @@ class ParameterPanel(QWidget):
         
         # 2. 锁定并显示处理状态
         self._ai_is_processing = True
-        target_btn.setText("⏹️ 取消")
-        status_label.setText("⏳ AI正在处理...")
+        target_btn.setText("⏳ 正在优化...")
+        # status_label.setText("⏳ AI正在处理...")
         self._ai_original_prompt = existing_prompt
         
         # 3. 启动后台线程
@@ -2088,6 +2321,8 @@ class ParameterPanel(QWidget):
     def _on_add_lora_click(self):
 
         """添加新的LoRA行"""
+        # 添加前先刷新一次候选项
+        self._refresh_comfyui_assets()
         # 直接添加空的LoRA项（用户从下拉框选择）
         self._add_lora_item("", 1.0)
 
@@ -2103,13 +2338,35 @@ class ParameterPanel(QWidget):
         
         header.addStretch()
         
-        # 改用英文 "Copy"，防止乱码
-        btn_copy = QPushButton("Copy") 
-        btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._fix_text_button(btn_copy) # 应用通用修复
         if copy_func:
+            btn_copy = QPushButton("复制")
+            btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_copy.setFixedWidth(50)
+            btn_copy.setStyleSheet("background: transparent; border: 1px solid palette(mid); border-radius: 3px; font-size: 10px; color: palette(mid);")
             btn_copy.clicked.connect(copy_func)
-        header.addWidget(btn_copy)
+            header.addWidget(btn_copy)
+            
+        # 增加“调用”按钮
+        btn_use = QPushButton("调用")
+        btn_use.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_use.setFixedWidth(50)
+        btn_use.setStyleSheet("""
+            QPushButton {
+                background-color: palette(button); 
+                border: 1px solid palette(highlight); 
+                border-radius: 3px; 
+                font-size: 10px; 
+                color: palette(highlight);
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: palette(highlight); color: white; }
+        """)
+        # 根据标题绑定不同的调用逻辑
+        if "反向" in title:
+            btn_use.clicked.connect(self._use_selected_neg_prompt)
+        else:
+            btn_use.clicked.connect(self._use_selected_prompt)
+        header.addWidget(btn_use)
         return header
 
     def _fix_text_button(self, btn):
@@ -2206,12 +2463,19 @@ class ParameterPanel(QWidget):
 
     def update_info(self, meta_data):
         """更新UI - V4.0新版"""
-        self.current_meta = meta_data # 保存当前元数据
         if not meta_data:
             self.clear_info()
             self.btn_apply_workspace.setEnabled(False)
             self.btn_remote_gen.setEnabled(False)
             return
+
+        # 检查是否是同一张图的冗余更新
+        new_path = meta_data.get('tech_info', {}).get('path')
+        old_path = self.current_meta.get('tech_info', {}).get('path') if self.current_meta else None
+        if new_path and old_path and new_path == old_path:
+            return
+            
+        self.current_meta = meta_data # 保存当前元数据
             
         # 只有 ComfyUI 导出的图片才支持调用和生成
         has_workflow = 'workflow' in meta_data
@@ -2252,6 +2516,12 @@ class ParameterPanel(QWidget):
         sampler = params.get('Sampler', params.get('sampler_name', '-'))
         self.sampler_label.setText(f"{sampler}")
         
+        scheduler = params.get('Scheduler', params.get('scheduler', '-'))
+        self.info_scheduler_label.setText(f"{scheduler}")
+        
+        denoise = params.get('Denoise', params.get('denoise', '-'))
+        self.info_denoise_label.setText(f"{denoise}")
+        
         # 更新LoRA展示 (简约文本)
         lora_texts = []
         for l in loras:
@@ -2282,9 +2552,9 @@ class ParameterPanel(QWidget):
             if key in self.detail_widgets:
                 self.detail_widgets[key].setText(str(value) if value else "-")
 
-        update_detail("scheduler", params.get('Scheduler'))
-        update_detail("denoise", params.get('Denoise'))
-        update_detail("model_hash", params.get('Model hash'))
+        update_detail("scheduler", params.get('Scheduler', params.get('scheduler')))
+        update_detail("denoise", params.get('Denoise', params.get('denoise')))
+        update_detail("model_hash", params.get('Model hash', params.get('model_hash')))
         
         if tech_info:
             update_detail("file_size", tech_info.get('file_size'))
@@ -2339,12 +2609,17 @@ class ParameterPanel(QWidget):
             if cfg: self.cfg_value.setValue(float(cfg))
         except: pass
 
-        # 5. Sampler
+        # 5. Sampler & Scheduler
         try:
             sampler = params.get('Sampler', params.get('sampler_name'))
             if sampler:
                 idx = self.sampler_combo.findText(sampler)
                 if idx >= 0: self.sampler_combo.setCurrentIndex(idx)
+            
+            scheduler = params.get('Scheduler', params.get('scheduler'))
+            if scheduler:
+                idx = self.scheduler_combo.findText(scheduler)
+                if idx >= 0: self.scheduler_combo.setCurrentIndex(idx)
         except: pass
 
         try:
@@ -2387,6 +2662,20 @@ class ParameterPanel(QWidget):
                 if name:
                     self._add_lora_item(name, weight)
         self._save_loras()
+
+    def _use_selected_prompt(self):
+        """将选中的正向提示词调用到工作区"""
+        text = self.info_prompt_val.toPlainText().strip()
+        if text:
+            self.prompt_edit.setPlainText(text)
+            self._temp_notify("✅ 正向提示词已调用")
+
+    def _use_selected_neg_prompt(self):
+        """将选中的反向提示词调用到工作区"""
+        text = self.info_neg_val.toPlainText().strip()
+        if text:
+            self.neg_prompt_edit.setPlainText(text)
+            self._temp_notify("✅ 反向提示词已调用")
 
     def _save_loras(self):
         """保存当前LoRA配置到Settings"""
@@ -2474,11 +2763,14 @@ class ParameterPanel(QWidget):
         self.resolution_combo.currentIndexChanged.connect(_on_res_change)
         # Note: Loading is handled in _populate_resolutions
 
-        # 7. Sampler (Combo) - Saving logic
+        # 7. Sampler & Scheduler (Combo) - Saving logic
         self.sampler_combo.currentTextChanged.connect(
             lambda t: self.settings.setValue("gen_sampler", t)
         )
-        # Note: Loading is handled in _populate_samplers
+        self.scheduler_combo.currentTextChanged.connect(
+            lambda t: self.settings.setValue("gen_scheduler", t)
+        )
+        # Note: Loading is handled in _populate_samplers/_populate_schedulers
 
         self.model_combo.currentTextChanged.connect(
             lambda t: self.settings.setValue("gen_model", t)
@@ -2645,9 +2937,16 @@ class ParameterPanel(QWidget):
         res_data = self.resolution_combo.currentData()
         user_width, user_height = res_data if res_data else (512, 768)
         
+        user_cfg = self.steps_value.value() if hasattr(self, 'steps_value') else 7.5 # fallback for cfg reading? Wait.
+        # Wait, the line above has a bug in my thought, let me re-check steps/cfg lines.
+        # Line 2868 is user_steps = self.steps_value.value()
+        # Line 2869 is user_cfg = self.cfg_value.value()
+        # Line 2870 is user_sampler = self.sampler_combo.currentText()
+        
         user_steps = self.steps_value.value()
         user_cfg = self.cfg_value.value()
         user_sampler = self.sampler_combo.currentText()
+        user_scheduler = self.scheduler_combo.currentText()
         
         # 3. 注入用户自定义参数到workflow
         self._log(f"\n[Comfy] ========== 参数注入开始 ==========")
@@ -2657,6 +2956,7 @@ class ParameterPanel(QWidget):
         self._log(f"  → Steps: {user_steps}")
         self._log(f"  → CFG: {user_cfg}")
         self._log(f"  → Sampler: {user_sampler}")
+        self._log(f"  → Scheduler: {user_scheduler}")
         self._log(f"  → LoRAs: {list(self.current_loras.keys())}")
         
         # 遍历workflow节点注入参数
@@ -2696,10 +2996,14 @@ class ParameterPanel(QWidget):
                     inputs['cfg'] = user_cfg
                     self._log(f"[Comfy] -> 注入CFG: 节点 {node_id} -> {user_cfg}")
                 
-                # Sampler
+                # Sampler & Scheduler
                 if 'sampler_name' in inputs and user_sampler:
                     inputs['sampler_name'] = user_sampler
                     self._log(f"[Comfy] -> 注入Sampler: 节点 {node_id} -> {user_sampler}")
+                
+                if 'scheduler' in inputs and user_scheduler:
+                    inputs['scheduler'] = user_scheduler
+                    self._log(f"[Comfy] -> 注入Scheduler: 节点 {node_id} -> {user_scheduler}")
             
             # CheckpointLoader节点: 注入模型名称
             if 'checkpointloader' in class_type:
@@ -3015,22 +3319,46 @@ class ParameterPanel(QWidget):
     def _find_best_lora_match(self, ui_name: str) -> str:
         if not hasattr(self, 'available_loras') or not self.available_loras:
             return None
+        
+        # ui_name 可能是绝对路径 (来自新选择器) 也可能是相对路径/文件名 (来自旧保存/输入)
         clean_name = ui_name.replace("🎨 ", "").strip()
+        clean_lower = clean_name.lower().replace("\\", "/") # 归一化查找
+        
+        # 1. 尝试直接匹配 (精确)
         if clean_name in self.available_loras:
             return clean_name
+        
+        # 2. 尝试匹配相对路径 (如果 ui_name 是绝对路径)
+        # 遍历 available_loras (它们通常是相对路径)，看是否 ui_name 以它结尾
+        # 例如: ui_name = "D:/ComfyUI/models/loras/style/anime.safetensors"
+        # available = "style/anime.safetensors"
+        # -> ui_name.endswith(available) -> True
+        for m in self.available_loras:
+            m_norm = m.replace("\\", "/")
+            if clean_lower.endswith(m_norm.lower()):
+                 return m
+        
+        # 3. 尝试扩展名匹配
         for ext in ['.safetensors', '.ckpt', '.pt', '.sft']:
             if clean_name + ext in self.available_loras:
                 return clean_name + ext
+        
+        # 4. 尝试文件名匹配 (最宽松)
         base_clean = os.path.basename(clean_name).lower()
         base_no_ext = os.path.splitext(base_clean)[0]
+        
         candidates = []
         for m in self.available_loras:
             base = os.path.basename(m).lower()
             base_no = os.path.splitext(base)[0]
             if base == base_clean or base_no == base_no_ext:
                 candidates.append(m)
-        if len(candidates) == 1:
+        
+        if len(candidates) >= 1:
+            # 如果有多个候选 (比如不同文件夹下同名)，优先选最短的(通常是根目录)? 或者选第一个
+            # 这里简单选第一个
             return candidates[0]
+            
         return None
 
     def _find_best_unet_match(self, ui_name: str) -> str:
