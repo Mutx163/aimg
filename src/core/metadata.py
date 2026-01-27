@@ -154,6 +154,13 @@ class MetadataParser:
                     for k in ['seed', 'steps', 'cfg', 'sampler_name', 'scheduler', 'denoise']:
                         if k in inputs:
                             result['params'][k] = inputs[k]
+                
+                # 提取分辨率 (EmptyLatentImage 或 LoadImage)
+                if class_type in ['emptylatentimage', 'latentupscalepython', 'latentupscale_videocf']:
+                    if 'width' in inputs and 'height' in inputs:
+                        result['params']['width'] = inputs['width']
+                        result['params']['height'] = inputs['height']
+                        result['params']['size'] = f"{inputs['width']}x{inputs['height']}"
 
                 # 提取文本节点 (V5.5 增强：排查那些只有单个 word 的 'text'，通常它们是模型名)
                 if class_type == 'cliptextencode':

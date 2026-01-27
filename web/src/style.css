@@ -1,0 +1,17 @@
+@import "tailwindcss";
+@config "../tailwind.config.js";
+
+:root {
+    --font-inter: "Inter", system-ui, -apple-system, sans-serif;
+    --font-outfit: "Outfit", system-ui, -apple-system, sans-serif;
+}
+
+body {
+    font-family: var(--font-inter);
+    -webkit-tap-highlight-color: transparent;
+}
+
+.modal-open {
+    overflow: hidden;
+    touch-action: pan-x pan-y;
+}

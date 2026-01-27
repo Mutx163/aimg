@@ -101,11 +101,22 @@ class DatabaseManager:
             cursor.execute("ALTER TABLE images ADD COLUMN file_mtime REAL DEFAULT 0")
             conn.commit()
         
+        # 添加 width 和 height 字段
+        try:
+            cursor.execute("SELECT width FROM images LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE images ADD COLUMN width INTEGER")
+            cursor.execute("ALTER TABLE images ADD COLUMN height INTEGER")
+            conn.commit()
+        
         conn.close()
 
     def add_image(self, file_path: str, meta: Dict[str, Any]) -> None:
         """插入或更新一张图片的元数据"""
         if not meta: return
+        
+        # 统一路径分隔符，防止 F:\... 和 F:/... 重复
+        file_path = file_path.replace("\\", "/")
         
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -121,8 +132,9 @@ class DatabaseManager:
                 INSERT OR REPLACE INTO images (
                     file_path, file_name, prompt, negative_prompt, 
                     seed, steps, sampler, scheduler, cfg_scale, 
-                    model_name, model_hash, tool, loras, tech_info, raw_metadata, file_mtime
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    model_name, model_hash, tool, loras, tech_info, raw_metadata, file_mtime,
+                    width, height
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 file_path,
                 os.path.basename(file_path),
@@ -139,7 +151,9 @@ class DatabaseManager:
                 json.dumps(loras),
                 json.dumps(tech_info),
                 meta.get('raw', ""),
-                file_mtime
+                file_mtime,
+                params.get('width') or tech_info.get('width') or meta.get('width') or 0,
+                params.get('height') or tech_info.get('height') or meta.get('height') or 0
             ))
             
             # 获取 ID 以更新 LoRA 表
@@ -169,14 +183,14 @@ class DatabaseManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # 排序逻辑映射
+        # 排序逻辑映射 (使用 file_path 作为最终稳定键)
         order_map = {
-            "time_desc": "i.file_mtime DESC", # 使用别名 i
-            "time_asc": "i.file_mtime ASC",
-            "name_asc": "i.file_name ASC",
-            "name_desc": "i.file_name DESC"
+            "time_desc": "i.file_mtime DESC, i.file_path ASC",
+            "time_asc": "i.file_mtime ASC, i.file_path ASC",
+            "name_asc": "i.file_name ASC, i.file_path ASC",
+            "name_desc": "i.file_name DESC, i.file_path DESC"
         }
-        order_sql = order_map.get(order_by, 'i.file_mtime DESC')
+        order_sql = order_map.get(order_by, 'i.file_mtime DESC, i.file_path DESC')
 
         args = []
         
@@ -231,6 +245,21 @@ class DatabaseManager:
             
         conn.close()
         return results
+
+    def get_unique_folders(self) -> List[str]:
+        """获取所有已索引图片所属的根目录列表"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        # 提取路径中最后一个斜杠前的部分作为文件夹
+        # 在 SQLite 中处理路径字符串较复杂，这里简单使用 DISTINCT folder_path 的逻辑
+        # 如果数据库没存 folder_path 列，我们需要从 file_path 提取
+        cursor.execute("SELECT DISTINCT file_path FROM images")
+        paths = [row[0] for row in cursor.fetchall()]
+        folders = set()
+        for p in paths:
+            folders.add(os.path.dirname(p).replace("\\", "/"))
+        conn.close()
+        return sorted(list(folders))
 
     def get_unique_models(self, folder_path: Optional[str] = None) -> List[tuple]:
         """获取已索引的所有 Checkpoint 模型及其计数"""
@@ -370,3 +399,106 @@ class DatabaseManager:
         
         conn.close()
         return sorted(list(set(schedulers)))
+
+    def get_image_info(self, file_path: str) -> Dict[str, Any]:
+        """获取单张图片的详细信息"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT width, height, model_name, seed, steps, sampler, scheduler, cfg_scale, prompt, negative_prompt, loras, tech_info
+            FROM images WHERE file_path = ?
+        ''', (file_path,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            width = row[0]
+            height = row[1]
+            
+            # 如果数据库没有 width/height，尝试从 tech_info 解析
+            if (not width or not height) and row[11]:
+                try:
+                    tech_info = json.loads(row[11])
+                    if 'resolution' in tech_info:
+                        res = tech_info['resolution']
+                        if 'x' in res:
+                            parts = res.split('x')
+                            width = int(parts[0]) if parts[0].isdigit() else 0
+                            height = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+                except:
+                    pass
+            
+            return {
+                'width': width or 0,
+                'height': height or 0,
+                'model_name': row[2] or '',
+                'seed': row[3] or '',
+                'steps': row[4] or 0,
+                'sampler': row[5] or '',
+                'scheduler': row[6] or '',
+                'cfg_scale': row[7] or 0,
+                'prompt': row[8] or '',
+                'negative_prompt': row[9] or '',
+                'loras': json.loads(row[10]) if row[10] else []
+            }
+        return {}
+    def get_images_batch_info(self, file_paths: List[str]) -> Dict[str, Dict[str, Any]]:
+        """批量获取图片信息，优化列表加载性能"""
+        if not file_paths:
+            return {}
+            
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # 动态构建 SQL，使用 parameters preventing injection
+        placeholders = ','.join(['?'] * len(file_paths))
+        query = f'''
+            SELECT file_path, width, height, model_name, seed, steps, sampler, scheduler, cfg_scale, prompt, negative_prompt, loras, tech_info
+            FROM images WHERE file_path IN ({placeholders})
+        '''
+        
+        try:
+            cursor.execute(query, file_paths)
+            results = {}
+            for row in cursor.fetchall():
+                path = row[0]
+                
+                # Width/Height fallback logic
+                width, height = row[1], row[2]
+                if (not width or not height) and row[12]:
+                    try:
+                        tech_info = json.loads(row[12])
+                        if 'resolution' in tech_info:
+                            res = tech_info['resolution']
+                            if 'x' in res:
+                                parts = res.split('x')
+                                width = int(parts[0]) if parts[0].isdigit() else width
+                                height = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else height
+                    except: pass
+                
+                results[path] = {
+                    'width': width or 0,
+                    'height': height or 0,
+                    'model_name': row[3] or '',
+                    'seed': row[4] or '',
+                    'steps': row[5] or 0,
+                    'sampler': row[6] or '',
+                    'scheduler': row[7] or '',
+                    'cfg_scale': row[8] or 0,
+                    'prompt': row[9] or '',
+                    'negative_prompt': row[10] or '',
+                    'loras': json.loads(row[11]) if row[11] else []
+                }
+            return results
+        except Exception as e:
+            print(f"[DB] Batch info error: {e}")
+            return {}
+        finally:
+            conn.close()
+
+    def get_all_file_paths(self):
+        """获取数据库中所有已索引的文件路径集合"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT file_path FROM images")
+            return {row[0] for row in cursor.fetchall()}
