@@ -27,6 +27,8 @@ ENV/
 # Project Specific Caches
 .thumbs/
 aimg_metadata.db
+aimg_metadata.db-shm
+aimg_metadata.db-wal
 web/.vue_build_fingerprint.json
 
 # IDEs
