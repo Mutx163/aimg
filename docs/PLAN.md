@@ -1,28 +1,49 @@
-# 核心优化执行计划 (PLAN.md)
+# 项目分析与改进计划 (Project Analysis & Improvement Plan)
 
-本项目将进入性能重构阶段，重点解决图像量级提升带来的延迟问题。
+## 📌 当前状态
+- **Security**: 已修复 LFI 漏洞，恢复 `0.0.0.0` 绑定以支持移动端。
+- **Frontend**: 已完成组件化重构 (`ImageList`, `ImageViewer`, `FilterModal`, `InfoPanel`)。
+- **Performance**: 已禁用 HMR。
 
-## 指派任务组
-- **数据库架构师 (`database-architect`)**: 负责 FTS5 虚拟表迁移和 LoRA 关系表重构。
-- **前端专家 (`frontend-specialist`)**: 负责将 `QListWidget` 迁移至 `QListView` (虚拟列表) 并实现同步缩放。
-- **性能优化师 (`performance-optimizer`)**: 负责实现 WebP 持久化缩略图缓存机制。
-- **测试工程师 (`test-engineer`)**: 负责验证元数据解析的一致性及检索性能。
+## 📱 移动端适配计划 (Mobile Adaptation Strategy)
 
-## 执行步骤
+### 目标
+实现 "Write Once, Run Everywhere"。确保 Web 端在手机浏览器 (iOS Safari, Android Chrome) 上有一流的原生应用体验。
 
-### 阶段 1: 基础设施 (Foundation)
-1. **[DB]** 迁移 SQLite 结构，增加 FTS5 支持。
-2. **[Cache]** 实现 `ThumbnailCache` 类，支持磁盘读写。
+### 涉及代理 (Agents)
+| 代理 (Agent) | 职责 |
+|---|---|
+| **Mobile UX Designer** | 设计移动端交互流程（手势、抽屉式导航）。 |
+| **Frontend Specialist** | 实现响应式布局 (Responsive Layout)。 |
+| **Test Engineer** | 验证不同视口下的表现。 |
 
-### 阶段 2: 核心组件 (Core)
-1. **[UI]** 编写 `ImageModel` (QAbstractListModel) 代替现有列表。
-2. **[UI]** 重构 `ThumbnailList` 使用 `QListView`。
-3. **[Core]** 优化 `loader.py` 使其支持批量事务。
+### 核心变更 (Proposed Changes)
 
-### 阶段 3: 功能增强 (Polish)
-1. **[UI]** 实现 `ComparisonView` 的同步视角。
-2. **[UI]** 实现参数面板的“一键回填”逻辑。
+#### 1. 响应式布局 (Layout)
+- **桌面端**: 三栏布局 (左侧列表 | 中间视图 | 右侧参数)。
+- **移动端**: 单栏布局 + 底部导航栏/抽屉。
+  - **默认视图**: 图片网格 (ImageList)。
+  - **详情视图**: 点击图片后全屏覆盖 (ImageViewer)，支持手势关闭。
+  - **参数面板**: 通过底部 Sheet 或侧边抽屉唤起。
 
-## 验证计划
-- 扫描 1000+ 带元数据的图片目录，内存占用需低于 150MB。
-- 模糊搜索提示词响应时间 < 50ms。
+#### 2. 交互优化 (Interactions)
+- [ ] **Touch Actions**: 禁用不必要的双击缩放 (`touch-action: manipulation`)。
+- [ ] **Gestures**: 在查看大图时支持双指缩放 (Pinch-to-zoom) 和单指拖拽。
+- [ ] **Buttons**: 增大点击热区 (min 44px)。
+
+#### 3. 组件改造
+- `App.vue`: 引入 `useWindowSize` 或 CSS Media Queries 控制布局模式。
+- `ImageList.vue`: 手机端默认为 2 列或 1 列。
+- `InfoPanel.vue`: 手机端改为浮层 (Overlay/Sheet) 样式。
+- `ImageViewer.vue`: 增加关闭按钮 (Mobile only)，优化触摸事件。
+
+## ✅ 验证计划
+- 使用 Chrome DevTools 模拟 iPhone 12/14 Pro。
+- 检查横竖屏切换表现。
+
+---
+
+## 📅 执行顺序
+1.  **Meta Tag**: 确认 `viewport` 设置。
+2.  **App Framework**: 修改 CSS Grid/Flex 布局为响应式。
+3.  **Component Adapt**: 逐个调整组件样式。

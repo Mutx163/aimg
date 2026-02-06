@@ -4,6 +4,7 @@ import tailwindcss from '@tailwindcss/vite'
 
 // https://vitejs.dev/config/
 export default defineConfig({
+    base: '/',
     plugins: [
         vue(),
         tailwindcss(),
@@ -11,6 +12,7 @@ export default defineConfig({
     server: {
         host: '0.0.0.0', // Allow access from other devices (Phone/Tablet)
         port: 3000,
+        hmr: false, // Disable HMR to prevent debugger lag
         proxy: {
             '/api': {
                 target: 'http://127.0.0.1:8000',

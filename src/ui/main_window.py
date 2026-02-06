@@ -555,8 +555,10 @@ class MainWindow(QMainWindow):
         # 如果距离上次加载超过 300ms 且不处于扫描中，立即响应一次以保证手感
         if not self._is_scanning and (curr_time - self._last_selection_time > 0.3):
              self._sync_image_selection()
-        else:
-             # 否则，重置定时器，保证“最后一次”点击生效
+        elif not self._selection_timer.isActive():
+             # Throttle Logic: Only start timer if not already running.
+             # This ensures we process updates at regular intervals (defined by delay)
+             # instead of delaying indefinitely while scrolling fast.
              self._selection_timer.start(delay)
 
     def _sync_image_selection(self):

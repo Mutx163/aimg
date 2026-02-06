@@ -232,7 +232,7 @@ class ComfyClient(QObject):
             self.status_changed.emit(f"正在提交 {batch_count} 个任务...")
             
             for i in range(batch_count):
-                modified_workflow = self._randomize_seeds(workflow)
+                modified_workflow = ComfyClient.randomize_workflow_seeds(workflow)
                 self.send_prompt(modified_workflow)
         else:
             # 从历史记录获取
@@ -361,43 +361,38 @@ class ComfyClient(QObject):
                 print(f"[Comfy] 成功获取 {len(valid_models)} 个可用模型")
                 self.models_fetched.emit(valid_models)
             else:
-                print("[Comfy] 未解析到任何模型")
+                # print("[Comfy] 未解析到任何模型") # Suppress noise
+                pass
                 
         except Exception as e:
             print(f"[Comfy] 模型列表解析异常: {e}")
         finally:
             reply.deleteLater()
 
-    def _randomize_seeds(self, workflow: Any) -> Any:
+    @staticmethod
+    def randomize_workflow_seeds(workflow: Any) -> Any:
         """
         遍历workflow，将所有KSampler节点的seed随机化
         返回修改后的workflow副本
         支持字典格式和列表格式的workflow
         """
+        import json
         import random
         
         # 深拷贝
         workflow_copy = json.loads(json.dumps(workflow))
         
-        # ComfyUI的workflow可能是两种格式：
-        # 1. 字典格式: {node_id: {class_type: ..., inputs: {...}}, ...}
-        # 2. 列表格式: [{id: ..., class_type: ..., inputs: {...}}, ...]
-        
         if isinstance(workflow_copy, dict):
-            # 字典格式
             for node_id, node_data in workflow_copy.items():
-                self._randomize_node_seed(node_id, node_data)
+                ComfyClient._randomize_node_seed(node_id, node_data)
         elif isinstance(workflow_copy, list):
-            # 列表格式
             for node_data in workflow_copy:
                 node_id = node_data.get("id", "unknown")
-                self._randomize_node_seed(node_id, node_data)
-        else:
-            print(f"[Comfy] 警告: 未知的workflow格式: {type(workflow_copy)}")
-        
+                ComfyClient._randomize_node_seed(node_id, node_data)
         return workflow_copy
     
-    def _randomize_node_seed(self, node_id: Any, node_data: Dict[str, Any]) -> None:
+    @staticmethod
+    def _randomize_node_seed(node_id: Any, node_data: Dict[str, Any]) -> None:
         """随机化单个节点的seed"""
         import random
         class_type = node_data.get("class_type", "")
@@ -406,10 +401,8 @@ class ComfyClient(QObject):
             inputs = node_data.get("inputs", {})
             if "seed" in inputs:
                 # “超随机种子”实现：使用 OS 级真随机源，保持 18-20 位长度
-                # ComfyUI 最大支持范围约为 2^64-1 (18,446,744,073,709,551,615)
                 ultra_random_seed = random.SystemRandom().randint(10**17, 18446744073709551614)
                 inputs["seed"] = ultra_random_seed
-                # print(f"[Comfy] 已随机化节点 {node_id} ({class_type}) 的超随机seed: {ultra_random_seed}")
 
     # ========== 队列管理方法 ==========
     

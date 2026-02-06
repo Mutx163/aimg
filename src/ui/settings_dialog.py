@@ -77,6 +77,18 @@ class SettingsDialog(QDialog):
         btn_browse.clicked.connect(self._browse_comfy_root)
         comfy_root_layout.addWidget(btn_browse)
         form_layout.addRow("ComfyUI 目录:", comfy_root_row)
+
+        self.edit_comfy_run_path = QLineEdit()
+        self.edit_comfy_run_path.setPlaceholderText("例如: D:\\ComfyUI\\run_nvidia_gpu.bat")
+        self.edit_comfy_run_path.setText(self.settings.value("comfy_run_path", ""))
+        comfy_run_row = QWidget()
+        comfy_run_layout = QHBoxLayout(comfy_run_row)
+        comfy_run_layout.setContentsMargins(0, 0, 0, 0)
+        comfy_run_layout.addWidget(self.edit_comfy_run_path, 1)
+        btn_browse_run = QPushButton("浏览")
+        btn_browse_run.clicked.connect(self._browse_comfy_run_path)
+        comfy_run_layout.addWidget(btn_browse_run)
+        form_layout.addRow("ComfyUI 启动路径:", comfy_run_row)
         
         layout.addWidget(group_input)
         
@@ -107,6 +119,7 @@ class SettingsDialog(QDialog):
         self.settings.setValue("glm_api_key", self.edit_glm_api_key.text().strip())
         self.settings.setValue("comfy_address", self.edit_comfy_addr.text().strip())
         self.settings.setValue("comfy_root", self.edit_comfy_root.text().strip())
+        self.settings.setValue("comfy_run_path", self.edit_comfy_run_path.text().strip())
         
         self.accept()
 
@@ -117,3 +130,8 @@ class SettingsDialog(QDialog):
             parent = self.parent()
             if parent and hasattr(parent, "statusBar"):
                 parent.statusBar().showMessage(f"已选择 ComfyUI 目录: {path}", 3000)
+
+    def _browse_comfy_run_path(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择 ComfyUI 启动脚本", self.edit_comfy_run_path.text().strip() or "", "Executables (*.bat *.exe *.sh);;All Files (*)")
+        if path:
+            self.edit_comfy_run_path.setText(path)

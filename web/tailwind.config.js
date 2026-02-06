@@ -1,9 +1,9 @@
-export default {
+module.exports = {
     content: [
         "./index.html",
         "./src/**/*.{vue,js,ts,jsx,tsx}",
     ],
-    darkMode: 'selector', // or 'class'
+    darkMode: 'class',
     theme: {
         extend: {},
     },

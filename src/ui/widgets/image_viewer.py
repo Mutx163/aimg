@@ -1,6 +1,20 @@
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QPixmap, QWheelEvent, QColor, QBrush, QPainter
+from PyQt6.QtCore import Qt, pyqtSignal, QThread
+from PyQt6.QtGui import QPixmap, QWheelEvent, QColor, QBrush, QPainter, QImage
+
+class AsyncImageLoader(QThread):
+    """异步加载图片的线程"""
+    loaded = pyqtSignal(QImage, str) # image, path
+    
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+        
+    def run(self):
+        # 即使在线程中，QImage 加载也是比较快的，主要是解码大图耗时
+        image = QImage(self.path)
+        if not self.isInterruptionRequested():
+            self.loaded.emit(image, self.path)
 
 class ImageViewer(QGraphicsView):
     """
@@ -38,6 +52,9 @@ class ImageViewer(QGraphicsView):
         self._zoom_factor = 1.15
         self.auto_fit = True 
         self._is_syncing = False # 防止信号环路
+        
+        # 异步加载器
+        self._current_loader = None
 
     def set_background_color(self, color_str):
         """设置视图背景色"""
@@ -68,7 +85,14 @@ class ImageViewer(QGraphicsView):
         self.resetTransform()
 
     def load_image(self, file_path):
-        """加载显示图片"""
+        """加载显示图片 (异步)"""
+        # 取消当前的加载任务
+        if self._current_loader and self._current_loader.isRunning():
+            self._current_loader.requestInterruption()
+            self._current_loader.wait(50) # 等待一小会儿，避免僵尸线程，但不阻塞太久
+            self._current_loader.deleteLater()
+            self._current_loader = None
+            
         # 如果 pixmap_item 被意外删除（例如通过 scene.clear()），重新创建
         try:
             self.pixmap_item.isVisible()
@@ -77,14 +101,33 @@ class ImageViewer(QGraphicsView):
             self.pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
             self.scene.addItem(self.pixmap_item)
 
-        pixmap = QPixmap(file_path)
-        if pixmap.isNull():
+        # 启动新加载
+        self._current_loader = AsyncImageLoader(file_path)
+        self._current_loader.loaded.connect(self._on_image_loaded)
+        self._current_loader.start()
+        
+    def _on_image_loaded(self, image, path):
+        """异步加载完成回调"""
+        # 再次检查当前加载器是否匹配 (虽然我们在 load_image 里取消了旧的，但以防万一)
+        # 实际上因为每次 load_image 都会替换 _current_loader，
+        # 并 disconnect 信号 (如果对象被销毁)，这里基本安全。
+        # 为了极度严谨，可以检查 sender() == self._current_loader
+        
+        if image.isNull():
             return
             
+        pixmap = QPixmap.fromImage(image)
         self.pixmap_item.setPixmap(pixmap)
-        self.setSceneRect(self.pixmap_item.boundingRect()) # 强行限制场景大小与图片一致
+        self.setSceneRect(self.pixmap_item.boundingRect()) 
         if self.auto_fit:
             self.fit_to_window()
+        
+        # 清理
+        sender = self.sender()
+        if sender:
+            sender.deleteLater()
+        if sender == self._current_loader:
+            self._current_loader = None
 
     def fit_to_window(self):
         """适应窗口 (完整显示并居中)"""

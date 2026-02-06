@@ -10,6 +10,16 @@ class DatabaseManager:
     def __init__(self, db_path: str = "aimg_metadata.db") -> None:
         self.db_path = db_path
         self._init_db()
+        # 保持一个长连接，防止 WAL 文件在无操作时被频繁删除/重建导致的文件闪烁
+        self._keep_alive_conn = self._get_connection()
+
+    def _get_connection(self):
+        """获取数据库连接（带超时和优化配置）"""
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        # 启用 WAL 模式，显著提高并发性能（读写不互斥）
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
 
     def _init_db(self) -> None:
         """初始化数据库表结构"""
@@ -110,6 +120,70 @@ class DatabaseManager:
             conn.commit()
         
         conn.close()
+
+    def add_images_batch(self, batch: List[tuple]) -> None:
+        """批量插入图片元数据（高性能事务模式）"""
+        if not batch: return
+        
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            # 开启事务
+            cursor.execute("BEGIN TRANSACTION")
+            
+            for file_path, meta in batch:
+                file_path = file_path.replace("\\", "/")
+                params = meta.get('params', {})
+                tech_info = meta.get('tech_info', {})
+                loras = meta.get('loras', [])
+                file_mtime = os.path.getmtime(file_path) if os.path.exists(file_path) else 0
+                
+                cursor.execute('''
+                    INSERT OR REPLACE INTO images (
+                        file_path, file_name, prompt, negative_prompt, 
+                        seed, steps, sampler, scheduler, cfg_scale, 
+                        model_name, model_hash, tool, loras, tech_info, raw_metadata, file_mtime,
+                        width, height
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    file_path,
+                    os.path.basename(file_path),
+                    meta.get('prompt', ""),
+                    meta.get('negative_prompt', ""),
+                    str(params.get('Seed', params.get('seed', ""))),
+                    params.get('Steps', params.get('steps')),
+                    params.get('Sampler', params.get('sampler_name')),
+                    params.get('Scheduler', params.get('scheduler')),
+                    params.get('CFG scale', params.get('cfg')),
+                    params.get('Model', ""),
+                    params.get('Model hash', ""),
+                    meta.get('tool', "Unknown"),
+                    json.dumps(loras),
+                    json.dumps(tech_info),
+                    meta.get('raw', ""),
+                    file_mtime,
+                    params.get('width') or tech_info.get('width') or meta.get('width') or 0,
+                    params.get('height') or tech_info.get('height') or meta.get('height') or 0
+                ))
+                
+                # 更新 LoRA 关联表 (此处仍需处理关联，但保持在同一事务内)
+                img_id = cursor.lastrowid
+                cursor.execute('DELETE FROM image_loras WHERE image_id = ?', (img_id,))
+                for l in loras:
+                    name = l.split('(')[0].strip()
+                    weight = 1.0
+                    if '(' in l:
+                        try: weight = float(l.split('(')[1].rstrip(')'))
+                        except: pass
+                    cursor.execute('INSERT INTO image_loras (image_id, lora_name, weight) VALUES (?, ?, ?)',
+                                 (img_id, name, weight))
+            
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"[DB] Batch insertion failed: {e}")
+        finally:
+            conn.close()
 
     def add_image(self, file_path: str, meta: Dict[str, Any]) -> None:
         """插入或更新一张图片的元数据"""

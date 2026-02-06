@@ -195,15 +195,7 @@ class AIPromptOptimizer:
         if not image_b64:
             return False, "未获取到有效图片"
         try:
-            system_prompt = self.SYSTEM_PROMPT_IMAGE_TO_PROMPT
-            user_content = [
-                {"type": "text", "text": "请根据图片内容生成中文提示词"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image_b64}}
-            ]
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ]
+            messages = self.construct_image_prompt_messages(image_b64)
             result = self._call_glm_api(messages, stream_callback)
             result = self._strip_format_markers(result)
             return True, result
@@ -213,6 +205,19 @@ class AIPromptOptimizer:
             return False, "网络连接失败,请检查网络"
         except Exception as e:
             return False, f"图生文失败: {str(e)}"
+    
+    def construct_image_prompt_messages(self, image_b64: str) -> list:
+        """构建图生文的消息列表"""
+        system_prompt = self.SYSTEM_PROMPT_IMAGE_TO_PROMPT
+        user_content = [
+            {"type": "text", "text": "请根据图片内容生成中文提示词"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image_b64}}
+        ]
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ]
+
     
     def _call_glm_api(self, messages: list, stream_callback: Optional[callable] = None) -> str:
         """
