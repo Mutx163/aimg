@@ -27,6 +27,7 @@ ENV/
 # Project Specific Caches
 .thumbs/
 aimg_metadata.db
+web/.vue_build_fingerprint.json
 
 # IDEs
 .vscode/

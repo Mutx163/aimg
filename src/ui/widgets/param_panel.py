@@ -12,7 +12,6 @@ import json
 import base64
 import os
 from src.assets.default_workflows import DEFAULT_T2I_WORKFLOW
-from src.core.ai_prompt_optimizer import AIPromptOptimizer
 
 class LoraSelectorWidget(QWidget):
     selection_changed = pyqtSignal(str) # Emits new path
@@ -104,6 +103,7 @@ class AIWorker(QThread):
             if self.is_cancelled:
                 self.finished.emit(False, "已取消")
                 return
+            from src.core.ai_prompt_optimizer import AIPromptOptimizer
             optimizer = AIPromptOptimizer()
             
             def on_stream_callback(chunk):
@@ -143,6 +143,7 @@ class ImagePromptWorker(QThread):
         try:
             if self.is_cancelled:
                 return
+            from src.core.ai_prompt_optimizer import AIPromptOptimizer
             optimizer = AIPromptOptimizer()
             
             def on_stream_callback(chunk):

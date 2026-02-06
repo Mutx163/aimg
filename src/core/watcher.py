@@ -40,7 +40,7 @@ class FileWatcher(QObject):
         self.observer = Observer()
         self.event_handler = ImageEventHandler()
 
-    def start_monitoring(self, path):
+    def start_monitoring(self, path, recursive: bool = False):
         if not os.path.exists(path):
             return False
         
@@ -48,9 +48,9 @@ class FileWatcher(QObject):
         self.stop_monitoring()
         
         self.observer = Observer() #虽然init里有，但stop后需要重新init? Observer stop后不能restart
-        self.observer.schedule(self.event_handler, path, recursive=False)
+        self.observer.schedule(self.event_handler, path, recursive=recursive)
         self.observer.start()
-        print(f"开始监控文件夹: {path}")
+        print(f"开始监控文件夹: {path} (recursive={recursive})")
         return True
 
     def stop_monitoring(self):

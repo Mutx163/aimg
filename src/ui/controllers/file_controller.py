@@ -2,9 +2,6 @@ import os
 from PyQt6.QtCore import QObject, QTimer, Qt
 from PyQt6.QtWidgets import QMessageBox, QMainWindow
 
-from send2trash import send2trash
-from src.core.loader import ImageLoaderThread
-
 class FileController(QObject):
     """
     负责处理文件操作：加载文件夹、删除图片、监控新文件
@@ -16,6 +13,8 @@ class FileController(QObject):
 
     def load_folder(self, folder: str) -> None:
         """扫描文件夹并加载现有图片 (异步)"""
+        from src.core.loader import ImageLoaderThread
+
         self.main.thumbnail_list.clear_list()
         self.main.viewer.clear_view()
         self.main.param_panel.clear_info()
@@ -26,7 +25,8 @@ class FileController(QObject):
             self.loader_thread.stop()
             self.loader_thread.wait()
             
-        self.loader_thread = ImageLoaderThread(folder, self.main.db_manager, self.main.thumb_cache)
+        recursive = self.main.settings.value("scan_recursive", False, type=bool)
+        self.loader_thread = ImageLoaderThread(folder, self.main.db_manager, self.main.thumb_cache, recursive=recursive)
         self.loader_thread.image_thumb_ready.connect(self._on_loader_image_ready)
         self.loader_thread.image_found.connect(self._on_loader_image_found)
         self.loader_thread.finished_loading.connect(self._on_loader_finished)
@@ -94,6 +94,7 @@ class FileController(QObject):
         
         try:
             # FIX: Windows API (SHFileOperation) 对路径分隔符非常敏感
+            from send2trash import send2trash
             safe_path = os.path.normpath(os.path.abspath(path))
             send2trash(safe_path)
             

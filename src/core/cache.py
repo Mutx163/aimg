@@ -17,10 +17,11 @@ class ThumbnailCache:
 
     def _get_cache_path(self, file_path):
         """为文件生成唯一的缓存路径 (使用 MD5 避免路径冲突)"""
-        file_hash = hashlib.md5(file_path.encode('utf-8')).hexdigest()
+        norm_path = os.path.normpath(file_path).replace("\\", "/")
+        file_hash = hashlib.md5(norm_path.encode('utf-8')).hexdigest()
         # 记录 mtime 确保图片更新时缓存同步刷新
         try:
-            mtime = int(os.path.getmtime(file_path))
+            mtime = int(os.path.getmtime(norm_path))
         except:
             mtime = 0
             
@@ -47,7 +48,8 @@ class ThumbnailCache:
 
     def _cleanup_old_versions(self, file_path):
         """删除旧的缓存文件以节省空间"""
-        file_hash = hashlib.md5(file_path.encode('utf-8')).hexdigest()
+        norm_path = os.path.normpath(file_path).replace("\\", "/")
+        file_hash = hashlib.md5(norm_path.encode('utf-8')).hexdigest()
         try:
             for f in os.listdir(self.cache_dir):
                 if f.startswith(file_hash):

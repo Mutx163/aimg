@@ -54,8 +54,11 @@ class ComfyLauncher:
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             
             result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo)
+            if result.returncode != 0:
+                # 访问受限或命令失败时，不应阻止自动启动
+                return False
             # 如果没找到，输出通常包含 "INFO: No tasks..." 或者为空
-            if "INFO:" in result.stdout or not result.stdout.strip():
+            if "INFO:" in result.stdout or "ERROR:" in result.stdout or not result.stdout.strip():
                 return False
             # 如果找到了，输出会包含进程信息
             return True
@@ -84,8 +87,14 @@ class ComfyLauncher:
 
         # 2. 检查是否有正在启动中的窗口 (防止在启动过程中重复触发)
         if ComfyLauncher.check_window_exists("ComfyUI Console"):
-             print(f"[Launcher] 检测到 ComfyUI 控制台窗口已存在 (可能正在启动中)，跳过启动")
-             return
+            print(f"[Launcher] 检测到 ComfyUI 控制台窗口已存在 (可能正在启动中)，等待端口就绪...")
+            # 给已存在的窗口一点时间启动服务
+            for _ in range(6):
+                time.sleep(0.5)
+                if ComfyLauncher.is_port_open(host, port):
+                    print(f"[Launcher] ComfyUI 已在运行 (端口畅通)")
+                    return
+            print(f"[Launcher] 控制台窗口存在但端口未就绪，尝试重新启动...")
             
         if not run_path:
             print(f"[Launcher] 未在设置中配置 ComfyUI 启动路径，跳过自动启动")

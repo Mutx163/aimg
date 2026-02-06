@@ -19,11 +19,10 @@ class ImageScanner:
         高效扫描所有已配置的文件夹，发现新图片并索引。
         返回新增图片数量。
         """
-        # if self._is_scanning:
-        #     print("[Scanner] Scan already in progress, skipping.")
-        #     return 0
-            
         with self._lock:
+            if self._is_scanning:
+                # 避免重入扫描造成重复 IO 和锁竞争
+                return 0
             self._is_scanning = True
             
         try:

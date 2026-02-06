@@ -34,30 +34,37 @@ class SettingsDialog(QDialog):
         self.check_del_confirm = QCheckBox("删除文件时显示确认框")
         self.check_del_confirm.setChecked(self.settings.value("confirm_delete", True, type=bool))
         form_layout.addRow("", self.check_del_confirm)
+
+        # 包含子文件夹
+        self.check_include_subfolders = QCheckBox("包含子文件夹（监控+扫描）")
+        include_default = self.settings.value("watch_recursive", False, type=bool) or \
+                          self.settings.value("scan_recursive", False, type=bool)
+        self.check_include_subfolders.setChecked(include_default)
+        form_layout.addRow("", self.check_include_subfolders)
         
-        # AI提示词优化 - 配置
+        # AI 提示词优化 - 配置
         self.edit_ai_base_url = QLineEdit()
-        self.edit_ai_base_url.setPlaceholderText("例如: https://open.bigmodel.cn/api/paas/v4")
+        self.edit_ai_base_url.setPlaceholderText("例如: https://open.bigmodel.cn/api/paas/v4 或 https://api.openai.com/v1")
         self.edit_ai_base_url.setText(self.settings.value("ai_base_url", "https://open.bigmodel.cn/api/paas/v4"))
-        form_layout.addRow("AI API地址:", self.edit_ai_base_url)
+        form_layout.addRow("AI 接口地址:", self.edit_ai_base_url)
 
         self.edit_ai_model = QLineEdit()
-        self.edit_ai_model.setPlaceholderText("例如: glm-4.7-flash")
+        self.edit_ai_model.setPlaceholderText("例如: glm-4.7-flash / gpt-4o-mini")
         self.edit_ai_model.setText(self.settings.value("ai_model_name", "glm-4.7-flash"))
-        form_layout.addRow("AI模型名称:", self.edit_ai_model)
+        form_layout.addRow("AI 模型名称:", self.edit_ai_model)
 
         self.edit_glm_api_key = QLineEdit()
-        self.edit_glm_api_key.setPlaceholderText("输入 API Key")
+        self.edit_glm_api_key.setPlaceholderText("输入 API Key（兼容 OpenAI 风格）")
 
         self.edit_glm_api_key.setEchoMode(QLineEdit.EchoMode.Password)  # 密码模式
         self.edit_glm_api_key.setText(self.settings.value("glm_api_key", ""))
         
         # 添加说明标签
-        glm_help_label = QLabel('<a href="https://open.bigmodel.cn">免费获取API Key</a>')
+        glm_help_label = QLabel('支持多家兼容 OpenAI 的模型服务商（链接仅作示例）')
         glm_help_label.setOpenExternalLinks(True)
         glm_help_label.setStyleSheet("color: #8b5cf6; font-size: 10px;")
         
-        form_layout.addRow("GLM API Key:", self.edit_glm_api_key)
+        form_layout.addRow("API Key:", self.edit_glm_api_key)
         form_layout.addRow("", glm_help_label)
         
         # ComfyUI 设置
@@ -114,6 +121,9 @@ class SettingsDialog(QDialog):
         self.settings.setValue("wheel_action", wheel_action)
         self.settings.setValue("theme", theme)
         self.settings.setValue("confirm_delete", self.check_del_confirm.isChecked())
+        include_sub = self.check_include_subfolders.isChecked()
+        self.settings.setValue("watch_recursive", include_sub)
+        self.settings.setValue("scan_recursive", include_sub)
         self.settings.setValue("ai_base_url", self.edit_ai_base_url.text().strip())
         self.settings.setValue("ai_model_name", self.edit_ai_model.text().strip())
         self.settings.setValue("glm_api_key", self.edit_glm_api_key.text().strip())

@@ -302,7 +302,7 @@ class DatabaseManager:
                      model: Optional[str] = None, lora: Optional[str] = None, 
                      order_by: str = "time_desc") -> List[str]:
         """搜索图片，支持关键字、模型、LoRA、文件夹过滤和排序"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         # 排序逻辑映射 (使用 file_path 作为最终稳定键)
@@ -314,46 +314,7 @@ class DatabaseManager:
         }
         order_sql = order_map.get(order_by, 'i.file_mtime DESC, i.file_path DESC')
 
-        args = []
-        
-        # 基础查询，使用别名 i
-        if lora and lora != "ALL":
-            # 如果按 LoRA 筛选，必须 JOIN image_loras 表
-            query = "SELECT DISTINCT i.file_path FROM images i JOIN image_loras il ON i.id = il.image_id WHERE il.lora_name = ?"
-            args.append(lora)
-        else:
-            query = "SELECT i.file_path FROM images i WHERE 1=1"
-
-        if keyword:
-            # 尝试使用 FTS5 (需要小心别名)
-            # FTS5 表通常包含 rowid, prompt, file_name
-            # 我们需要查找符合 keyword 的 rowid，然后在 images 表中过滤
-            try:
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='images_fts'")
-                if cursor.fetchone():
-                    # FTS5 语法：images_fts MATCH 'keyword'
-                    # 注意：match 参数不能直接用 ? params 绑定到 match 表达式内部，但可以用字符串拼接或者 ? 绑定整个表达式
-                    # 更好的写法：WHERE images_fts MATCH ? -> args: keyword
-                    # 这里我们需要连接 images i
-                    query += " AND i.id IN (SELECT rowid FROM images_fts WHERE images_fts MATCH ?)"
-                    args.append(f'"{keyword}"') # FTS5 建议用引号包裹短语
-                else:
-                    query += " AND (i.prompt LIKE ? OR i.file_name LIKE ?)"
-                    args.extend([f"%{keyword}%", f"%{keyword}%"])
-            except:
-                query += " AND (i.prompt LIKE ? OR i.file_name LIKE ?)"
-                args.extend([f"%{keyword}%", f"%{keyword}%"])
-            
-        if folder_path:
-            # 统一路径分隔符 (数据库中推荐存 /, 但为了兼容性，我们确保查询时也一致)
-            norm_folder = folder_path.replace("\\", "/")
-            query += " AND i.file_path LIKE ?"
-            args.append(f"{norm_folder}%")
-
-        if model and model != "ALL":
-            query += " AND i.model_name = ?"
-            args.append(model)
-        
+        query, args = self._build_search_base_query(cursor, keyword, folder_path, model, lora)
         query += f" ORDER BY {order_sql}"
         
         try:
@@ -368,9 +329,105 @@ class DatabaseManager:
         conn.close()
         return results
 
+    def search_images_page(self, keyword: str = "", folder_path: Optional[str] = None,
+                           model: Optional[str] = None, lora: Optional[str] = None,
+                           order_by: str = "time_desc", offset: int = 0, limit: int = 30) -> List[str]:
+        """分页搜索图片，避免一次性加载全部路径"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        order_map = {
+            "time_desc": "i.file_mtime DESC, i.file_path ASC",
+            "time_asc": "i.file_mtime ASC, i.file_path ASC",
+            "name_asc": "i.file_name ASC, i.file_path ASC",
+            "name_desc": "i.file_name DESC, i.file_path DESC"
+        }
+        order_sql = order_map.get(order_by, 'i.file_mtime DESC, i.file_path DESC')
+
+        query, args = self._build_search_base_query(cursor, keyword, folder_path, model, lora)
+        query += f" ORDER BY {order_sql} LIMIT ? OFFSET ?"
+        args.extend([limit, offset])
+
+        try:
+            cursor.execute(query, args)
+            results = [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"[DB] Search Page Error: {e}\nQuery: {query}\nArgs: {args}")
+            results = []
+        finally:
+            conn.close()
+        return results
+
+    def count_images(self, keyword: str = "", folder_path: Optional[str] = None,
+                     model: Optional[str] = None, lora: Optional[str] = None) -> int:
+        """统计搜索结果总数（用于分页）"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        query, args = self._build_search_base_query(cursor, keyword, folder_path, model, lora)
+        count_query = f"SELECT COUNT(*) FROM ({query}) AS sub"
+        try:
+            cursor.execute(count_query, args)
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+        except Exception as e:
+            print(f"[DB] Count Error: {e}\nQuery: {count_query}\nArgs: {args}")
+            return 0
+        finally:
+            conn.close()
+
+    def delete_images(self, file_paths: List[str]) -> None:
+        """批量删除图片记录（含级联 LoRA）"""
+        if not file_paths:
+            return
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            placeholders = ",".join(["?"] * len(file_paths))
+            cursor.execute(f"DELETE FROM images WHERE file_path IN ({placeholders})", file_paths)
+            conn.commit()
+        except Exception as e:
+            print(f"[DB] Batch delete failed: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def _build_search_base_query(self, cursor, keyword: str, folder_path: Optional[str],
+                                 model: Optional[str], lora: Optional[str]) -> tuple[str, list]:
+        args = []
+
+        if lora and lora != "ALL":
+            query = "SELECT DISTINCT i.file_path FROM images i JOIN image_loras il ON i.id = il.image_id WHERE il.lora_name = ?"
+            args.append(lora)
+        else:
+            query = "SELECT i.file_path FROM images i WHERE 1=1"
+
+        if keyword:
+            try:
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='images_fts'")
+                if cursor.fetchone():
+                    query += " AND i.id IN (SELECT rowid FROM images_fts WHERE images_fts MATCH ?)"
+                    args.append(f'"{keyword}"')
+                else:
+                    query += " AND (i.prompt LIKE ? OR i.file_name LIKE ?)"
+                    args.extend([f"%{keyword}%", f"%{keyword}%"])
+            except:
+                query += " AND (i.prompt LIKE ? OR i.file_name LIKE ?)"
+                args.extend([f"%{keyword}%", f"%{keyword}%"])
+
+        if folder_path:
+            norm_folder = folder_path.replace("\\", "/")
+            query += " AND i.file_path LIKE ?"
+            args.append(f"{norm_folder}%")
+
+        if model and model != "ALL":
+            query += " AND i.model_name = ?"
+            args.append(model)
+
+        return query, args
+
     def get_unique_folders(self) -> List[str]:
         """获取所有已索引图片所属的根目录列表"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         # 提取路径中最后一个斜杠前的部分作为文件夹
         # 在 SQLite 中处理路径字符串较复杂，这里简单使用 DISTINCT folder_path 的逻辑
@@ -385,7 +442,7 @@ class DatabaseManager:
 
     def get_unique_models(self, folder_path: Optional[str] = None) -> List[tuple]:
         """获取已索引的所有 Checkpoint 模型及其计数"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         query = "SELECT model_name, COUNT(*) as count FROM images WHERE model_name != ''"
         args = []
@@ -403,7 +460,7 @@ class DatabaseManager:
         获取已索引的所有 LoRA 网络及其计数。
         如果指定了 model_filter，则只返回在该模型生成的图片中使用过的 LoRA。
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         args = []
@@ -438,7 +495,7 @@ class DatabaseManager:
     
     def get_unique_resolutions(self, folder_path: Optional[str] = None) -> List[tuple]:
         """获取所有使用过的分辨率"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         args = []
         
@@ -472,7 +529,7 @@ class DatabaseManager:
     
     def get_unique_samplers(self, folder_path: Optional[str] = None) -> List[str]:
         """获取所有使用过的采样器名称"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         args = []
         
@@ -498,7 +555,7 @@ class DatabaseManager:
 
     def get_unique_schedulers(self, folder_path: Optional[str] = None) -> List[str]:
         """获取所有使用过的调度器名称"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         args = []
         
@@ -524,7 +581,7 @@ class DatabaseManager:
 
     def get_image_info(self, file_path: str) -> Dict[str, Any]:
         """获取单张图片的详细信息"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         cursor.execute('''
             SELECT width, height, model_name, seed, steps, sampler, scheduler, cfg_scale, prompt, negative_prompt, loras, tech_info
@@ -569,7 +626,7 @@ class DatabaseManager:
         if not file_paths:
             return {}
             
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         # 动态构建 SQL，使用 parameters preventing injection
@@ -624,3 +681,22 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute("SELECT file_path FROM images")
             return {row[0] for row in cursor.fetchall()}
+
+    def get_file_mtime_map(self, folder_path: Optional[str] = None) -> Dict[str, float]:
+        """获取文件路径到 mtime 的映射，用于快速判断是否需要重新解析"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        args = []
+        query = "SELECT file_path, file_mtime FROM images WHERE 1=1"
+        if folder_path:
+            norm_folder = folder_path.replace("\\", "/")
+            query += " AND file_path LIKE ?"
+            args.append(f"{norm_folder}%")
+        try:
+            cursor.execute(query, args)
+            return {row[0]: row[1] for row in cursor.fetchall()}
+        except Exception as e:
+            print(f"[DB] mtime map error: {e}")
+            return {}
+        finally:
+            conn.close()

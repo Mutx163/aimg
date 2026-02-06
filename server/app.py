@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 import uuid
 import threading
 import time
-import requests as py_requests
+import httpx
 
 # Removed sys.path hack. Expecting PYTHONPATH to be set correctly by launcher.
 
@@ -186,15 +186,38 @@ async def get_images(
     model: Optional[str] = None, lora: Optional[str] = None, 
     sort: str = "time_desc", page: int = 1, page_size: int = 30
 ):
-    all_paths = db.search_images(keyword=keyword, folder_path=folder, model=model, lora=lora, order_by=sort)
+    total = db.count_images(keyword=keyword, folder_path=folder, model=model, lora=lora)
     start_idx = (page - 1) * page_size
     valid_images = []
-    current_idx = start_idx
+
+    # Fetch one page; if all entries are missing, purge and retry a few times
     target_paths = []
-    while len(target_paths) < page_size and current_idx < len(all_paths):
-        path = all_paths[current_idx]
-        if os.path.exists(path): target_paths.append(path)
-        current_idx += 1
+    attempts = 0
+    while attempts < 3:
+        paths = db.search_images_page(
+            keyword=keyword, folder_path=folder, model=model, lora=lora,
+            order_by=sort, offset=start_idx, limit=page_size
+        )
+        if not paths:
+            target_paths = []
+            break
+        missing = []
+        target_paths = []
+        for path in paths:
+            if os.path.exists(os.path.normpath(path)):
+                target_paths.append(path)
+            else:
+                missing.append(path)
+
+        if missing:
+            db.delete_images(missing)
+            total = max(0, total - len(missing))
+            if target_paths:
+                break
+            attempts += 1
+            continue
+        break
+
     batch_info = db.get_images_batch_info(target_paths)
     for path in target_paths:
         info = batch_info.get(path, {})
@@ -204,7 +227,8 @@ async def get_images(
             "width": info.get('width', 0) or 0,
             "height": info.get('height', 0) or 0,
         })
-    return {"total": len(all_paths), "page": page, "page_size": page_size, "images": valid_images, "has_more": current_idx < len(all_paths)}
+    has_more = (start_idx + page_size) < total
+    return {"total": total, "page": page, "page_size": page_size, "images": valid_images, "has_more": has_more}
 
 @app.get("/api/image/raw")
 async def get_raw_image(path: str):
@@ -256,13 +280,14 @@ async def get_comfy_samplers_schedulers():
     """Fetch real-time supported samplers and schedulers from ComfyUI, with DB fallback."""
     try:
         # Try to get from KSampler node info
-        resp = py_requests.get(f"http://{COMFY_ADDRESS}/object_info/KSampler", timeout=2)
-        if resp.status_code == 200:
-            data = resp.json()
-            input_req = data.get("KSampler", {}).get("input", {}).get("required", {})
-            samplers = input_req.get("sampler_name", [[]])[0]
-            schedulers = input_req.get("scheduler", [[]])[0]
-            return {"samplers": samplers, "schedulers": schedulers}
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(f"http://{COMFY_ADDRESS}/object_info/KSampler")
+            if resp.status_code == 200:
+                data = resp.json()
+                input_req = data.get("KSampler", {}).get("input", {}).get("required", {})
+                samplers = input_req.get("sampler_name", [[]])[0]
+                schedulers = input_req.get("scheduler", [[]])[0]
+                return {"samplers": samplers, "schedulers": schedulers}
     except Exception:
         pass
     
@@ -275,8 +300,9 @@ async def get_comfy_samplers_schedulers():
 @app.get("/api/comfy/queue")
 async def get_full_queue():
     try:
-        queue_resp = py_requests.get(f"http://{COMFY_ADDRESS}/queue", timeout=2)
-        queue_data = queue_resp.json()
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            queue_resp = await client.get(f"http://{COMFY_ADDRESS}/queue")
+            queue_data = queue_resp.json()
         pending_tasks = []
         running_items = queue_data.get("queue_running", [])
         pending_items = queue_data.get("queue_pending", [])
@@ -303,8 +329,9 @@ async def get_full_queue():
 @app.post("/api/comfy/interrupt")
 async def interrupt_task():
     try:
-        resp = py_requests.post(f"http://{COMFY_ADDRESS}/interrupt", timeout=5)
-        return {"success": resp.status_code == 200}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(f"http://{COMFY_ADDRESS}/interrupt")
+            return {"success": resp.status_code == 200}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/comfy/cancel_task")
@@ -312,8 +339,9 @@ async def cancel_task(data: Dict[str, Any] = Body(...)):
     prompt_id = data.get("prompt_id")
     try:
         payload = {"delete": [prompt_id]}
-        resp = py_requests.post(f"http://{COMFY_ADDRESS}/queue", json=payload, timeout=5)
-        return {"success": resp.status_code == 200}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(f"http://{COMFY_ADDRESS}/queue", json=payload)
+            return {"success": resp.status_code == 200}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 from src.core.comfy_client import ComfyClient
@@ -365,9 +393,10 @@ async def generate_image(req: GenerateRequest):
         
         # 使用统一的 CLIENT_ID 提交
         p = {"prompt": wf, "client_id": CLIENT_ID}
-        resp = py_requests.post(f"http://{COMFY_ADDRESS}/prompt", json=p, timeout=5)
-        if resp.status_code == 200: return resp.json()
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(f"http://{COMFY_ADDRESS}/prompt", json=p)
+            if resp.status_code == 200: return resp.json()
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
     except Exception as e: 
         import traceback
         traceback.print_exc()
@@ -453,11 +482,7 @@ async def delete_image(path: str):
         safe_path = validate_path_security(path)
         if os.path.exists(safe_path): send2trash(safe_path)
         db_path = safe_path.replace("\\", "/")
-        import sqlite3
-        conn = sqlite3.connect(db.db_path)
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.cursor().execute("DELETE FROM images WHERE file_path = ?", (db_path,))
-        conn.commit(); conn.close()
+        db.delete_images([db_path])
         return {"success": True}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 

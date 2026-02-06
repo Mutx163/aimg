@@ -14,11 +14,12 @@ class ImageLoaderThread(QThread):
     image_thumb_ready = pyqtSignal(str, QImage) # 发送路径和预生成的缩略图
     finished_loading = pyqtSignal() # 全部扫描完成
 
-    def __init__(self, folder_path, db_manager=None, thumb_cache=None):
+    def __init__(self, folder_path, db_manager=None, thumb_cache=None, recursive: bool = False):
         super().__init__()
         self.folder_path = folder_path
         self.db_manager = db_manager
         self.thumb_cache = thumb_cache or ThumbnailCache()
+        self.recursive = recursive
         self._is_running = True
 
     def run(self):
@@ -27,16 +28,30 @@ class ImageLoaderThread(QThread):
         
         extensions = {'.png', '.jpg', '.jpeg', '.webp'}
         files = []
+        known_mtimes = {}
+        if self.db_manager:
+            known_mtimes = self.db_manager.get_file_mtime_map(self.folder_path)
         
         try:
-            with os.scandir(self.folder_path) as it:
-                for entry in it:
+            if self.recursive:
+                for root, _, filenames in os.walk(self.folder_path):
                     if not self._is_running:
                         break
-                    if entry.is_file():
-                        _, ext = os.path.splitext(entry.name)
+                    for name in filenames:
+                        if not self._is_running:
+                            break
+                        _, ext = os.path.splitext(name)
                         if ext.lower() in extensions:
-                            files.append(entry.path)
+                            files.append(os.path.join(root, name))
+            else:
+                with os.scandir(self.folder_path) as it:
+                    for entry in it:
+                        if not self._is_running:
+                            break
+                        if entry.is_file():
+                            _, ext = os.path.splitext(entry.name)
+                            if ext.lower() in extensions:
+                                files.append(entry.path)
             
             if self._is_running:
                 files.sort(key=lambda x: (-os.path.getmtime(x), os.path.basename(x)))
@@ -61,10 +76,16 @@ class ImageLoaderThread(QThread):
                         
                     # 2. 解析并记录到数据库
                     if self.db_manager:
-                        # TODO: 这里可以优化为批量提交
-                        meta = MetadataParser.parse_image(f)
-                        if meta:
-                            self.db_manager.add_image(f, meta)
+                        # 如果 mtime 未变化，跳过解析以加速加载
+                        norm_path = os.path.normpath(f).replace("\\", "/")
+                        current_mtime = os.path.getmtime(f) if os.path.exists(f) else 0
+                        if known_mtimes.get(norm_path) != current_mtime:
+                            # TODO: 这里可以优化为批量提交
+                            meta = MetadataParser.parse_image(f)
+                            if meta:
+                                self.db_manager.add_image(f, meta)
+                            # 更新本地缓存，避免同次扫描重复解析
+                            known_mtimes[norm_path] = current_mtime
 
                     if thumb:
                         self.image_thumb_ready.emit(f, thumb)

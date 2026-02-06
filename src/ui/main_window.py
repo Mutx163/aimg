@@ -4,27 +4,26 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QStatusBar, QLineEdit, QLabel, QTabWidget, QStackedWidget, 
                              QFrame, QComboBox, QPushButton, QAbstractSpinBox, QTextEdit, QApplication,
                              QProgressBar, QSizePolicy)
-from PyQt6.QtCore import Qt, QSize, QSettings, QTimer, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QSettings, QTimer, QThread, QProcess, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QImage
 import time
 import os
-from send2trash import send2trash
+import webbrowser
 
 from src.core.watcher import FileWatcher
-from src.core.loader import ImageLoaderThread
 from src.core.database import DatabaseManager
 from src.ui.widgets.image_viewer import ImageViewer
 from src.ui.widgets.thumbnail_list import ThumbnailList
 from src.ui.widgets.param_panel import ParameterPanel
 from src.ui.widgets.model_explorer import ModelExplorer
 from src.ui.widgets.comparison_view import ComparisonView
-from src.core.metadata import MetadataParser
 from src.core.comfy_client import ComfyClient
 from src.ui.settings_dialog import SettingsDialog
 from src.core.cache import ThumbnailCache
 from src.ui.controllers.file_controller import FileController
 from src.ui.controllers.search_controller import SearchController
 from src.ui.dialogs.image_gallery_dialog import ImageGalleryDialog
+from src.services.web_server_service import WebServerService
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -60,6 +59,13 @@ class MainWindow(QMainWindow):
         # 控制器初始化
         self.search_controller = SearchController(self)
         self.file_controller = FileController(self)
+
+        # Web 服务控制（按需启动）
+        self.web_service = WebServerService()
+        self.web_service.service_ready.connect(self._on_web_service_ready)
+        self.web_service.service_stopped.connect(self._on_web_service_stopped)
+        self.web_service.log_message.connect(self._on_web_service_log)
+        self._web_last_url = None
         
         # 连接监控信号 (需在控制器初始化后)
         self.watcher.get_signal().connect(lambda p: self.file_controller.on_new_image_detected(p))
@@ -126,24 +132,31 @@ class MainWindow(QMainWindow):
         self._last_selection_time = 0
 
         
-        # 自动加载上次的文件夹
+        # 将恢复流程延后到事件循环启动后，优先显示首屏。
+        QTimer.singleShot(0, self._restore_last_session)
+
+    def _restore_last_session(self):
+        """在首屏显示后恢复上次文件夹与相关状态。"""
+        # 如果用户已主动选择过文件夹，则跳过自动恢复。
+        if self.current_folder:
+            return
+
         last_folder = self.settings.value("last_folder")
-        if last_folder and os.path.exists(last_folder):
-            self.current_folder = last_folder
-            self.file_controller.load_folder(last_folder)
-            
-            # 从数据库加载历史分辨率并更新到param_panel
-            self._load_historical_resolutions()
-            
-            # 从数据库加载历史采样器并更新到param_panel
-            self._load_historical_samplers()
-            
-            # 从数据库加载历史调度器并更新到param_panel
-            self._load_historical_schedulers()
-            
-            # 启动监控
-            if self.watcher.start_monitoring(last_folder):
-                self.statusBar().showMessage(f"正在监控(上次位置): {last_folder}")
+        if not (last_folder and os.path.exists(last_folder)):
+            return
+
+        self.current_folder = last_folder
+        self.file_controller.load_folder(last_folder)
+
+        # 这些查询可能较慢，统一放在首屏之后执行。
+        self._load_historical_resolutions()
+        self._load_historical_samplers()
+        self._load_historical_schedulers()
+
+        watch_recursive = self.settings.value("watch_recursive", False, type=bool)
+        if self.watcher.start_monitoring(last_folder, recursive=watch_recursive):
+            mode = "递归" if watch_recursive else "非递归"
+            self.statusBar().showMessage(f"正在监控(上次位置): {last_folder} ({mode})")
 
 
 
@@ -216,6 +229,11 @@ class MainWindow(QMainWindow):
         action_settings = QAction("设置", self)
         action_settings.triggered.connect(self.open_settings)
         toolbar.addAction(action_settings)
+
+        toolbar.addSeparator()
+        self.action_web = QAction("启动 Web", self)
+        self.action_web.triggered.connect(self.toggle_web_service)
+        toolbar.addAction(self.action_web)
         
         self.addToolBar(toolbar)
         
@@ -470,8 +488,10 @@ class MainWindow(QMainWindow):
             self.file_controller.load_folder(folder)
             
             # 启动监控
-            if self.watcher.start_monitoring(folder):
-                self.statusBar().showMessage(f"正在监控: {folder}")
+            watch_recursive = self.settings.value("watch_recursive", False, type=bool)
+            if self.watcher.start_monitoring(folder, recursive=watch_recursive):
+                mode = "递归" if watch_recursive else "非递归"
+                self.statusBar().showMessage(f"正在监控: {folder} ({mode})")
             else:
                 self.statusBar().showMessage(f"监控失败: {folder}")
 
@@ -579,6 +599,7 @@ class MainWindow(QMainWindow):
             self._on_zoom_changed(self.zoom_combo.currentIndex())
         
         # 3. 解析并显示参数 (优化：如果是扫描阶段，参数更新可以更慢)
+        from src.core.metadata import MetadataParser
         meta = MetadataParser.parse_image(path)
         self.param_panel.update_info(meta)
         
@@ -626,6 +647,7 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self)
         old_addr = self.settings.value("comfy_address", "127.0.0.1:8188")
         old_root = self.settings.value("comfy_root", "")
+        old_watch_recursive = self.settings.value("watch_recursive", False, type=bool)
         if dlg.exec():
             # 重新应用主题以响应设置变化
             new_addr = self.settings.value("comfy_address", "127.0.0.1:8188")
@@ -639,6 +661,13 @@ class MainWindow(QMainWindow):
                 if new_root:
                     self.statusBar().showMessage(f"ComfyUI 目录已更新: {new_root}", 3000)
             self.apply_theme()
+            
+            new_watch_recursive = self.settings.value("watch_recursive", False, type=bool)
+            if new_watch_recursive != old_watch_recursive and self.current_folder:
+                self.watcher.stop_monitoring()
+                if self.watcher.start_monitoring(self.current_folder, recursive=new_watch_recursive):
+                    mode = "递归" if new_watch_recursive else "非递归"
+                    self.statusBar().showMessage(f"监控模式已更新: {mode}", 3000)
 
     def _poll_logs(self):
         """定时轮询param_panel的日志列表并更新UI"""
@@ -1071,6 +1100,42 @@ class MainWindow(QMainWindow):
             self.settings.setValue("sort_by", sort_by)
             self.search_controller.perform_search()
 
+    # --- Web 服务控制 ---
+    def _is_web_running(self) -> bool:
+        return bool(self.web_service and self.web_service.process and
+                    self.web_service.process.state() != QProcess.ProcessState.NotRunning)
+
+    def toggle_web_service(self):
+        """启动/停止 Web 服务"""
+        if self._is_web_running():
+            self.statusBar().showMessage("正在停止 Web 服务...")
+            self.web_service.stop_server()
+        else:
+            self.statusBar().showMessage("正在启动 Web 服务...")
+            try:
+                self.web_service.start_server()
+            except Exception as e:
+                self.statusBar().showMessage(f"Web 服务启动失败: {e}", 5000)
+
+    def _on_web_service_ready(self, url: str):
+        self._web_last_url = url
+        if hasattr(self, 'action_web'):
+            self.action_web.setText("停止 Web")
+        self.statusBar().showMessage(f"Web 服务已启动: {url}", 5000)
+
+        # 默认打开本机地址
+        local_url = f"http://127.0.0.1:{self.web_service.port}"
+        webbrowser.open(local_url)
+
+    def _on_web_service_stopped(self):
+        if hasattr(self, 'action_web'):
+            self.action_web.setText("启动 Web")
+        self.statusBar().showMessage("Web 服务已停止", 5000)
+
+    def _on_web_service_log(self, msg: str):
+        # 控制台输出，避免 UI 过于频繁刷屏
+        print(msg)
+
     def on_selection_changed(self, selected, deselected):
         """当选择项改变时（用于对比模式自动触发）"""
         if hasattr(self, 'action_compare') and self.action_compare.isChecked():
@@ -1245,6 +1310,9 @@ class MainWindow(QMainWindow):
             if self.comfy_client.reconnect_timer.isActive():
                 self.comfy_client.reconnect_timer.stop()
             self.comfy_client.ws.close()
+
+        if hasattr(self, "web_service"):
+            self.web_service.stop_server()
 
         # 保存窗口几何形状（位置和大小）
         self.settings.setValue("window/geometry", self.saveGeometry())
