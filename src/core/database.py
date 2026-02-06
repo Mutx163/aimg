@@ -16,6 +16,7 @@ class DatabaseManager:
     def _get_connection(self):
         """获取数据库连接（带超时和优化配置）"""
         conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.execute("PRAGMA foreign_keys=ON")
         # 启用 WAL 模式，显著提高并发性能（读写不互斥）
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -24,6 +25,7 @@ class DatabaseManager:
     def _init_db(self) -> None:
         """初始化数据库表结构"""
         conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA foreign_keys=ON")
         cursor = conn.cursor()
         
         # 1. 图片主表
@@ -130,7 +132,34 @@ class DatabaseManager:
         try:
             # 开启事务
             cursor.execute("BEGIN TRANSACTION")
-            
+
+            upsert_sql = '''
+                INSERT INTO images (
+                    file_path, file_name, prompt, negative_prompt, 
+                    seed, steps, sampler, scheduler, cfg_scale, 
+                    model_name, model_hash, tool, loras, tech_info, raw_metadata, file_mtime,
+                    width, height
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(file_path) DO UPDATE SET
+                    file_name=excluded.file_name,
+                    prompt=excluded.prompt,
+                    negative_prompt=excluded.negative_prompt,
+                    seed=excluded.seed,
+                    steps=excluded.steps,
+                    sampler=excluded.sampler,
+                    scheduler=excluded.scheduler,
+                    cfg_scale=excluded.cfg_scale,
+                    model_name=excluded.model_name,
+                    model_hash=excluded.model_hash,
+                    tool=excluded.tool,
+                    loras=excluded.loras,
+                    tech_info=excluded.tech_info,
+                    raw_metadata=excluded.raw_metadata,
+                    file_mtime=excluded.file_mtime,
+                    width=excluded.width,
+                    height=excluded.height
+            '''
+
             for file_path, meta in batch:
                 file_path = file_path.replace("\\", "/")
                 params = meta.get('params', {})
@@ -138,14 +167,7 @@ class DatabaseManager:
                 loras = meta.get('loras', [])
                 file_mtime = os.path.getmtime(file_path) if os.path.exists(file_path) else 0
                 
-                cursor.execute('''
-                    INSERT OR REPLACE INTO images (
-                        file_path, file_name, prompt, negative_prompt, 
-                        seed, steps, sampler, scheduler, cfg_scale, 
-                        model_name, model_hash, tool, loras, tech_info, raw_metadata, file_mtime,
-                        width, height
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
+                cursor.execute(upsert_sql, (
                     file_path,
                     os.path.basename(file_path),
                     meta.get('prompt', ""),
@@ -167,7 +189,11 @@ class DatabaseManager:
                 ))
                 
                 # 更新 LoRA 关联表 (此处仍需处理关联，但保持在同一事务内)
-                img_id = cursor.lastrowid
+                cursor.execute("SELECT id FROM images WHERE file_path = ?", (file_path,))
+                row = cursor.fetchone()
+                if not row:
+                    continue
+                img_id = row[0]
                 cursor.execute('DELETE FROM image_loras WHERE image_id = ?', (img_id,))
                 for l in loras:
                     name = l.split('(')[0].strip()
@@ -192,7 +218,7 @@ class DatabaseManager:
         # 统一路径分隔符，防止 F:\... 和 F:/... 重复
         file_path = file_path.replace("\\", "/")
         
-        conn = sqlite3.connect(self.db_path)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         params = meta.get('params', {})
@@ -203,12 +229,30 @@ class DatabaseManager:
         
         try:
             cursor.execute('''
-                INSERT OR REPLACE INTO images (
+                INSERT INTO images (
                     file_path, file_name, prompt, negative_prompt, 
                     seed, steps, sampler, scheduler, cfg_scale, 
                     model_name, model_hash, tool, loras, tech_info, raw_metadata, file_mtime,
                     width, height
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(file_path) DO UPDATE SET
+                    file_name=excluded.file_name,
+                    prompt=excluded.prompt,
+                    negative_prompt=excluded.negative_prompt,
+                    seed=excluded.seed,
+                    steps=excluded.steps,
+                    sampler=excluded.sampler,
+                    scheduler=excluded.scheduler,
+                    cfg_scale=excluded.cfg_scale,
+                    model_name=excluded.model_name,
+                    model_hash=excluded.model_hash,
+                    tool=excluded.tool,
+                    loras=excluded.loras,
+                    tech_info=excluded.tech_info,
+                    raw_metadata=excluded.raw_metadata,
+                    file_mtime=excluded.file_mtime,
+                    width=excluded.width,
+                    height=excluded.height
             ''', (
                 file_path,
                 os.path.basename(file_path),
@@ -231,7 +275,11 @@ class DatabaseManager:
             ))
             
             # 获取 ID 以更新 LoRA 表
-            img_id = cursor.lastrowid
+            cursor.execute("SELECT id FROM images WHERE file_path = ?", (file_path,))
+            row = cursor.fetchone()
+            if not row:
+                return
+            img_id = row[0]
             cursor.execute('DELETE FROM image_loras WHERE image_id = ?', (img_id,))
             for l in loras:
                 # 尝试解析 "LoRA Name (Weight)"

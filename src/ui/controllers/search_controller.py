@@ -113,12 +113,12 @@ class SearchController(QObject):
             import sqlite3
             conn = sqlite3.connect(self.main.db_manager.db_path)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA foreign_keys = ON")
             cursor.execute("DELETE FROM images WHERE file_path = ?", (path,))
             # 级联删除 image_loras 会由 FK 自动处理 (如果开启了 PRAGMA foreign_keys = ON)
             # 稳妥起见，我们可能需要手动删，或者信任 DB 结构
             # 我们的 create table 写了 ON DELETE CASCADE，但 sqlite 默认不开启 FK 支持
             # 显式开启
-            cursor.execute("PRAGMA foreign_keys = ON")
             conn.commit()
             conn.close()
         except Exception as e:

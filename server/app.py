@@ -137,11 +137,47 @@ scanner = ImageScanner(db)
 
 # --- Core Logic ---
 
-def validate_path_security(path: str):
-    normalized_path = os.path.normpath(path).replace("\\", "/")
-    info = db.get_image_info(normalized_path)
-    if not info:
-         raise HTTPException(status_code=403, detail="Access Denied: File not indexed.")
+ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+
+def _normalize_abs_path(path: str) -> str:
+    return os.path.normpath(os.path.abspath(path))
+
+def _is_within(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([path, root]) == os.path.commonpath([root])
+    except ValueError:
+        # Different drives on Windows
+        return False
+
+def _get_allowed_roots() -> List[str]:
+    roots = []
+    for folder in db.get_unique_folders():
+        if folder and os.path.exists(folder):
+            roots.append(_normalize_abs_path(folder))
+    return roots
+
+def validate_path_security(path: str, require_indexed: bool = True) -> str:
+    if not path:
+        raise HTTPException(status_code=400, detail="Missing path.")
+
+    normalized_path = _normalize_abs_path(path)
+    _, ext = os.path.splitext(normalized_path)
+    if ext.lower() not in ALLOWED_IMAGE_EXTS:
+        raise HTTPException(status_code=403, detail="Access Denied: Unsupported file type.")
+
+    allowed_roots = _get_allowed_roots()
+    if not allowed_roots:
+        raise HTTPException(status_code=403, detail="Access Denied: No indexed folders.")
+
+    if not any(_is_within(normalized_path, root) for root in allowed_roots):
+        raise HTTPException(status_code=403, detail="Access Denied: Path outside indexed folders.")
+
+    if require_indexed:
+        db_path = normalized_path.replace("\\", "/")
+        info = db.get_image_info(db_path)
+        if not info:
+            raise HTTPException(status_code=403, detail="Access Denied: File not indexed.")
+
     return normalized_path
 
 @app.get("/api/images")
@@ -172,14 +208,13 @@ async def get_images(
 
 @app.get("/api/image/raw")
 async def get_raw_image(path: str):
-    validate_path_security(path)
-    normalized_path = os.path.normpath(path)
+    normalized_path = validate_path_security(path)
     if not os.path.exists(normalized_path): raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(normalized_path)
 
 @app.get("/api/metadata")
 async def get_metadata(path: str):
-    normalized_path = os.path.normpath(path)
+    normalized_path = validate_path_security(path, require_indexed=False)
     db_path = normalized_path.replace("\\", "/")
     info = db.get_image_info(db_path)
     if info:
@@ -393,8 +428,7 @@ async def trigger_scan():
 
 @app.get("/api/image/thumb")
 def get_thumbnail(path: str, size: int = 768):
-    validate_path_security(path)
-    normalized_path = os.path.normpath(path)
+    normalized_path = validate_path_security(path)
     if not os.path.exists(normalized_path): raise HTTPException(status_code=404, detail="Original image not found")
     import hashlib
     from PIL import Image
@@ -416,11 +450,12 @@ def get_thumbnail(path: str, size: int = 768):
 async def delete_image(path: str):
     try:
         from send2trash import send2trash
-        safe_path = os.path.normpath(os.path.abspath(path))
+        safe_path = validate_path_security(path)
         if os.path.exists(safe_path): send2trash(safe_path)
         db_path = safe_path.replace("\\", "/")
         import sqlite3
         conn = sqlite3.connect(db.db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.cursor().execute("DELETE FROM images WHERE file_path = ?", (db_path,))
         conn.commit(); conn.close()
         return {"success": True}
@@ -435,6 +470,7 @@ if __name__ == "__main__":
     from src.utils.network import get_local_ip
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--no-scan", action="store_true", help="Disable initial folder scan on startup")
     parser.add_argument("--comfy-host", type=str, default="127.0.0.1", help="ComfyUI host")
@@ -449,4 +485,4 @@ if __name__ == "__main__":
     if not args.no_scan:
         threading.Thread(target=lambda: (time.sleep(2), scanner.scan_folders()), daemon=True).start()
     
-    uvicorn.run(app, host="0.0.0.0", port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port)
