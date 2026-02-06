@@ -16,7 +16,7 @@ class WebServerService(QObject):
         super().__init__(parent)
         self.process = None
         self.port = 8000
-        self.host = "0.0.0.0"
+        self.host = "127.0.0.1"
         self.is_ready = False
 
     def start_server(self):
@@ -36,6 +36,7 @@ class WebServerService(QObject):
         # Read Comfy Settings
         settings = QSettings("ComfyUIImageManager", "Settings")
         comfy_address = settings.value("comfy_address", "127.0.0.1:8188")
+        self.host = settings.value("web_bind", "127.0.0.1")
         if ":" in comfy_address:
             host, port = comfy_address.split(":", 1)
         else:
@@ -45,6 +46,7 @@ class WebServerService(QObject):
         # 传递 --port 参数 和 --no-scan (避免双重扫描导致锁死)
         self.process.setArguments([
             "-m", "server.app", 
+            "--host", str(self.host),
             "--port", str(self.port), 
             "--no-scan",
             "--comfy-host", host,
@@ -82,8 +84,11 @@ class WebServerService(QObject):
 
         if "Application startup complete" in data or "Uvicorn running on" in data:
              self.is_ready = True
-             local_ip = get_local_ip()
-             url = f"http://{local_ip}:{self.port}"
+             if str(self.host) in ("127.0.0.1", "localhost"):
+                 url = f"http://127.0.0.1:{self.port}"
+             else:
+                 local_ip = get_local_ip()
+                 url = f"http://{local_ip}:{self.port}"
              self.service_ready.emit(url)
 
     def _filter_logs(self, message):
