@@ -1,17 +1,77 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QTextEdit, QScrollArea,
                              QFrame, QGridLayout, QHBoxLayout, QPushButton, QApplication, 
                              QSplitter, QGroupBox, QSpinBox, QDoubleSpinBox, QSlider, 
-                             QComboBox, QLineEdit, QCheckBox, QDialog, QMenu, QToolButton,
+                             QComboBox, QLineEdit, QCheckBox, QDialog, QToolButton,
                              QAbstractSpinBox, QSizePolicy, QListWidget, QListWidgetItem, QMessageBox)
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSettings, QThread, QEvent, QBuffer, QIODevice, QByteArray
 from PyQt6.QtGui import QFont, QAction, QImage, QGuiApplication
-from typing import List, Dict
+from typing import List, Dict, Any, Tuple, Optional
 import random
 import copy
 import json
 import base64
 import os
+import re
+import uuid
+from datetime import datetime
 from src.assets.default_workflows import DEFAULT_T2I_WORKFLOW
+
+
+def parse_compare_weights_expression(text: str) -> List[float]:
+    """解析 LoRA 对比权重表达式，支持列表和 start:end:step。"""
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("请先输入 LoRA 权重，例如 0.7,0.75 或 0.7:0.9:0.05")
+
+    tokens = [t.strip() for t in re.split(r"[,，;\n；]+", raw) if t.strip()]
+    values: List[float] = []
+
+    for token in tokens:
+        if ":" not in token:
+            try:
+                val = float(token)
+            except Exception as exc:
+                raise ValueError(f"无法解析权重: {token}") from exc
+            values.append(round(val, 6))
+            continue
+
+        parts = [p.strip() for p in token.split(":")]
+        if len(parts) != 3:
+            raise ValueError(f"区间写法错误: {token}，应为 start:end:step")
+        try:
+            start = float(parts[0])
+            end = float(parts[1])
+            step = float(parts[2])
+        except Exception as exc:
+            raise ValueError(f"区间值无法解析: {token}") from exc
+
+        if abs(step) < 1e-12:
+            raise ValueError(f"区间步长不能为 0: {token}")
+        if (end - start) * step < 0:
+            raise ValueError(f"区间方向与步长不一致: {token}")
+
+        cur = start
+        if step > 0:
+            while cur <= end + 1e-9:
+                values.append(round(cur, 6))
+                cur += step
+        else:
+            while cur >= end - 1e-9:
+                values.append(round(cur, 6))
+                cur += step
+
+    deduped: List[float] = []
+    seen = set()
+    for v in values:
+        key = f"{v:.6f}"
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(v)
+
+    if not deduped:
+        raise ValueError("未解析到任何权重值")
+    return deduped
 
 class LoraSelectorWidget(QWidget):
     selection_changed = pyqtSignal(str) # Emits new path
@@ -72,6 +132,8 @@ class LoraSelectorWidget(QWidget):
             if dlg.exec():
                 selected = dlg.selected_lora
                 if selected:
+                    selected_profile = getattr(dlg, "selected_lora_profile", {}) or {}
+                    self.setProperty("selected_lora_profile", selected_profile)
                     self.set_current_lora(selected)
                     self.selection_changed.emit(selected)
         except Exception as e:
@@ -272,9 +334,30 @@ class AIPromptDialog(QDialog):
         scroll.viewport().installEventFilter(self)
         layout.addWidget(scroll)
         
+        quick_scene_row = QHBoxLayout()
+        quick_scene_row.setSpacing(6)
+        quick_scene_row.addWidget(QLabel("快捷场景:"))
+        scene_tags = ["近景", "远景", "全身照", "半身照", "特写", "仰拍", "俯拍"]
+        for tag in scene_tags:
+            scene_btn = QPushButton(tag)
+            scene_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            scene_btn.setStyleSheet(
+                "QPushButton { padding: 2px 8px; border-radius: 10px; border: 1px solid palette(mid); background: palette(base); }"
+                "QPushButton:hover { border-color: palette(highlight); color: palette(highlight); }"
+            )
+            scene_btn.clicked.connect(lambda checked, t=tag: self._on_tag_clicked(t))
+            quick_scene_row.addWidget(scene_btn)
+        quick_scene_row.addStretch()
+        layout.addLayout(quick_scene_row)
+
+        self.quick_cmd_edit = QLineEdit()
+        self.quick_cmd_edit.setPlaceholderText("快捷修改指令（可选）：如“改成夜景、增加景深、改为电影光影”")
+        self.quick_cmd_edit.setClearButtonEnabled(True)
+        layout.addWidget(self.quick_cmd_edit)
+
         # 输入框
         self.input_edit = SmartTextEdit()
-        self.input_edit.setPlaceholderText("在此输入或点击上方标签...\n(提示: Enter 确定优化, Shift+Enter 换行)")
+        self.input_edit.setPlaceholderText("输入你的核心修改需求...\n提示: Enter 确定优化, Shift+Enter 换行")
         self.input_edit.setStyleSheet("background-color: palette(base); border: 1px solid palette(mid); border-radius: 4px; padding: 8px;")
         self.input_edit.submitted.connect(self._try_accept)
         layout.addWidget(self.input_edit)
@@ -339,6 +422,7 @@ class AIPromptDialog(QDialog):
         layout.addLayout(btn_layout)
 
         self.input_edit.textChanged.connect(self._update_state)
+        self.quick_cmd_edit.textChanged.connect(self._update_state)
         self._update_state()
         self.input_edit.setFocus()
 
@@ -352,16 +436,18 @@ class AIPromptDialog(QDialog):
 
     def _update_state(self):
         text = self.input_edit.toPlainText().strip()
-        self.counter_label.setText(f"字数: {len(text)}")
-        self.btn_ok.setEnabled(bool(text))
+        quick = self.quick_cmd_edit.text().strip()
+        self.counter_label.setText(f"字数: {len(text) + len(quick)}")
+        self.btn_ok.setEnabled(bool(text or quick))
 
     def _try_accept(self):
-        text = self.input_edit.toPlainText().strip()
+        text = self.get_text()
         if text:
             self.accept()
 
     def _clear_input(self):
         self.input_edit.clear()
+        self.quick_cmd_edit.clear()
 
     def eventFilter(self, source, event):
         if source is self.tag_scroll.viewport() and event.type() == QEvent.Type.Wheel:
@@ -377,11 +463,16 @@ class AIPromptDialog(QDialog):
         return super().eventFilter(source, event)
 
     def get_text(self):
-        return self.input_edit.toPlainText().strip()
+        main_text = self.input_edit.toPlainText().strip()
+        quick = self.quick_cmd_edit.text().strip()
+        if main_text and quick:
+            return f"{main_text}；补充要求：{quick}"
+        return main_text or quick
 
 class ParameterPanel(QWidget):
     # 信号定义
-    remote_gen_requested = pyqtSignal(dict, int) # 请求远程生成 (带workflow, 批次数量)
+    remote_gen_requested = pyqtSignal(dict, int, bool) # 请求远程生成 (带workflow, 批次数量, 是否随机seed)
+    compare_generate_requested = pyqtSignal(dict) # LoRA 对比生成请求
     
     # 日志系统:使用简单的列表,不用信号
     generation_logs = []  # 类变量,存储所有生成日志
@@ -389,16 +480,24 @@ class ParameterPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.settings = QSettings("ComfyUIImageManager", "Settings")
+        self._compact_breakpoint = 430
+        self._layout_mode = ""
         
         # 内部状态
         self.current_meta = {}
         self.current_loras = {} # 存储当前选中的LoRA {name: weight}
+        self.current_lora_meta = {} # 存储LoRA附加信息 {name: {note, prompt, auto_use_prompt}}
         self._ai_is_processing = False # AI处理并发锁
         self._img_prompt_processing = False
         self.history_manager = AIHistoryManager()
         self.history_dialogs = {}
         self.current_ai_worker = None
         self.current_img_worker = None
+        self._neg_bottom_dragging = False
+        self._neg_bottom_start_y = 0
+        self._neg_bottom_start_h = 0
+        self._neg_bottom_start_top_size = 0
+        self._neg_bottom_start_bottom_size = 0
         
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(5, 5, 5, 5)
@@ -861,10 +960,12 @@ class ParameterPanel(QWidget):
         self.workspace_scroll.verticalScrollBar().setFocusPolicy(Qt.FocusPolicy.NoFocus)
         
         workspace_content = QWidget()
+        workspace_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
         workspace_layout = QVBoxLayout(workspace_content)
         workspace_layout.setContentsMargins(0, 0, 0, 0)
         workspace_layout.setSpacing(6)
         self.workspace_scroll.setWidget(workspace_content)
+        self.workspace_scroll.viewport().installEventFilter(self)
 
         # --- 1. 可编辑文本区 ---
         def create_edit_block(title, placeholder, height):
@@ -964,40 +1065,29 @@ class ParameterPanel(QWidget):
         """)
         self.btn_file_import.clicked.connect(self._on_file_import_click)
 
-        # 压缩按钮尺寸以适应窄边栏
-        self.btn_ai_optimize.setFixedSize(65, 22)
-        self.btn_clipboard_import.setFixedSize(75, 22)
-        self.btn_file_import.setFixedSize(65, 22)
-        self.btn_history.setFixedSize(45, 22)
-        
-        # 组装正向提示词标题栏：[标签] -> [按钮组容器(强制右对齐)]
-        # 创建独立的按钮容器，彻底解决 addStretch 跳动问题
-        btn_container = QWidget()
-        btn_layout = QHBoxLayout(btn_container)
-        btn_layout.setContentsMargins(0, 0, 0, 0)
-        btn_layout.setSpacing(4)
-        btn_layout.setAlignment(Qt.AlignmentFlag.AlignRight) # 强制右对齐
-        
-        # 将按钮加入独立容器
-        # 彻底移除 ai_status_label，防止其占据空间导致左侧出现空隙
-        # btn_layout.addWidget(self.ai_status_label) # 将状态标签也移出
-        btn_layout.addWidget(self.btn_history)
-        btn_layout.addWidget(self.btn_file_import)
-        btn_layout.addWidget(self.btn_clipboard_import)
-        btn_layout.addWidget(self.btn_ai_optimize)
-        
-        # 将容器加入主行，并赋予伸缩能力使其占据剩余空间
-        prompt_title_row.addWidget(btn_container, 1)
-
         prompt_container = QWidget()
         prompt_layout = QVBoxLayout(prompt_container)
         prompt_layout.setContentsMargins(0, 0, 0, 0)
         prompt_layout.setSpacing(4)
         prompt_layout.addLayout(prompt_title_row)
 
+        # 正向提示词工具栏（永不隐藏，固定两行保证所有功能可见）
+        prompt_actions_container = QWidget()
+        self.prompt_actions_layout = QGridLayout(prompt_actions_container)
+        self.prompt_actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.prompt_actions_layout.setHorizontalSpacing(4)
+        self.prompt_actions_layout.setVerticalSpacing(4)
+        self.prompt_actions_layout.addWidget(self.btn_history, 0, 0)
+        self.prompt_actions_layout.addWidget(self.btn_ai_optimize, 0, 1)
+        self.prompt_actions_layout.addWidget(self.btn_file_import, 1, 0)
+        self.prompt_actions_layout.addWidget(self.btn_clipboard_import, 1, 1)
+        self.prompt_actions_layout.setColumnStretch(2, 1)
+        prompt_layout.addWidget(prompt_actions_container)
+        prompt_container.setMinimumHeight(96)
+
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setPlaceholderText("输入新的提示词进行创作...")
-        self.prompt_edit.setMinimumHeight(prompt_height)
+        self.prompt_edit.setMinimumHeight(48)
         self.prompt_edit.setStyleSheet("background-color: palette(base); border: 1px solid palette(mid); border-radius: 4px; padding: 4px;")
         prompt_layout.addWidget(self.prompt_edit)
 
@@ -1037,47 +1127,62 @@ class ParameterPanel(QWidget):
         # 移除 setFixedWidth
         # neg_title_row.addWidget(self.neg_ai_status_label) # 移除反向状态标签
         
-        self.btn_neg_ai_optimize.setFixedSize(65, 22)
-        self.btn_neg_history.setFixedSize(45, 22)
-        
-        # 组装反向提示词标题栏
-        # 同样使用独立容器封装
-        neg_btn_container = QWidget()
-        neg_btn_layout = QHBoxLayout(neg_btn_container)
-        neg_btn_layout.setContentsMargins(0, 0, 0, 0)
-        neg_btn_layout.setSpacing(4)
-        neg_btn_layout.setAlignment(Qt.AlignmentFlag.AlignRight)
-        
-        # 彻底移除 status label，消除间隙
-        neg_btn_layout.addWidget(self.btn_neg_history)
-        neg_btn_layout.addWidget(self.btn_neg_ai_optimize)
-        
-        neg_title_row.addWidget(neg_btn_container, 1)
-
         neg_container = QWidget()
         neg_layout = QVBoxLayout(neg_container)
         neg_layout.setContentsMargins(0, 0, 0, 0)
         neg_layout.setSpacing(4)
         neg_layout.addLayout(neg_title_row)
 
+        # 反向提示词工具栏（永不隐藏）
+        neg_actions_container = QWidget()
+        self.neg_actions_layout = QGridLayout(neg_actions_container)
+        self.neg_actions_layout.setContentsMargins(0, 0, 0, 0)
+        self.neg_actions_layout.setHorizontalSpacing(4)
+        self.neg_actions_layout.setVerticalSpacing(4)
+        self.neg_actions_layout.addWidget(self.btn_neg_history, 0, 0)
+        self.neg_actions_layout.addWidget(self.btn_neg_ai_optimize, 0, 1)
+        self.neg_actions_layout.setColumnStretch(2, 1)
+        neg_layout.addWidget(neg_actions_container)
+        neg_container.setMinimumHeight(72)
+
         self.neg_prompt_edit = QTextEdit()
         self.neg_prompt_edit.setPlaceholderText("输入过滤词...")
-        self.neg_prompt_edit.setMinimumHeight(neg_height)
+        self.neg_prompt_edit.setMinimumHeight(40)
         self.neg_prompt_edit.setStyleSheet("background-color: palette(base); border: 1px solid palette(mid); border-radius: 4px; padding: 4px;")
+        saved_neg_height = self.settings.value("param_panel/neg_prompt_height", 0, type=int)
+        if saved_neg_height and saved_neg_height > 0:
+            self.neg_prompt_edit.setFixedHeight(max(40, min(saved_neg_height, 520)))
         neg_layout.addWidget(self.neg_prompt_edit)
+
+        self.neg_bottom_handle = QFrame()
+        self.neg_bottom_handle.setFixedHeight(6)
+        self.neg_bottom_handle.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.neg_bottom_handle.setStyleSheet("""
+            QFrame {
+                background-color: palette(mid);
+                border-radius: 2px;
+            }
+            QFrame:hover {
+                background-color: palette(highlight);
+            }
+        """)
+        self.neg_bottom_handle.installEventFilter(self)
+        neg_layout.addWidget(self.neg_bottom_handle)
 
         self.prompt_splitter = QSplitter(Qt.Orientation.Vertical)
         self.prompt_splitter.setChildrenCollapsible(False)
-        self.prompt_splitter.setHandleWidth(2)
+        self.prompt_splitter.setHandleWidth(6)
         self.prompt_splitter.addWidget(prompt_container)
         self.prompt_splitter.addWidget(neg_container)
         self.prompt_splitter.setStretchFactor(0, 1)
         self.prompt_splitter.setStretchFactor(1, 1)
+        prompt_handle = self.prompt_splitter.handle(1)
+        prompt_handle.setCursor(Qt.CursorShape.SizeVerCursor)
         saved_prompt_splitter = self.settings.value("param_panel/prompt_splitter")
         if saved_prompt_splitter:
             self.prompt_splitter.restoreState(saved_prompt_splitter)
         else:
-            self.prompt_splitter.setSizes([prompt_height + 80, neg_height + 70])
+            self.prompt_splitter.setSizes([170, 95])
         self.prompt_splitter.splitterMoved.connect(lambda *_: self._save_prompt_splitter_state())
         workspace_layout.addWidget(self.prompt_splitter)
         
@@ -1099,7 +1204,8 @@ class ParameterPanel(QWidget):
         self.seed_input = QLineEdit()
         self.seed_input.setText("-1")
         self.seed_input.setPlaceholderText("输入种子数值")
-        self.seed_input.setMinimumWidth(120)
+        self.seed_input.setMinimumWidth(110)
+        self.seed_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.seed_input.setStyleSheet("padding: 3px; border-radius: 3px; font-size: 11px;")
         seed_row.addWidget(self.seed_input)
 
@@ -1117,8 +1223,8 @@ class ParameterPanel(QWidget):
 
         gen_layout.addLayout(seed_row)
 
-        # 初始化时禁用输入框（因为默认随机）
-        self.seed_input.setEnabled(False)
+        # 初始化时根据“随机”状态控制输入框
+        self.seed_input.setEnabled(not saved_random)
 
         # 保存上一张图片的seed，用于取消随机时恢复
         self.last_image_seed = None
@@ -1132,7 +1238,8 @@ class ParameterPanel(QWidget):
         res_row.addWidget(lbl_res)
 
         self.resolution_combo = QComboBox()
-        self.resolution_combo.setMinimumWidth(160)
+        self.resolution_combo.setMinimumWidth(110)
+        self.resolution_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.resolution_combo.setStyleSheet("padding: 3px; font-size: 11px;")
 
         # 系统预设分辨率
@@ -1177,17 +1284,18 @@ class ParameterPanel(QWidget):
         gen_layout.addLayout(res_row)
 
         # ===== Steps和CFG合并到一行 =====
-        steps_cfg_row = QHBoxLayout()
-        steps_cfg_row.setSpacing(6)
+        self.steps_cfg_row = QGridLayout()
+        self.steps_cfg_row.setContentsMargins(0, 0, 0, 0)
+        self.steps_cfg_row.setHorizontalSpacing(6)
+        self.steps_cfg_row.setVerticalSpacing(4)
 
-        lbl_steps = QLabel("Steps:")
-        lbl_steps.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 60px;")
-        steps_cfg_row.addWidget(lbl_steps)
+        self.lbl_steps = QLabel("Steps:")
+        self.lbl_steps.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 60px;")
 
         self.steps_value = QSpinBox()
         self.steps_value.setRange(1, 150)
         self.steps_value.setValue(20)
-        self.steps_value.setMinimumWidth(70)
+        self.steps_value.setMinimumWidth(56)
         self.steps_value.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.steps_value.setStyleSheet("""
             QSpinBox {
@@ -1199,20 +1307,17 @@ class ParameterPanel(QWidget):
             }
             QSpinBox:focus { border: 2px solid palette(highlight); }
         """)
-        steps_cfg_row.addWidget(self.steps_value)
+        self.steps_value.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        steps_cfg_row.addSpacing(15)
-
-        lbl_cfg = QLabel("CFG:")
-        lbl_cfg.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 40px;")
-        steps_cfg_row.addWidget(lbl_cfg)
+        self.lbl_cfg = QLabel("CFG:")
+        self.lbl_cfg.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 40px;")
 
         self.cfg_value = QDoubleSpinBox()
         self.cfg_value.setRange(1.0, 30.0)
         self.cfg_value.setSingleStep(0.5)
         self.cfg_value.setValue(7.5)
         self.cfg_value.setDecimals(1)
-        self.cfg_value.setMinimumWidth(70)
+        self.cfg_value.setMinimumWidth(56)
         self.cfg_value.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.cfg_value.setStyleSheet("""
             QDoubleSpinBox {
@@ -1224,38 +1329,31 @@ class ParameterPanel(QWidget):
             }
             QDoubleSpinBox:focus { border: 2px solid palette(highlight); }
         """)
-        steps_cfg_row.addWidget(self.cfg_value)
-        steps_cfg_row.addStretch()
+        self.cfg_value.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        gen_layout.addLayout(steps_cfg_row)
+        gen_layout.addLayout(self.steps_cfg_row)
         
         # ===== 采样器和调度器行 =====
-        sampler_scheduler_row = QHBoxLayout()
-        sampler_scheduler_row.setSpacing(6)
+        self.sampler_scheduler_row = QGridLayout()
+        self.sampler_scheduler_row.setContentsMargins(0, 0, 0, 0)
+        self.sampler_scheduler_row.setHorizontalSpacing(6)
+        self.sampler_scheduler_row.setVerticalSpacing(4)
 
-        lbl_sampler = QLabel("采样器:")
-        lbl_sampler.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 60px;")
-        sampler_scheduler_row.addWidget(lbl_sampler)
+        self.lbl_sampler = QLabel("采样器:")
+        self.lbl_sampler.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 60px;")
 
         self.sampler_combo = QComboBox()
-        self.sampler_combo.setMinimumWidth(100)
+        self.sampler_combo.setMinimumWidth(90)
+        self.sampler_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.sampler_combo.setStyleSheet("padding: 3px; font-size: 11px;")
-        sampler_scheduler_row.addWidget(self.sampler_combo)
-
-        sampler_scheduler_row.addSpacing(10)
-
-        lbl_scheduler = QLabel("调度器:")
-        lbl_scheduler.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 40px;")
-        sampler_scheduler_row.addWidget(lbl_scheduler)
+        self.lbl_scheduler = QLabel("调度器:")
+        self.lbl_scheduler.setStyleSheet("color: palette(mid); font-size: 10px; min-width: 40px;")
 
         self.scheduler_combo = QComboBox()
-        self.scheduler_combo.setMinimumWidth(80)
+        self.scheduler_combo.setMinimumWidth(84)
+        self.scheduler_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.scheduler_combo.setStyleSheet("padding: 3px; font-size: 11px;")
-        sampler_scheduler_row.addWidget(self.scheduler_combo)
-
-        sampler_scheduler_row.addStretch()
-
-        gen_layout.addLayout(sampler_scheduler_row)
+        gen_layout.addLayout(self.sampler_scheduler_row)
 
         self.model_row_widget = QWidget()
         model_row = QHBoxLayout(self.model_row_widget)
@@ -1267,9 +1365,10 @@ class ParameterPanel(QWidget):
         model_row.addWidget(self.lbl_model)
 
         self.model_combo = QComboBox()
-        self.model_combo.setMinimumWidth(150)
-        self.model_combo.setMaximumWidth(260) # 限制最大宽度，防止长名字撑爆边栏
+        self.model_combo.setMinimumWidth(110)
+        self.model_combo.setMaximumWidth(16777215) # 限制最大宽度，防止长名字撑爆边栏
         self.model_combo.setStyleSheet("padding: 3px; font-size: 11px;")
+        self.model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         model_row.addWidget(self.model_combo)
         model_row.addStretch()
 
@@ -1285,9 +1384,10 @@ class ParameterPanel(QWidget):
         self.lbl_unet.setText("模型(UNET):")
 
         self.unet_combo = QComboBox()
-        self.unet_combo.setMinimumWidth(150)
-        self.unet_combo.setMaximumWidth(260)
+        self.unet_combo.setMinimumWidth(110)
+        self.unet_combo.setMaximumWidth(16777215)
         self.unet_combo.setStyleSheet("padding: 3px; font-size: 11px;")
+        self.unet_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         unet_row.addWidget(self.unet_combo)
         unet_row.addStretch()
 
@@ -1301,8 +1401,9 @@ class ParameterPanel(QWidget):
         vae_row.addWidget(lbl_vae)
 
         self.vae_combo = QComboBox()
-        self.vae_combo.setMinimumWidth(160)
+        self.vae_combo.setMinimumWidth(110)
         self.vae_combo.setStyleSheet("padding: 3px; font-size: 11px;")
+        self.vae_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         vae_row.addWidget(self.vae_combo)
         vae_row.addStretch()
 
@@ -1316,9 +1417,10 @@ class ParameterPanel(QWidget):
         clip_row.addWidget(lbl_clip)
 
         self.clip_combo = QComboBox()
-        self.clip_combo.setMinimumWidth(150)
-        self.clip_combo.setMaximumWidth(260)
+        self.clip_combo.setMinimumWidth(110)
+        self.clip_combo.setMaximumWidth(16777215)
         self.clip_combo.setStyleSheet("padding: 3px; font-size: 11px;")
+        self.clip_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         clip_row.addWidget(self.clip_combo)
         clip_row.addStretch()
 
@@ -1337,6 +1439,87 @@ class ParameterPanel(QWidget):
         controls_layout.setSpacing(6)
         controls_layout.addWidget(self.gen_settings_container)
 
+        # ===== LoRA 对比测试区域（可折叠） =====
+        self.compare_section_container = QFrame()
+        self.compare_section_container.setObjectName("CompareSection")
+        compare_layout = QVBoxLayout(self.compare_section_container)
+        compare_layout.setContentsMargins(8, 8, 8, 8)
+        compare_layout.setSpacing(6)
+
+        compare_header_row = QHBoxLayout()
+        compare_header_row.setContentsMargins(0, 0, 0, 0)
+        compare_header_row.setSpacing(6)
+        self.compare_toggle_btn = QToolButton()
+        self.compare_toggle_btn.setCheckable(True)
+        self.compare_toggle_btn.setChecked(True)
+        self.compare_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.compare_toggle_btn.setFixedSize(18, 18)
+        compare_header_row.addWidget(self.compare_toggle_btn)
+
+        compare_title = QLabel("LoRA 对比测试")
+        compare_title.setStyleSheet("font-weight: bold; color: palette(text);")
+        compare_header_row.addWidget(compare_title)
+        compare_header_row.addStretch()
+        compare_layout.addLayout(compare_header_row)
+
+        self.compare_content = QWidget()
+        compare_content_layout = QVBoxLayout(self.compare_content)
+        compare_content_layout.setContentsMargins(0, 0, 0, 0)
+        compare_content_layout.setSpacing(6)
+
+        compare_weight_row = QHBoxLayout()
+        compare_weight_row.setSpacing(6)
+        compare_weight_row.addWidget(QLabel("权重:"))
+        self.compare_weights_input = QLineEdit()
+        self.compare_weights_input.setPlaceholderText("例如: 0.7,0.75,0.8 或 0.7:0.9:0.05")
+        self.compare_weights_input.setMinimumWidth(110)
+        self.compare_weights_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        compare_weight_row.addWidget(self.compare_weights_input, 1)
+        compare_content_layout.addLayout(compare_weight_row)
+
+        self.compare_mode_row = QGridLayout()
+        self.compare_mode_row.setContentsMargins(0, 0, 0, 0)
+        self.compare_mode_row.setHorizontalSpacing(6)
+        self.compare_mode_row.setVerticalSpacing(4)
+        self.compare_lbl_combo = QLabel("组合:")
+        self.compare_combo_mode = QComboBox()
+        self.compare_combo_mode.addItem("笛卡尔积", "cartesian")
+        self.compare_combo_mode.addItem("按位配对", "pairwise")
+        self.compare_combo_mode.setMinimumWidth(96)
+        self.compare_combo_mode.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        self.compare_lbl_seed = QLabel("种子:")
+        self.compare_seed_mode_combo = QComboBox()
+        self.compare_seed_mode_combo.addItem("固定同种子", "fixed")
+        self.compare_seed_mode_combo.addItem("每图随机", "random")
+        self.compare_seed_mode_combo.setMinimumWidth(96)
+        self.compare_seed_mode_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        self.compare_include_baseline = QCheckBox("包含基线图(无LoRA)")
+        compare_content_layout.addLayout(self.compare_mode_row)
+
+        self.compare_btn_row = QGridLayout()
+        self.compare_btn_row.setContentsMargins(0, 0, 0, 0)
+        self.compare_btn_row.setHorizontalSpacing(8)
+        self.compare_btn_row.setVerticalSpacing(4)
+        self.btn_compare_generate = QPushButton("开始对比生成")
+        self.btn_compare_generate.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_compare_generate.clicked.connect(self._on_compare_generate_click)
+        self.btn_compare_generate.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        self.btn_open_last_compare = QPushButton("打开最近对比")
+        self.btn_open_last_compare.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_last_compare.clicked.connect(self._open_last_compare_from_panel)
+        self.btn_open_last_compare.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        compare_content_layout.addLayout(self.compare_btn_row)
+
+        compare_layout.addWidget(self.compare_content)
+        controls_layout.addWidget(self.compare_section_container)
+
+        saved_compare_expanded = self.settings.value("param_panel/compare_section_expanded", True, type=bool)
+        self.compare_toggle_btn.toggled.connect(self._on_compare_section_toggled)
+        self._set_compare_section_expanded(saved_compare_expanded)
+
         # ===== LoRA管理区域 =====
         self.lora_section_container = QWidget()
         lora_section_layout = QVBoxLayout(self.lora_section_container)
@@ -1351,7 +1534,8 @@ class ParameterPanel(QWidget):
         lora_header_row.addWidget(lbl_loras)
 
         add_lora_btn = QPushButton("+ 添加")
-        add_lora_btn.setFixedSize(60, 22)
+        add_lora_btn.setMinimumWidth(60)
+        add_lora_btn.setFixedHeight(22)
         add_lora_btn.setStyleSheet("""
             QPushButton {
                 padding: 2px 6px;
@@ -1378,6 +1562,7 @@ class ParameterPanel(QWidget):
         lora_section_layout.addWidget(self.lora_container)
 
         self.current_loras = {}
+        self.current_lora_meta = {}
         
         workspace_layout.addWidget(self.workspace_controls_container)
         workspace_layout.addWidget(self.lora_section_container)
@@ -1385,16 +1570,17 @@ class ParameterPanel(QWidget):
 
         # --- 3. 底部生成按钮 (从上方移动到这里) ---
         self.gen_btn_container = QWidget()
-        gen_btn_layout = QHBoxLayout(self.gen_btn_container)
-
-        # 始终使用标准模板,不再提供切换选项
-        gen_btn_layout.addStretch()
+        self.gen_btn_layout = QGridLayout(self.gen_btn_container)
+        self.gen_btn_layout.setContentsMargins(0, 0, 0, 0)
+        self.gen_btn_layout.setHorizontalSpacing(8)
+        self.gen_btn_layout.setVerticalSpacing(4)
 
         # [NEW] 批量生成计数器 (优化版 - 简洁风格)
         self.batch_count_spin = QSpinBox()
         self.batch_count_spin.setRange(1, 100)
         self.batch_count_spin.setValue(1)
-        self.batch_count_spin.setFixedWidth(60) # 稍微收窄，因为去掉了按钮
+        self.batch_count_spin.setMinimumWidth(56)
+        self.batch_count_spin.setMaximumWidth(88)
         self.batch_count_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.batch_count_spin.setToolTip("批量生成数量 (输入数字)")
         # 隐藏上下按钮，只显示数字框
@@ -1417,18 +1603,12 @@ class ParameterPanel(QWidget):
         """)
         
         # 添加 "批量:" 标签，明确含义
-        lbl_batch = QLabel("批量:")
-        lbl_batch.setStyleSheet("color: palette(text); font-weight: bold;")
-        gen_btn_layout.addWidget(lbl_batch)
-        gen_btn_layout.addWidget(self.batch_count_spin)
+        self.lbl_batch = QLabel("批量:")
+        self.lbl_batch.setStyleSheet("color: palette(text); font-weight: bold;")
         
         # 添加 "张" 单位标签
-        lbl_unit = QLabel("张")
-        lbl_unit.setStyleSheet("color: palette(mid);")
-        gen_btn_layout.addWidget(lbl_unit)
-        
-        # Spacer
-        gen_btn_layout.addSpacing(15)
+        self.lbl_batch_unit = QLabel("张")
+        self.lbl_batch_unit.setStyleSheet("color: palette(mid);")
 
         self.btn_remote_gen = QPushButton("生成")
         self.btn_remote_gen.setMinimumHeight(32)
@@ -1449,14 +1629,15 @@ class ParameterPanel(QWidget):
             QPushButton:disabled { background-color: #555; color: #aaa; border: none; }
         """)
         self.btn_remote_gen.clicked.connect(self._on_remote_gen_click)
-        gen_btn_layout.addWidget(self.btn_remote_gen)
-        
+        self.btn_remote_gen.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
         outer_layout.addWidget(self.workspace_scroll, 1)
         outer_layout.addWidget(self.gen_btn_container)
         
         # 初始化持久化逻辑
         self._init_workspace_persistence()
         self._toggle_workspace_controls(self.workspace_toggle_btn.isChecked())
+        QTimer.singleShot(0, self._apply_responsive_layout)
         return gen_settings_outer
 
     def _toggle_workspace_controls(self, expanded):
@@ -1465,9 +1646,158 @@ class ParameterPanel(QWidget):
         if hasattr(self, "workspace_toggle_btn"):
             self.workspace_toggle_btn.setText("收起" if expanded else "展开")
         self.settings.setValue("gen_workspace_controls_expanded", expanded)
+        if expanded:
+            QTimer.singleShot(0, self._apply_responsive_layout)
+
+    def _set_compare_section_expanded(self, expanded: bool):
+        if hasattr(self, "compare_content"):
+            self.compare_content.setVisible(bool(expanded))
+        if hasattr(self, "compare_toggle_btn"):
+            self.compare_toggle_btn.blockSignals(True)
+            self.compare_toggle_btn.setChecked(bool(expanded))
+            self.compare_toggle_btn.setText("▼" if expanded else "▶")
+            self.compare_toggle_btn.blockSignals(False)
+        self.settings.setValue("param_panel/compare_section_expanded", bool(expanded))
+        if expanded:
+            QTimer.singleShot(0, self._apply_responsive_layout)
+
+    def _on_compare_section_toggled(self, checked: bool):
+        self._set_compare_section_expanded(bool(checked))
+
+    def _reset_layout_items(self, layout):
+        while layout.count():
+            layout.takeAt(0)
+
+    def _layout_steps_cfg_row(self, compact: bool):
+        if not hasattr(self, "steps_cfg_row"):
+            return
+        self._reset_layout_items(self.steps_cfg_row)
+        for i in range(5):
+            self.steps_cfg_row.setColumnStretch(i, 0)
+        if compact:
+            self.steps_cfg_row.addWidget(self.lbl_steps, 0, 0)
+            self.steps_cfg_row.addWidget(self.steps_value, 0, 1)
+            self.steps_cfg_row.addWidget(self.lbl_cfg, 1, 0)
+            self.steps_cfg_row.addWidget(self.cfg_value, 1, 1)
+            self.steps_cfg_row.setColumnStretch(2, 1)
+        else:
+            self.steps_cfg_row.addWidget(self.lbl_steps, 0, 0)
+            self.steps_cfg_row.addWidget(self.steps_value, 0, 1)
+            self.steps_cfg_row.addWidget(self.lbl_cfg, 0, 2)
+            self.steps_cfg_row.addWidget(self.cfg_value, 0, 3)
+            self.steps_cfg_row.setColumnStretch(4, 1)
+
+    def _layout_sampler_scheduler_row(self, compact: bool):
+        if not hasattr(self, "sampler_scheduler_row"):
+            return
+        self._reset_layout_items(self.sampler_scheduler_row)
+        for i in range(5):
+            self.sampler_scheduler_row.setColumnStretch(i, 0)
+        if compact:
+            self.sampler_scheduler_row.addWidget(self.lbl_sampler, 0, 0)
+            self.sampler_scheduler_row.addWidget(self.sampler_combo, 0, 1)
+            self.sampler_scheduler_row.addWidget(self.lbl_scheduler, 1, 0)
+            self.sampler_scheduler_row.addWidget(self.scheduler_combo, 1, 1)
+            self.sampler_scheduler_row.setColumnStretch(2, 1)
+        else:
+            self.sampler_scheduler_row.addWidget(self.lbl_sampler, 0, 0)
+            self.sampler_scheduler_row.addWidget(self.sampler_combo, 0, 1)
+            self.sampler_scheduler_row.addWidget(self.lbl_scheduler, 0, 2)
+            self.sampler_scheduler_row.addWidget(self.scheduler_combo, 0, 3)
+            self.sampler_scheduler_row.setColumnStretch(4, 1)
+
+    def _layout_neg_prompt_actions(self, compact: bool):
+        if not hasattr(self, "neg_actions_layout"):
+            return
+        self._reset_layout_items(self.neg_actions_layout)
+        for i in range(3):
+            self.neg_actions_layout.setColumnStretch(i, 0)
+        if compact:
+            self.neg_actions_layout.addWidget(self.btn_neg_history, 0, 0)
+            self.neg_actions_layout.addWidget(self.btn_neg_ai_optimize, 1, 0)
+            self.neg_actions_layout.setColumnStretch(1, 1)
+        else:
+            self.neg_actions_layout.addWidget(self.btn_neg_history, 0, 0)
+            self.neg_actions_layout.addWidget(self.btn_neg_ai_optimize, 0, 1)
+            self.neg_actions_layout.setColumnStretch(2, 1)
+
+    def _layout_compare_section(self, compact: bool):
+        if not hasattr(self, "compare_mode_row") or not hasattr(self, "compare_btn_row"):
+            return
+        self._reset_layout_items(self.compare_mode_row)
+        self._reset_layout_items(self.compare_btn_row)
+        for i in range(6):
+            self.compare_mode_row.setColumnStretch(i, 0)
+        for i in range(3):
+            self.compare_btn_row.setColumnStretch(i, 0)
+        if compact:
+            self.compare_mode_row.addWidget(self.compare_lbl_combo, 0, 0)
+            self.compare_mode_row.addWidget(self.compare_combo_mode, 0, 1)
+            self.compare_mode_row.addWidget(self.compare_lbl_seed, 1, 0)
+            self.compare_mode_row.addWidget(self.compare_seed_mode_combo, 1, 1)
+            self.compare_mode_row.addWidget(self.compare_include_baseline, 2, 0, 1, 2)
+            self.compare_mode_row.setColumnStretch(2, 1)
+
+            self.compare_btn_row.addWidget(self.btn_compare_generate, 0, 0)
+            self.compare_btn_row.addWidget(self.btn_open_last_compare, 1, 0)
+            self.compare_btn_row.setColumnStretch(1, 1)
+        else:
+            self.compare_mode_row.addWidget(self.compare_lbl_combo, 0, 0)
+            self.compare_mode_row.addWidget(self.compare_combo_mode, 0, 1)
+            self.compare_mode_row.addWidget(self.compare_lbl_seed, 0, 2)
+            self.compare_mode_row.addWidget(self.compare_seed_mode_combo, 0, 3)
+            self.compare_mode_row.addWidget(self.compare_include_baseline, 0, 4)
+            self.compare_mode_row.setColumnStretch(5, 1)
+
+            self.compare_btn_row.addWidget(self.btn_compare_generate, 0, 0)
+            self.compare_btn_row.addWidget(self.btn_open_last_compare, 0, 1)
+            self.compare_btn_row.setColumnStretch(2, 1)
+
+    def _layout_generate_buttons(self, compact: bool):
+        if not hasattr(self, "gen_btn_layout"):
+            return
+        self._reset_layout_items(self.gen_btn_layout)
+        for i in range(6):
+            self.gen_btn_layout.setColumnStretch(i, 0)
+        if compact:
+            self.gen_btn_layout.addWidget(self.lbl_batch, 0, 0)
+            self.gen_btn_layout.addWidget(self.batch_count_spin, 0, 1)
+            self.gen_btn_layout.addWidget(self.lbl_batch_unit, 0, 2)
+            self.gen_btn_layout.addWidget(self.btn_remote_gen, 1, 0, 1, 3)
+            self.gen_btn_layout.setColumnStretch(3, 1)
+        else:
+            self.gen_btn_layout.setColumnStretch(0, 1)
+            self.gen_btn_layout.addWidget(self.lbl_batch, 0, 1)
+            self.gen_btn_layout.addWidget(self.batch_count_spin, 0, 2)
+            self.gen_btn_layout.addWidget(self.lbl_batch_unit, 0, 3)
+            self.gen_btn_layout.addWidget(self.btn_remote_gen, 0, 4)
+            self.gen_btn_layout.setColumnStretch(5, 1)
+
+    def _apply_responsive_layout(self):
+        if not hasattr(self, "workspace_scroll"):
+            return
+        current_width = self.workspace_scroll.viewport().width()
+        compact = current_width <= self._compact_breakpoint
+        mode = "compact" if compact else "normal"
+        if mode == self._layout_mode:
+            return
+        self._layout_mode = mode
+        self._layout_steps_cfg_row(compact)
+        self._layout_sampler_scheduler_row(compact)
+        self._layout_neg_prompt_actions(compact)
+        self._layout_compare_section(compact)
+        self._layout_generate_buttons(compact)
     
     
-    def _add_lora_item(self, name: str = "", weight: float = 1.0):
+    def _normalize_lora_profile_meta(self, profile):
+        data = {"note": "", "prompt": "", "auto_use_prompt": True}
+        if isinstance(profile, dict):
+            data["note"] = str(profile.get("note", "") or "").strip()
+            data["prompt"] = str(profile.get("prompt", "") or "").strip()
+            data["auto_use_prompt"] = bool(profile.get("auto_use_prompt", True))
+        return data
+
+    def _add_lora_item(self, name: str = "", weight: float = 1.0, lora_meta: dict | None = None):
         """添加一个LoRA项到列表（弹出窗口模式）"""
         # 限制最多5个LoRA
         if len(self.current_loras) >= 5:
@@ -1477,16 +1807,18 @@ class ParameterPanel(QWidget):
         item_widget = QWidget()
         item_layout = QHBoxLayout(item_widget)
         item_layout.setContentsMargins(4, 2, 4, 2)
-        item_layout.setSpacing(8)
+        item_layout.setSpacing(6)
         
         # LoRA选择器 (弹出窗口版)
         lora_selector = LoraSelectorWidget()
-        lora_selector.setMinimumWidth(150)
-        lora_selector.setMaximumWidth(260)
+        lora_selector.setMinimumWidth(110)
+        lora_selector.setMaximumWidth(16777215)
+        lora_selector.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         lora_selector.set_data_source(self._get_all_loras)
         
         if name:
             lora_selector.set_current_lora(name)
+        lora_selector.setProperty("selected_lora_profile", self._normalize_lora_profile_meta(lora_meta))
         
         # 当选择改变时更新数据
         lora_selector.selection_changed.connect(
@@ -1506,7 +1838,8 @@ class ParameterPanel(QWidget):
         weight_spin.setSingleStep(0.01)  # 步长改为0.01
         weight_spin.setValue(round(weight, 2))
         weight_spin.setDecimals(2)  # 显示2位小数
-        weight_spin.setMinimumWidth(70)  # 稍微加宽以容纳两位小数
+        weight_spin.setMinimumWidth(58)
+        weight_spin.setMaximumWidth(86)
         weight_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         weight_spin.setStyleSheet("""
             QDoubleSpinBox {
@@ -1521,7 +1854,6 @@ class ParameterPanel(QWidget):
         weight_spin.valueChanged.connect(
             lambda v: self._update_lora_weight_from_combo(lora_selector, round(v, 2))
         )
-        weight_spin.wheelEvent = lambda e: e.ignore() # 禁止滚轮切换
         item_layout.addWidget(weight_spin)
         
         # 删除按钮
@@ -1548,6 +1880,7 @@ class ParameterPanel(QWidget):
         # 如果指定了名称，添加到数据并设置属性
         if name and name != "选择LoRA...":
             self.current_loras[name] = weight
+            self.current_lora_meta[name] = self._normalize_lora_profile_meta(lora_meta)
             lora_selector.setProperty("selected_lora", name)  # 设置属性，防止重复检测
 
     def _get_all_loras(self):
@@ -1727,27 +2060,51 @@ class ParameterPanel(QWidget):
             old_data = selector.property("selected_lora")
             if old_data and old_data in self.current_loras:
                 del self.current_loras[old_data]
+            if old_data and old_data in self.current_lora_meta:
+                del self.current_lora_meta[old_data]
             selector.setProperty("selected_lora", None)
             self._save_loras()
             return
         
-        # 检查是否重复
-        if text in self.current_loras:
-            # 恢复之前的选择或重置
-            old_data = selector.property("selected_lora")
-            selector.set_current_lora(old_data if old_data else "")
-            # print(f"[UI] LoRA '{text}' 已被使用")
+        old_name = selector.property("selected_lora")
+
+        # 检查是否重复（允许“同一行重新选择同一个LoRA”，用于更新备注/提示词等元数据）
+        if text in self.current_loras and text != old_name:
+            selector.set_current_lora(old_name if old_name else "")
             return
         
         # 更新数据
-        old_name = selector.property("selected_lora")
         if old_name and old_name in self.current_loras:
             del self.current_loras[old_name]
-        
+        if old_name and old_name in self.current_lora_meta:
+            del self.current_lora_meta[old_name]
+
         weight_spin = selector.property("weight_spin")
-        weight = weight_spin.value() if weight_spin else 1.0
+        profile_raw = selector.property("selected_lora_profile")
+        profile_meta = self._normalize_lora_profile_meta(profile_raw)
+        recommended_weight = weight_spin.value() if weight_spin else 1.0
+        if isinstance(profile_raw, dict) and "recommended_weight" in profile_raw:
+            try:
+                recommended_weight = float(profile_raw.get("recommended_weight", recommended_weight))
+            except Exception:
+                pass
+        recommended_weight = max(-2.0, min(2.0, float(recommended_weight)))
+        if weight_spin:
+            weight_spin.blockSignals(True)
+            weight_spin.setValue(round(recommended_weight, 2))
+            weight_spin.blockSignals(False)
+        weight = round(recommended_weight, 2)
         self.current_loras[text] = weight
+        self.current_lora_meta[text] = profile_meta
         selector.setProperty("selected_lora", text)
+        selector.setProperty(
+            "selected_lora_profile",
+            {
+                "note": profile_meta["note"],
+                "prompt": profile_meta["prompt"],
+                "auto_use_prompt": profile_meta["auto_use_prompt"],
+            },
+        )
         self._save_loras()
         # print(f"[UI] 选择LoRA: {text} (权重: {weight})")
     
@@ -1766,6 +2123,8 @@ class ParameterPanel(QWidget):
         lora_name = selector.property("selected_lora")
         if lora_name and lora_name in self.current_loras:
             del self.current_loras[lora_name]
+        if lora_name and lora_name in self.current_lora_meta:
+            del self.current_lora_meta[lora_name]
             # print(f"[UI] 删除LoRA: {lora_name}")
         
         self.lora_layout.removeWidget(widget)
@@ -1776,6 +2135,8 @@ class ParameterPanel(QWidget):
         """删除一个LoRA项（兼容旧方法）"""
         if name in self.current_loras:
             del self.current_loras[name]
+        if name in self.current_lora_meta:
+            del self.current_lora_meta[name]
         
         self.lora_layout.removeWidget(widget)
         widget.deleteLater()
@@ -1798,6 +2159,7 @@ class ParameterPanel(QWidget):
                 item.widget().deleteLater()
         
         self.current_loras.clear()
+        self.current_lora_meta.clear()
         if persist:
             self._save_loras()
         # print(f"[UI] 清空LoRA列表")
@@ -2284,9 +2646,15 @@ class ParameterPanel(QWidget):
         
         # 预设标签
         if is_negative:
-            preset_tags = ["一键优化", "去除马赛克", "去除水印/文字", "提升清晰度", "修正肢体崩坏", "过滤低质量"]
+            preset_tags = [
+                "一键优化", "去除马赛克", "去除水印/文字", "提升清晰度", "修正肢体崩坏", "过滤低质量",
+                "避免多余手指", "避免脸部崩坏", "避免过曝", "避免噪点"
+            ]
         else:
-            preset_tags = ["一键优化", "换背景", "丰富画面细节", "改为夜景风格", "电影级光影", "质感提升", "增加环境描述"]
+            preset_tags = [
+                "一键优化", "换背景", "丰富画面细节", "改为夜景风格", "电影级光影", "质感提升", "增加环境描述",
+                "全身照", "半身照", "近景特写", "远景构图", "增强景深"
+            ]
 
         if existing_prompt:
             dialog_title = f"优化{label_prefix}提示词"
@@ -2442,15 +2810,20 @@ class ParameterPanel(QWidget):
         self.settings.setValue("seed_random", checked)
         self.seed_input.setEnabled(not checked)
         if checked:
-            # 勾选随机也保持显示当前图片的seed，只是禁用编辑
-            if self.last_image_seed:
-                self.seed_input.setText(str(self.last_image_seed))
+            # 仅禁用编辑，不改动当前显示值
+            return
         else:
-            # 取消随机 -> 恢复上一张图片的seed
-            if self.last_image_seed:
+            # 取消随机后必须有确定种子，避免仍然走随机分支
+            text = self.seed_input.text().strip()
+            if text and text != "-1":
+                return
+            if self.last_image_seed not in (None, "", "-1"):
                 self.seed_input.setText(str(self.last_image_seed))
-            else:
-                self.seed_input.clear()
+                return
+            saved_seed = self.settings.value("gen_seed", "1", type=str).strip()
+            if not saved_seed or saved_seed == "-1":
+                saved_seed = "1"
+            self.seed_input.setText(saved_seed)
     
     def _set_resolution(self, width, height):
         """设置分辨率预设"""
@@ -2656,8 +3029,13 @@ class ParameterPanel(QWidget):
             if isinstance(lora, dict):
                 name = lora.get('name', '')
                 weight = lora.get('weight', 1.0)
+                meta = {
+                    "note": lora.get("note", ""),
+                    "prompt": lora.get("prompt", ""),
+                    "auto_use_prompt": lora.get("auto_use_prompt", True),
+                }
                 if name:
-                    self._add_lora_item(name, weight)
+                    self._add_lora_item(name, weight, lora_meta=meta)
             elif isinstance(lora, str):
                 name, weight = _parse_lora_string(lora)
                 if name:
@@ -2681,11 +3059,18 @@ class ParameterPanel(QWidget):
     def _save_loras(self):
         """保存当前LoRA配置到Settings"""
         try:
-            # self.current_loras 是 {name: weight} 字典
-            # 转换为 list of dicts 以便扩展
             lora_list = []
             for name, weight in self.current_loras.items():
-                lora_list.append({"name": name, "weight": weight})
+                meta = self._normalize_lora_profile_meta(self.current_lora_meta.get(name, {}))
+                lora_list.append(
+                    {
+                        "name": name,
+                        "weight": weight,
+                        "note": meta["note"],
+                        "prompt": meta["prompt"],
+                        "auto_use_prompt": meta["auto_use_prompt"],
+                    }
+                )
             
             json_str = json.dumps(lora_list)
             self.settings.setValue("gen_loras", json_str)
@@ -2706,10 +3091,66 @@ class ParameterPanel(QWidget):
                 if isinstance(lora, dict):
                     name = lora.get("name", "")
                     weight = lora.get("weight", 1.0)
+                    meta = {
+                        "note": lora.get("note", ""),
+                        "prompt": lora.get("prompt", ""),
+                        "auto_use_prompt": lora.get("auto_use_prompt", True),
+                    }
                     if name:
-                        self._add_lora_item(name, weight)
+                        self._add_lora_item(name, weight, lora_meta=meta)
+                elif isinstance(lora, str):
+                    name = lora.strip()
+                    if name:
+                        self._add_lora_item(name, 1.0)
         except Exception as e:
             print(f"Error loading LoRAs: {e}")
+
+    def _normalize_prompt_piece(self, text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip()).lower()
+
+    def _split_prompt_pieces(self, prompt: str) -> List[str]:
+        if not prompt:
+            return []
+        parts = re.split(r"[,，;\n；]+", prompt)
+        return [p.strip() for p in parts if p and p.strip()]
+
+    def _collect_lora_prompt_extras(self) -> List[str]:
+        extras = []
+        seen = set()
+        for name in self.current_loras.keys():
+            meta = self.current_lora_meta.get(name, {})
+            if not isinstance(meta, dict):
+                continue
+            if not bool(meta.get("auto_use_prompt", True)):
+                continue
+            prompt = str(meta.get("prompt", "") or "").strip()
+            if not prompt:
+                continue
+            norm = self._normalize_prompt_piece(prompt)
+            if norm and norm not in seen:
+                seen.add(norm)
+                extras.append(prompt)
+        return extras
+
+    def _merge_prompt_with_lora_extras(self, base_prompt: str):
+        base_prompt = (base_prompt or "").strip()
+        extras = self._collect_lora_prompt_extras()
+        if not extras:
+            return base_prompt, 0
+
+        existing = {self._normalize_prompt_piece(p) for p in self._split_prompt_pieces(base_prompt)}
+        append_parts = []
+        for text in extras:
+            norm = self._normalize_prompt_piece(text)
+            if norm and norm not in existing:
+                existing.add(norm)
+                append_parts.append(text)
+
+        if not append_parts:
+            return base_prompt, 0
+        if base_prompt:
+            return f"{base_prompt}, {', '.join(append_parts)}", len(append_parts)
+        return ", ".join(append_parts), len(append_parts)
 
     def _init_workspace_persistence(self):
         """初始化工作区持久化：连接信号并加载初始值"""
@@ -2786,8 +3227,353 @@ class ParameterPanel(QWidget):
             lambda t: self.settings.setValue("gen_clip", t)
         )
 
-        # 8. LoRAs
+        # 8. Compare settings
+        self.compare_weights_input.textChanged.connect(
+            lambda t: self.settings.setValue("compare_weights", t)
+        )
+        saved_compare_weights = self.settings.value("compare_weights", "0.7,0.75,0.8,0.85", type=str)
+        if saved_compare_weights:
+            self.compare_weights_input.setText(saved_compare_weights)
+
+        self.compare_combo_mode.currentIndexChanged.connect(
+            lambda _: self.settings.setValue("compare_combo_mode", self.compare_combo_mode.currentData())
+        )
+        saved_combo_mode = self.settings.value("compare_combo_mode", "cartesian", type=str)
+        idx_combo_mode = self.compare_combo_mode.findData(saved_combo_mode)
+        self.compare_combo_mode.setCurrentIndex(idx_combo_mode if idx_combo_mode >= 0 else 0)
+
+        self.compare_seed_mode_combo.currentIndexChanged.connect(
+            lambda _: self.settings.setValue("compare_seed_mode", self.compare_seed_mode_combo.currentData())
+        )
+        saved_seed_mode = self.settings.value("compare_seed_mode", "fixed", type=str)
+        idx_seed_mode = self.compare_seed_mode_combo.findData(saved_seed_mode)
+        self.compare_seed_mode_combo.setCurrentIndex(idx_seed_mode if idx_seed_mode >= 0 else 0)
+
+        self.compare_include_baseline.toggled.connect(
+            lambda checked: self.settings.setValue("compare_include_baseline", checked)
+        )
+        self.compare_include_baseline.setChecked(
+            self.settings.value("compare_include_baseline", False, type=bool)
+        )
+
+        # 9. LoRAs
         self._load_loras()
+
+    def _open_last_compare_from_panel(self):
+        self.compare_generate_requested.emit({"action": "open_last"})
+
+    def _parse_compare_weights(self) -> List[float]:
+        return parse_compare_weights_expression(self.compare_weights_input.text())
+
+    def _get_compare_seed(self, seed_mode: str) -> int:
+        if seed_mode == "fixed":
+            seed_text = self.seed_input.text().strip()
+            try:
+                seed_val = int(seed_text)
+            except Exception:
+                seed_val = -1
+            if seed_val == -1:
+                fallback_seed = self.last_image_seed if self.last_image_seed not in (None, "", "-1") else 1
+                try:
+                    seed_val = int(fallback_seed)
+                except Exception:
+                    seed_val = 1
+                self.seed_input.setText(str(seed_val))
+            return int(seed_val)
+        return random.SystemRandom().randint(10**17, 18446744073709551614)
+
+    def _alloc_workflow_node_id(self, workflow: Dict[str, Any]) -> str:
+        numeric_ids = [int(k) for k in workflow.keys() if str(k).isdigit()]
+        return str((max(numeric_ids) if numeric_ids else 0) + 1)
+
+    def _find_prompt_node_ids_for_workflow(self, workflow: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        # 首选 KSampler 的 positive/negative 回链
+        for _, node in workflow.items():
+            ctype = str(node.get("class_type", "")).lower()
+            if "ksampler" not in ctype:
+                continue
+            inputs = node.get("inputs", {})
+            pos_link = inputs.get("positive")
+            neg_link = inputs.get("negative")
+            pos_id = str(pos_link[0]) if isinstance(pos_link, list) and pos_link else None
+            neg_id = str(neg_link[0]) if isinstance(neg_link, list) and neg_link else None
+            return pos_id, neg_id
+        return None, None
+
+    def _apply_compare_loras(
+        self,
+        workflow: Dict[str, Any],
+        lora_items: List[Tuple[str, float]]
+    ) -> List[str]:
+        missing_loras: List[str] = []
+        lora_nodes = []
+        for nid, node in workflow.items():
+            ctype = str(node.get("class_type", "")).lower()
+            if "loraloader" in ctype:
+                try:
+                    sort_id = int(nid)
+                except Exception:
+                    sort_id = 10**9
+                lora_nodes.append((sort_id, str(nid)))
+        lora_nodes.sort(key=lambda x: x[0])
+
+        if not lora_nodes:
+            return [name for name, _ in lora_items]
+
+        first_id = lora_nodes[0][1]
+        first_node = workflow.get(first_id, {})
+        first_inputs = first_node.get("inputs", {})
+        chain_ids = [nid for _, nid in lora_nodes]
+
+        # 如果节点数量不足，则按首个 LoRA 节点链式扩容
+        if len(lora_items) > len(chain_ids) and "model" in first_inputs:
+            prev_id = first_id
+            appended_ids = []
+            for _ in range(len(lora_items) - len(chain_ids)):
+                new_id = self._alloc_workflow_node_id(workflow)
+                new_node = copy.deepcopy(first_node)
+                new_inputs = new_node.setdefault("inputs", {})
+                new_inputs["model"] = [prev_id, 0]
+                if "clip" in new_inputs:
+                    new_inputs["clip"] = [prev_id, 1]
+                workflow[new_id] = new_node
+                appended_ids.append(new_id)
+                prev_id = new_id
+
+            # 将原先消费 first_id 输出的 model/clip 引用重定向到链尾
+            if appended_ids:
+                final_id = appended_ids[-1]
+                for nid, node in workflow.items():
+                    if nid in appended_ids:
+                        continue
+                    inputs = node.get("inputs", {})
+                    for key, value in inputs.items():
+                        if not isinstance(value, list) or len(value) < 2:
+                            continue
+                        if str(value[0]) != first_id:
+                            continue
+                        if value[1] == 0:
+                            inputs[key] = [final_id, 0]
+                        elif value[1] == 1 and "clip" in first_inputs:
+                            inputs[key] = [final_id, 1]
+
+                chain_ids = [nid for _, nid in lora_nodes] + appended_ids
+
+        # baseline 或多余节点都要静音
+        for idx, nid in enumerate(chain_ids):
+            node = workflow.get(nid, {})
+            inputs = node.get("inputs", {})
+            if idx < len(lora_items):
+                lora_name, lora_weight = lora_items[idx]
+                resolved = self._find_best_lora_match(lora_name)
+                if "lora_name" in inputs:
+                    if resolved:
+                        inputs["lora_name"] = resolved
+                    else:
+                        missing_loras.append(lora_name)
+                applied_weight = lora_weight if resolved or "lora_name" not in inputs else 0.0
+                if "strength_model" in inputs:
+                    inputs["strength_model"] = applied_weight
+                if "strength_clip" in inputs:
+                    inputs["strength_clip"] = applied_weight
+            else:
+                if "strength_model" in inputs:
+                    inputs["strength_model"] = 0.0
+                if "strength_clip" in inputs:
+                    inputs["strength_clip"] = 0.0
+
+        return sorted(set(missing_loras))
+
+    def _build_compare_workflow(self, variant: Dict[str, Any], seed_mode: str) -> Dict[str, Any]:
+        workflow = copy.deepcopy(DEFAULT_T2I_WORKFLOW)
+
+        prompt_text = self.prompt_edit.toPlainText().strip()
+        neg_text = self.neg_prompt_edit.toPlainText().strip()
+        prompt_text, _ = self._merge_prompt_with_lora_extras(prompt_text)
+
+        pos_id, neg_id = self._find_prompt_node_ids_for_workflow(workflow)
+        if pos_id and pos_id in workflow:
+            workflow[pos_id].setdefault("inputs", {})["text"] = prompt_text
+        if neg_id and neg_id in workflow:
+            workflow[neg_id].setdefault("inputs", {})["text"] = neg_text
+
+        res_data = self.resolution_combo.currentData()
+        user_width, user_height = res_data if res_data else (1200, 1600)
+        user_steps = self.steps_value.value()
+        user_cfg = self.cfg_value.value()
+        user_sampler = self.sampler_combo.currentText()
+        user_scheduler = self.scheduler_combo.currentText()
+
+        seed_value = variant.get("seed")
+        if seed_mode == "random" and seed_value is None:
+            seed_value = random.SystemRandom().randint(10**17, 18446744073709551614)
+
+        for node_id, node in workflow.items():
+            class_type = str(node.get("class_type", "")).lower()
+            inputs = node.setdefault("inputs", {})
+
+            if "ksampler" in class_type:
+                if "seed" in inputs and seed_value is not None:
+                    inputs["seed"] = int(seed_value)
+                if "steps" in inputs:
+                    inputs["steps"] = user_steps
+                if "cfg" in inputs:
+                    inputs["cfg"] = user_cfg
+                if "sampler_name" in inputs and user_sampler:
+                    inputs["sampler_name"] = user_sampler
+                if "scheduler" in inputs and user_scheduler:
+                    inputs["scheduler"] = user_scheduler
+
+            if "latentimage" in class_type and "empty" in class_type:
+                if "width" in inputs:
+                    inputs["width"] = user_width
+                if "height" in inputs:
+                    inputs["height"] = user_height
+                if "batch_size" in inputs:
+                    inputs["batch_size"] = 1
+
+            if "checkpointloader" in class_type and "ckpt_name" in inputs:
+                selected_model = self.model_combo.currentText() if hasattr(self, "model_combo") else ""
+                if selected_model and selected_model != "自动":
+                    resolved_model = self._find_best_model_match(selected_model)
+                    if resolved_model:
+                        inputs["ckpt_name"] = resolved_model
+
+            if "unetloader" in class_type and "unet_name" in inputs:
+                selected_unet = self.unet_combo.currentText() if hasattr(self, "unet_combo") else ""
+                if selected_unet and selected_unet != "自动":
+                    resolved_unet = self._find_best_unet_match(selected_unet)
+                    if resolved_unet:
+                        inputs["unet_name"] = resolved_unet
+
+            if "vaeloader" in class_type and "vae_name" in inputs:
+                selected_vae = self.vae_combo.currentText() if hasattr(self, "vae_combo") else ""
+                if selected_vae and selected_vae != "自动":
+                    resolved_vae = self._find_best_vae_match(selected_vae)
+                    if resolved_vae:
+                        inputs["vae_name"] = resolved_vae
+
+            if "cliploader" in class_type and "clip_name" in inputs:
+                selected_clip = self.clip_combo.currentText() if hasattr(self, "clip_combo") else ""
+                if selected_clip and selected_clip != "自动":
+                    resolved_clip = self._find_best_clip_match(selected_clip)
+                    if resolved_clip:
+                        inputs["clip_name"] = resolved_clip
+
+        lora_items = variant.get("lora_items", [])
+        missing_loras = self._apply_compare_loras(workflow, lora_items)
+        if missing_loras:
+            self._temp_notify(f"⚠️ LoRA 未匹配到: {'、'.join(missing_loras)}")
+        return workflow
+
+    def _build_compare_variants(self) -> Tuple[List[Dict[str, Any]], str]:
+        weights = self._parse_compare_weights()
+        combo_mode = str(self.compare_combo_mode.currentData() or "cartesian")
+        seed_mode = str(self.compare_seed_mode_combo.currentData() or "fixed")
+        include_baseline = self.compare_include_baseline.isChecked()
+        lora_names = list(self.current_loras.keys())
+
+        if not lora_names and not include_baseline:
+            raise ValueError("当前没有选择 LoRA，至少选择一个 LoRA 或勾选基线图。")
+
+        variants: List[Dict[str, Any]] = []
+        if include_baseline:
+            variants.append(
+                {
+                    "variant_id": "baseline",
+                    "label": "基线图 (无LoRA)",
+                    "lora_items": [],
+                    "is_baseline": True,
+                }
+            )
+
+        if lora_names:
+            if combo_mode == "pairwise":
+                if len(lora_names) != len(weights):
+                    raise ValueError(
+                        f"按位配对模式要求 LoRA 数量({len(lora_names)}) 与权重数量({len(weights)})一致。"
+                    )
+                pairs = list(zip(lora_names, weights))
+            else:
+                pairs = [(lora_name, weight) for lora_name in lora_names for weight in weights]
+
+            for idx, (lora_name, weight) in enumerate(pairs):
+                variants.append(
+                    {
+                        "variant_id": f"variant_{idx + 1}",
+                        "label": f"{os.path.basename(lora_name)} @ {weight:g}",
+                        "lora_name": lora_name,
+                        "lora_weight": float(weight),
+                        "lora_items": [(lora_name, float(weight))],
+                    }
+                )
+
+        # 填充 seed
+        fixed_seed = self._get_compare_seed(seed_mode) if seed_mode == "fixed" else None
+        for variant in variants:
+            if seed_mode == "fixed":
+                variant["seed"] = fixed_seed
+            else:
+                variant["seed"] = random.SystemRandom().randint(10**17, 18446744073709551614)
+            variant["seed_mode"] = seed_mode
+        return variants, seed_mode
+
+    def _on_compare_generate_click(self):
+        try:
+            variants, seed_mode = self._build_compare_variants()
+        except Exception as e:
+            QMessageBox.warning(self, "参数错误", str(e))
+            return
+
+        expected_count = len(variants)
+        if expected_count <= 0:
+            QMessageBox.warning(self, "提示", "没有可提交的对比任务。")
+            return
+
+        if expected_count > 20:
+            ret = QMessageBox.question(
+                self,
+                "数量较多",
+                f"本次将提交 {expected_count} 个对比任务，是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+
+        self._refresh_comfyui_assets()
+        session_id = str(uuid.uuid4())
+        session_name = f"LoRA对比 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+        workflows: List[Dict[str, Any]] = []
+        contexts: List[Dict[str, Any]] = []
+        for idx, variant in enumerate(variants):
+            workflow = self._build_compare_workflow(variant, seed_mode=seed_mode)
+            workflows.append(workflow)
+            contexts.append(
+                {
+                    "session_id": session_id,
+                    "variant_id": variant["variant_id"],
+                    "variant_index": idx,
+                    "label": variant["label"],
+                    "seed_mode": seed_mode,
+                    "seed": variant.get("seed"),
+                }
+            )
+
+        payload = {
+            "action": "start",
+            "session_id": session_id,
+            "session_name": session_name,
+            "expected_count": expected_count,
+            "seed_mode": seed_mode,
+            "variants": variants,
+            "workflows": workflows,
+            "contexts": contexts,
+            "prompt": self.prompt_edit.toPlainText().strip(),
+            "negative_prompt": self.neg_prompt_edit.toPlainText().strip(),
+        }
+        self.compare_generate_requested.emit(payload)
+        self._temp_notify(f"已提交 LoRA 对比任务: {expected_count} 张")
 
     def _on_remote_gen_click(self):
         """处理远程生成点击"""
@@ -2819,6 +3605,8 @@ class ParameterPanel(QWidget):
         # 智能同步修改后的提示词到工作流 (V5.4 精准透明版)
         new_prompt = self.prompt_edit.toPlainText().strip()
         new_neg = self.neg_prompt_edit.toPlainText().strip()
+        new_prompt, lora_prompt_count = self._merge_prompt_with_lora_extras(new_prompt)
+        self._log(f"[Comfy] 已附加 LoRA 提示词: {lora_prompt_count} 条")
         
         # 1. 注入提示词 (智能追踪版)
         def find_prompt_nodes_by_tracing(wf):
@@ -2928,11 +3716,19 @@ class ParameterPanel(QWidget):
         if not self.seed_random_checkbox.isChecked():
             # 不随机，读取输入框
             user_seed_text = self.seed_input.text().strip()
-            if user_seed_text and user_seed_text != "-1":
+            try:
+                parsed_seed = int(user_seed_text) if user_seed_text else None
+            except Exception:
+                parsed_seed = None
+            if parsed_seed is None or parsed_seed == -1:
+                fallback_seed = self.last_image_seed if self.last_image_seed not in (None, "", "-1") else 1
                 try:
-                    user_seed = int(user_seed_text)
-                except:
-                    pass  # 无效输入，忽略
+                    user_seed = int(fallback_seed)
+                except Exception:
+                    user_seed = 1
+                self.seed_input.setText(str(user_seed))
+            else:
+                user_seed = parsed_seed
         
         # 从下拉框获取分辨率
         res_data = self.resolution_combo.currentData()
@@ -2985,7 +3781,8 @@ class ParameterPanel(QWidget):
                     inputs['seed'] = final_seed
                     # 实时反馈：将生成的随机种子显示在界面上，不再隐藏
                     self.seed_input.setText(str(final_seed))
-                    self._log(f"[Comfy] -> 注入超随机Seed: 节点 {node_id} -> {final_seed}")
+                    seed_mode = "固定Seed" if user_seed is not None else "超随机Seed"
+                    self._log(f"[Comfy] -> 注入{seed_mode}: 节点 {node_id} -> {final_seed}")
                 
                 # Steps
                 if 'steps' in inputs:
@@ -3274,7 +4071,7 @@ class ParameterPanel(QWidget):
         
         # 发送请求信号
         batch_count = self.batch_count_spin.value()
-        self.remote_gen_requested.emit(workflow, batch_count)
+        self.remote_gen_requested.emit(workflow, batch_count, self.seed_random_checkbox.isChecked())
         QTimer.singleShot(800, _restore_btn)
 
     def set_available_models(self, models: List[str]):
@@ -3446,6 +4243,45 @@ class ParameterPanel(QWidget):
     def eventFilter(self, source, event):
         """实现点击复制逻辑"""
         from PyQt6.QtCore import QEvent
+        if hasattr(self, "workspace_scroll") and source is self.workspace_scroll.viewport():
+            if event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
+                self._apply_responsive_layout()
+                return False
+        if hasattr(self, "neg_bottom_handle") and source is self.neg_bottom_handle:
+            if event.type() == QEvent.Type.MouseButtonPress:
+                self._neg_bottom_dragging = True
+                try:
+                    self._neg_bottom_start_y = int(event.globalPosition().y())
+                except Exception:
+                    self._neg_bottom_start_y = int(event.pos().y())
+                self._neg_bottom_start_h = int(self.neg_prompt_edit.height())
+                sizes = self.prompt_splitter.sizes() if hasattr(self, "prompt_splitter") else [0, 0]
+                self._neg_bottom_start_top_size = int(sizes[0]) if len(sizes) > 0 else 0
+                self._neg_bottom_start_bottom_size = int(sizes[1]) if len(sizes) > 1 else 0
+                return True
+            if event.type() == QEvent.Type.MouseMove and self._neg_bottom_dragging:
+                try:
+                    current_y = int(event.globalPosition().y())
+                except Exception:
+                    current_y = int(event.pos().y())
+                delta = current_y - self._neg_bottom_start_y
+                new_h = max(40, min(520, self._neg_bottom_start_h + delta))
+                self.neg_prompt_edit.setFixedHeight(new_h)
+                if hasattr(self, "prompt_splitter"):
+                    bottom_delta = new_h - self._neg_bottom_start_h
+                    target_bottom = max(72, self._neg_bottom_start_bottom_size + bottom_delta)
+                    target_top = max(80, self._neg_bottom_start_top_size)
+                    target_total = target_top + target_bottom + self.prompt_splitter.handleWidth()
+                    self.prompt_splitter.setFixedHeight(target_total)
+                    self.prompt_splitter.setSizes([target_top, target_bottom])
+                    self.prompt_splitter.updateGeometry()
+                return True
+            if event.type() == QEvent.Type.MouseButtonRelease and self._neg_bottom_dragging:
+                self._neg_bottom_dragging = False
+                self.settings.setValue("param_panel/neg_prompt_height", int(self.neg_prompt_edit.height()))
+                if hasattr(self, "prompt_splitter"):
+                    self._save_prompt_splitter_state()
+                return True
         if event.type() == QEvent.Type.MouseButtonPress:
             if source is self.info_prompt_val.viewport():
                 self._copy_to_clip(self.info_prompt_val.toPlainText(), "✨ 提示词已复制")
@@ -3460,3 +4296,4 @@ class ParameterPanel(QWidget):
         if text:
             QApplication.clipboard().setText(text)
             self._temp_notify(f"✅ {msg}")
+

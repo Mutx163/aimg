@@ -3,12 +3,16 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QSplitter, QFileDialog, QToolBar, QMessageBox, 
                              QStatusBar, QLineEdit, QLabel, QTabWidget, QStackedWidget, 
                              QFrame, QComboBox, QPushButton, QAbstractSpinBox, QTextEdit, QApplication,
+                             QToolButton, QMenu, QStyle,
                              QProgressBar, QSizePolicy)
-from PyQt6.QtCore import Qt, QSize, QSettings, QTimer, QThread, QProcess, pyqtSignal
-from PyQt6.QtGui import QAction, QIcon, QImage
+from PyQt6.QtCore import Qt, QSize, QSettings, QTimer, QThread, QProcess, pyqtSignal, QUrl
+from PyQt6.QtGui import QAction, QActionGroup, QIcon, QImage, QDesktopServices
 import time
 import os
 import webbrowser
+import json
+from dataclasses import dataclass, field
+from typing import Dict, Any, List
 
 from src.core.watcher import FileWatcher
 from src.core.database import DatabaseManager
@@ -23,9 +27,25 @@ from src.core.cache import ThumbnailCache
 from src.ui.controllers.file_controller import FileController
 from src.ui.controllers.search_controller import SearchController
 from src.ui.dialogs.image_gallery_dialog import ImageGalleryDialog
+from src.ui.dialogs.compare_popup_dialog import ComparePopupDialog
 from src.services.web_server_service import WebServerService
 
+
+@dataclass
+class CompareSession:
+    session_id: str
+    name: str
+    mode: str
+    expected_count: int
+    completed_count: int = 0
+    variants: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    prompt_to_variant: Dict[str, str] = field(default_factory=dict)
+    items: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+
 class MainWindow(QMainWindow):
+    COMPARE_LAST_SESSION_KEY = "compare_last_session_v1"
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AI Image Viewer Pro")
@@ -46,6 +66,10 @@ class MainWindow(QMainWindow):
         self.current_folder = None
         self.current_model = "ALL"
         self.current_lora = "ALL"
+        self.compare_dialog = None
+        self.last_compare_session: CompareSession | None = None
+        self.compare_sessions: Dict[str, CompareSession] = {}
+        self._load_last_compare_session()
         
         # 初始化数据库与缓存
         self.db_manager = DatabaseManager()
@@ -110,13 +134,20 @@ class MainWindow(QMainWindow):
         
         # 监听队列状态以更新右下角计数
         self.comfy_client.queue_updated.connect(self._update_queue_button)
+        self._has_realtime_progress = False
+        self.queue_sync_timer = QTimer(self)
+        self.queue_sync_timer.setInterval(1000)
+        self.queue_sync_timer.timeout.connect(self.comfy_client.get_queue)
         # 初始获取一次队列
         QTimer.singleShot(2000, self.comfy_client.get_queue)
         
         # 绑定参数面板的远程生成请求
         self.param_panel.remote_gen_requested.connect(self.on_remote_gen_requested)
+        self.param_panel.compare_generate_requested.connect(self.on_compare_generate_requested)
         self.comfy_client.execution_start.connect(self._on_comfy_node_start)
         self.comfy_client.execution_done.connect(self._on_comfy_done)
+        self.comfy_client.prompt_submitted_with_context.connect(self._on_prompt_submitted_with_context)
+        self.comfy_client.prompt_executed_images.connect(self._on_prompt_executed_images)
         
         # 日志系统:使用定时器轮询param_panel的日志列表
         self.log_poll_timer = QTimer(self)
@@ -162,78 +193,95 @@ class MainWindow(QMainWindow):
 
     def setup_ui(self):
         # 1. 工具栏 - Windows 原生风格
-        toolbar = QToolBar("Main Toolbar")
+        self.top_toolbar = QToolBar("Main Toolbar")
+        toolbar = self.top_toolbar
+        toolbar.setObjectName("TopToolbar")
         toolbar.setMovable(False)
+        toolbar.setFloatable(False)
         toolbar.setIconSize(QSize(20, 20))
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        # 移除硬编码样式，改由 apply_theme 统一控制
-        self.addToolBar(toolbar)
         
-        action_open = QAction("打开文件夹", self)
-        action_open.triggered.connect(self.select_folder)
-        toolbar.addAction(action_open)
-        
-        action_refresh = QAction("刷新", self)
-        action_refresh.triggered.connect(self.refresh_folder)
-        toolbar.addAction(action_refresh)
-        
-        toolbar.addSeparator()
-        
-        # 缩放控制 - 下拉列表样式
-        zoom_label = QLabel(" 缩放: ")
-        zoom_label.setStyleSheet("color: palette(window-text); font-weight: bold;")
-        toolbar.addWidget(zoom_label)
-        
-        self.zoom_combo = QComboBox()
-        self.zoom_combo.setMinimumWidth(100)
-        # 添加选项 (显示文本, 用户数据)
-        self.zoom_combo.addItem("适应窗口", "fit")
-        self.zoom_combo.addItem("铺满窗口", "fill")
-        self.zoom_combo.addItem("100% 原始大小", "1.0")
-        self.zoom_combo.addItem("50%", "0.5")
-        self.zoom_combo.addItem("200%", "2.0")
-        self.zoom_combo.addItem("400%", "4.0")
-        
-        self.zoom_combo.currentIndexChanged.connect(self._on_zoom_changed)
-        toolbar.addWidget(self.zoom_combo)
-        
-        toolbar.addSeparator()
-        
-        self.action_compare = QAction("对比模式", self)
-        self.action_compare.setCheckable(True)
-        self.action_compare.triggered.connect(self.toggle_comparison_mode)
-        toolbar.addAction(self.action_compare)
-        
-        toolbar.addSeparator()
-        
-        # 排序选择 - 优化样式
-        sort_label = QLabel(" 排序: ")
-        sort_label.setStyleSheet("color: palette(window-text); font-weight: bold;")
-        toolbar.addWidget(sort_label)
-        
-        self.sort_combo = QComboBox()
-        # 移除硬编码样式
-        self.sort_combo.addItem("时间倒序 (最新在前)", "time_desc")
-        self.sort_combo.addItem("时间正序 (最旧在前)", "time_asc")
-        self.sort_combo.addItem("名称 A-Z", "name_asc")
-        self.sort_combo.addItem("名称 Z-A", "name_desc")
-        
-        # 设置当前选中项
-        index = self.sort_combo.findData(self.current_sort_by)
-        if index >= 0: self.sort_combo.setCurrentIndex(index)
-        
-        self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
-        toolbar.addWidget(self.sort_combo)
-        
-        toolbar.addSeparator()
-        action_settings = QAction("设置", self)
-        action_settings.triggered.connect(self.open_settings)
-        toolbar.addAction(action_settings)
+        # 顶栏仅保留功能菜单，避免与系统标题栏形成“双标题”视觉。
+
+        def add_menu_button(title: str, menu: QMenu) -> QToolButton:
+            btn = QToolButton(self)
+            btn.setObjectName("TopBarMenuButton")
+            btn.setText(title)
+            btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            btn.setMenu(menu)
+            toolbar.addWidget(btn)
+            return btn
+
+        file_menu = QMenu(self)
+        file_menu.addAction("打开文件夹", self.select_folder)
+        file_menu.addAction("刷新列表", self.refresh_folder)
+        file_menu.addSeparator()
+        file_menu.addAction("打开输出文件夹", self.open_output_folder)
+        file_menu.addAction("打开 LoRA 文件夹", self.open_lora_folder)
+        file_menu.addSeparator()
+        file_menu.addAction("设置", self.open_settings)
+        self.file_menu_btn = add_menu_button("文件", file_menu)
+
+        view_menu = QMenu(self)
+        self.action_compare = QAction("打开对比弹窗", self)
+        self.action_compare.triggered.connect(self.open_compare_popup)
+        view_menu.addAction(self.action_compare)
+        view_menu.addAction("图片画廊", self.show_image_gallery)
+        self.view_menu_btn = add_menu_button("查看", view_menu)
+
+        self._zoom_options = [
+            ("适应窗口", "fit"),
+            ("铺满窗口", "fill"),
+            ("100% 原始大小", "1.0"),
+            ("50%", "0.5"),
+            ("200%", "2.0"),
+            ("400%", "4.0"),
+        ]
+        self.current_zoom_mode = self.settings.value("zoom_mode", "fit", type=str)
+        self.zoom_menu = QMenu(self)
+        self.zoom_action_group = QActionGroup(self)
+        self.zoom_action_group.setExclusive(True)
+        self.zoom_actions = {}
+        for label, value in self._zoom_options:
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.triggered.connect(lambda checked, v=value: self._set_zoom_mode(v))
+            self.zoom_action_group.addAction(act)
+            self.zoom_menu.addAction(act)
+            self.zoom_actions[value] = act
+        self.zoom_menu_btn = add_menu_button("缩放", self.zoom_menu)
+        self._set_zoom_mode(self.current_zoom_mode, apply=False)
+
+        self._sort_options = [
+            ("时间倒序 (最新在前)", "time_desc"),
+            ("时间正序 (最旧在前)", "time_asc"),
+            ("名称 A-Z", "name_asc"),
+            ("名称 Z-A", "name_desc"),
+        ]
+        self.sort_menu = QMenu(self)
+        self.sort_action_group = QActionGroup(self)
+        self.sort_action_group.setExclusive(True)
+        self.sort_actions = {}
+        for label, value in self._sort_options:
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.triggered.connect(lambda checked, v=value: self._set_sort_mode(v))
+            self.sort_action_group.addAction(act)
+            self.sort_menu.addAction(act)
+            self.sort_actions[value] = act
+        self.sort_menu_btn = add_menu_button("排序", self.sort_menu)
+        self._set_sort_mode(self.current_sort_by, trigger_search=False)
 
         toolbar.addSeparator()
+        toolbar_spacer = QWidget()
+        toolbar_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        toolbar.addWidget(toolbar_spacer)
+
+        tool_menu = QMenu(self)
         self.action_web = QAction("启动 Web", self)
         self.action_web.triggered.connect(self.toggle_web_service)
-        toolbar.addAction(self.action_web)
+        tool_menu.addAction(self.action_web)
+        self.tool_menu_btn = add_menu_button("服务", tool_menu)
         
         self.addToolBar(toolbar)
         
@@ -504,6 +552,60 @@ class MainWindow(QMainWindow):
             self.param_panel.refresh_lora_options()
             self.statusBar().showMessage("已刷新列表与可用资源", 2000)
 
+    def _resolve_comfyui_models_root(self):
+        base = self.settings.value("comfy_root", "", type=str).strip()
+        if not base:
+            return ""
+        base_lower = os.path.basename(base).lower()
+        if base_lower == "models":
+            return base
+        has_models_subdir = any(
+            os.path.isdir(os.path.join(base, name))
+            for name in ("checkpoints", "loras", "unet", "vae", "clip")
+        )
+        if has_models_subdir:
+            return base
+        models_dir = os.path.join(base, "models")
+        if os.path.isdir(models_dir):
+            return models_dir
+        return base
+
+    def _open_folder_in_system(self, path, label):
+        if not path:
+            QMessageBox.information(self, "路径未配置", f"请先在设置中配置{label}路径。")
+            return
+        target = os.path.normpath(path)
+        if not os.path.isdir(target):
+            QMessageBox.warning(self, "目录不存在", f"{label}目录不存在:\n{target}")
+            return
+        if QDesktopServices.openUrl(QUrl.fromLocalFile(target)):
+            self.statusBar().showMessage(f"已打开{label}目录: {target}", 3000)
+        else:
+            QMessageBox.warning(self, "打开失败", f"无法打开目录:\n{target}")
+
+    def open_lora_folder(self):
+        models_root = self._resolve_comfyui_models_root()
+        if not models_root:
+            QMessageBox.information(self, "未配置 ComfyUI 目录", "请先在设置中配置 ComfyUI 目录。")
+            return
+        self._open_folder_in_system(os.path.join(models_root, "loras"), "LoRA")
+
+    def open_output_folder(self):
+        # 优先打开当前正在浏览/监控的图片目录，符合用户常用操作。
+        if self.current_folder and os.path.isdir(self.current_folder):
+            self._open_folder_in_system(self.current_folder, "图片输出")
+            return
+
+        comfy_root = self.settings.value("comfy_root", "", type=str).strip()
+        if not comfy_root:
+            QMessageBox.information(
+                self,
+                "未找到输出目录",
+                "当前没有可用的图片目录。请先选择图片文件夹，或在设置中配置 ComfyUI 目录。",
+            )
+            return
+        self._open_folder_in_system(os.path.join(comfy_root, "output"), "图片输出")
+
     def _load_historical_resolutions(self):
         """从数据库加载历史分辨率并更新到参数面板"""
         try:
@@ -545,20 +647,17 @@ class MainWindow(QMainWindow):
             self._load_historical_schedulers()
 
 
-    def on_remote_gen_requested(self, workflow, batch_count=1):
+    def on_remote_gen_requested(self, workflow, batch_count=1, randomize_seed=True):
         """处理远程生成请求 - 使用当前图片的workflow重新生成"""
         # 清空上一轮日志缓存
         self.last_gen_logs = ""
         self.last_log_count = 0
         
-        # 使用当前图片的workflow，但会自动修改随机种子
-        print(f"[Main] 远程生成: 使用当前图片的workflow（随机种子） x{batch_count}")
-        self.comfy_client.queue_current_prompt(workflow, batch_count)
+        # 随机模式每次提交自动随机；固定模式按工作区指定seed提交
+        seed_mode_text = "随机种子" if randomize_seed else "固定种子"
+        print(f"[Main] 远程生成: 使用当前图片的workflow（{seed_mode_text}） x{batch_count}")
+        self.comfy_client.queue_current_prompt(workflow, batch_count, randomize_seed)
         self.statusBar().showMessage(f"已发送 {batch_count} 个生成请求到ComfyUI", 3000)
-    def _on_prompt_submitted(self, prompt_id):
-        """当任务成功提交到 ComfyUI 后触发"""
-        self.statusBar().showMessage(f"请求已提交 (ID: {prompt_id[:8]}...)", 5000)
-
     def on_image_selected(self, path):
         """记录选中的图片路径，并启动同步定时器"""
         if not path: return
@@ -596,7 +695,7 @@ class MainWindow(QMainWindow):
         
         # 2. 只有在单图模式下才重置缩放（对比模式由其自己管理）
         if self.view_stack.currentIndex() == 0:
-            self._on_zoom_changed(self.zoom_combo.currentIndex())
+            self._on_zoom_changed()
         
         # 3. 解析并显示参数 (优化：如果是扫描阶段，参数更新可以更慢)
         from src.core.metadata import MetadataParser
@@ -778,6 +877,7 @@ class MainWindow(QMainWindow):
         """显示全屏图片库弹窗"""
         dlg = ImageGalleryDialog(self.thumbnail_list.image_model, self)
         dlg.image_selected.connect(self._on_gallery_image_selected)
+        dlg.compare_selected.connect(self._on_gallery_compare_selected)
         dlg.exec()
 
     def _on_gallery_image_selected(self, path):
@@ -788,6 +888,350 @@ class MainWindow(QMainWindow):
                 self.thumbnail_list.setCurrentRow(i)
                 break
         self.on_image_selected(path)
+
+    def _on_gallery_compare_selected(self, paths):
+        self.open_compare_popup(paths=paths, title="图库手动对比")
+
+    def _compare_session_to_dict(self, session: CompareSession) -> Dict[str, Any]:
+        return {
+            "session_id": session.session_id,
+            "name": session.name,
+            "mode": session.mode,
+            "expected_count": int(session.expected_count),
+            "completed_count": int(session.completed_count),
+            "variants": session.variants,
+            "prompt_to_variant": session.prompt_to_variant,
+            "items": session.items,
+            "saved_at": int(time.time()),
+        }
+
+    def _compare_session_from_dict(self, data: Dict[str, Any]) -> CompareSession | None:
+        try:
+            session_id = str(data.get("session_id") or "")
+            if not session_id:
+                return None
+            session = CompareSession(
+                session_id=session_id,
+                name=str(data.get("name") or "对比会话"),
+                mode=str(data.get("mode") or "generate"),
+                expected_count=int(data.get("expected_count") or 0),
+                completed_count=int(data.get("completed_count") or 0),
+            )
+            session.variants = dict(data.get("variants") or {})
+            session.prompt_to_variant = dict(data.get("prompt_to_variant") or {})
+            items = dict(data.get("items") or {})
+            # 兜底修复 item 结构
+            normalized_items: Dict[str, Dict[str, Any]] = {}
+            for variant_id, item in items.items():
+                if not isinstance(item, dict):
+                    continue
+                normalized_items[str(variant_id)] = {
+                    "variant_id": str(item.get("variant_id") or variant_id),
+                    "status": str(item.get("status") or "queued"),
+                    "path": item.get("path"),
+                    "label": str(item.get("label") or variant_id),
+                    "meta": item.get("meta") if isinstance(item.get("meta"), dict) else {},
+                }
+            session.items = normalized_items
+            if session.expected_count <= 0:
+                session.expected_count = len(session.items)
+            if session.completed_count < 0:
+                session.completed_count = 0
+            if session.completed_count > session.expected_count:
+                session.completed_count = session.expected_count
+            return session
+        except Exception:
+            return None
+
+    def _save_last_compare_session(self):
+        if not self.last_compare_session:
+            self.settings.remove(self.COMPARE_LAST_SESSION_KEY)
+            return
+        try:
+            payload = self._compare_session_to_dict(self.last_compare_session)
+            self.settings.setValue(self.COMPARE_LAST_SESSION_KEY, json.dumps(payload, ensure_ascii=False))
+        except Exception as e:
+            print(f"[Compare] 保存最近会话失败: {e}")
+
+    def _load_last_compare_session(self):
+        raw = self.settings.value(self.COMPARE_LAST_SESSION_KEY, "", type=str)
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return
+            session = self._compare_session_from_dict(data)
+            if not session:
+                return
+            self.last_compare_session = session
+            self.compare_sessions[session.session_id] = session
+        except Exception as e:
+            print(f"[Compare] 加载最近会话失败: {e}")
+
+    def _ensure_compare_dialog(self) -> ComparePopupDialog:
+        if not self.compare_dialog:
+            self.compare_dialog = ComparePopupDialog(self)
+        return self.compare_dialog
+
+    def _session_items_as_list(self, session: CompareSession) -> List[Dict[str, Any]]:
+        return [session.items[k] for k in session.items.keys()]
+
+    def _refresh_compare_dialog_for_session(self, session: CompareSession) -> None:
+        dlg = self._ensure_compare_dialog()
+        dlg.set_session(
+            {
+                "name": session.name,
+                "expected_count": session.expected_count,
+                "completed_count": session.completed_count,
+                "mode": session.mode,
+            }
+        )
+        dlg.set_items(self._session_items_as_list(session))
+
+    def _remember_manual_compare_session(self, paths: List[str], title: str) -> None:
+        session_id = f"manual_{int(time.time() * 1000)}"
+        session = CompareSession(
+            session_id=session_id,
+            name=title,
+            mode="manual",
+            expected_count=len(paths),
+            completed_count=len(paths),
+        )
+        for idx, path in enumerate(paths):
+            variant_id = f"manual_{idx}"
+            item = {
+                "variant_id": variant_id,
+                "status": "done",
+                "path": path,
+                "label": os.path.basename(path) if path else f"图{idx + 1}",
+                "meta": {"manual": True},
+            }
+            session.items[variant_id] = item
+            session.variants[variant_id] = {"label": item["label"]}
+        self.compare_sessions[session_id] = session
+        self.last_compare_session = session
+        self._save_last_compare_session()
+
+    def open_compare_popup(self, checked: bool = False, paths: List[str] | None = None, title: str | None = None):
+        if paths:
+            valid_paths = [p for p in paths if p and os.path.exists(p)]
+            if len(valid_paths) < 2:
+                QMessageBox.information(self, "提示", "可对比图片少于 2 张。")
+                return
+            dlg = self._ensure_compare_dialog()
+            session_title = title or "手动对比"
+            dlg.open_with_paths(valid_paths, title=session_title)
+            self._remember_manual_compare_session(valid_paths, session_title)
+            return
+
+        if self.last_compare_session:
+            session = self.last_compare_session
+            self._refresh_compare_dialog_for_session(session)
+            dlg = self._ensure_compare_dialog()
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+
+        indexes = self.thumbnail_list.selectionModel().selectedIndexes() if self.thumbnail_list.selectionModel() else []
+        selected_paths = []
+        for idx in indexes:
+            if idx.isValid():
+                path = self.thumbnail_list.image_model.get_path(idx.row())
+                if path:
+                    selected_paths.append(path)
+
+        if len(selected_paths) >= 2:
+            self.open_compare_popup(paths=selected_paths, title="当前列表手动对比")
+            return
+        QMessageBox.information(self, "提示", "暂无可恢复会话。请先做一次 LoRA 对比生成或在图库中多选图片。")
+
+    def on_compare_generate_requested(self, payload: Dict[str, Any]):
+        action = str(payload.get("action") or "")
+        if action == "open_last":
+            self.open_compare_popup()
+            return
+        if action != "start":
+            return
+
+        workflows = payload.get("workflows") or []
+        contexts = payload.get("contexts") or []
+        variants = payload.get("variants") or []
+        session_id = str(payload.get("session_id") or "")
+        session_name = str(payload.get("session_name") or "LoRA对比")
+        expected_count = int(payload.get("expected_count") or len(workflows))
+        if not session_id or not workflows:
+            QMessageBox.warning(self, "提交失败", "对比任务数据不完整。")
+            return
+
+        session = CompareSession(
+            session_id=session_id,
+            name=session_name,
+            mode="generate",
+            expected_count=expected_count,
+            completed_count=0,
+        )
+
+        for variant in variants:
+            variant_id = str(variant.get("variant_id") or "")
+            if not variant_id:
+                continue
+            label = str(variant.get("label") or variant_id)
+            session.variants[variant_id] = variant
+            session.items[variant_id] = {
+                "variant_id": variant_id,
+                "status": "queued",
+                "path": None,
+                "label": label,
+                "meta": {
+                    "seed": variant.get("seed"),
+                    "seed_mode": variant.get("seed_mode"),
+                    "lora_name": variant.get("lora_name"),
+                    "lora_weight": variant.get("lora_weight"),
+                    "is_baseline": bool(variant.get("is_baseline", False)),
+                },
+            }
+
+        self.compare_sessions[session_id] = session
+        self.last_compare_session = session
+        self._save_last_compare_session()
+        self._refresh_compare_dialog_for_session(session)
+        self.open_compare_popup()
+
+        self.comfy_client.submit_workflow_batch(workflows, contexts)
+        self.statusBar().showMessage(f"已提交 LoRA 对比任务: {expected_count} 个", 5000)
+
+    def _on_prompt_submitted_with_context(self, prompt_id: str, context: Dict[str, Any]):
+        session_id = str(context.get("session_id") or "")
+        variant_id = str(context.get("variant_id") or "")
+        session = self.compare_sessions.get(session_id)
+        if not session or not variant_id:
+            return
+
+        session.prompt_to_variant[prompt_id] = variant_id
+        item = session.items.get(variant_id)
+        if not item:
+            return
+        if item.get("status") == "queued":
+            item["status"] = "submitted"
+        self._save_last_compare_session()
+
+        if self.compare_dialog:
+            self.compare_dialog.upsert_item(
+                variant_id=variant_id,
+                status=item.get("status", "submitted"),
+                path=item.get("path"),
+                label=item.get("label"),
+                meta=item.get("meta"),
+            )
+            self.compare_dialog.set_session(
+                {
+                    "name": session.name,
+                    "expected_count": session.expected_count,
+                    "completed_count": session.completed_count,
+                    "mode": session.mode,
+                }
+            )
+
+    def _resolve_comfy_image_path(self, image_info: Dict[str, Any]) -> str:
+        filename = str(image_info.get("filename") or "")
+        if not filename:
+            return ""
+        subfolder = str(image_info.get("subfolder") or "")
+        img_type = str(image_info.get("type") or "output")
+        comfy_root = str(self.settings.value("comfy_root", "", type=str) or "").strip()
+
+        candidates = []
+        if comfy_root:
+            candidates.append(os.path.normpath(os.path.join(comfy_root, img_type, subfolder, filename)))
+            candidates.append(os.path.normpath(os.path.join(comfy_root, "output", subfolder, filename)))
+            if os.path.basename(comfy_root).lower() == "models":
+                root_parent = os.path.dirname(comfy_root)
+                candidates.append(os.path.normpath(os.path.join(root_parent, "output", subfolder, filename)))
+                candidates.append(os.path.normpath(os.path.join(root_parent, img_type, subfolder, filename)))
+        if self.current_folder:
+            candidates.append(os.path.normpath(os.path.join(self.current_folder, subfolder, filename)))
+            candidates.append(os.path.normpath(os.path.join(self.current_folder, filename)))
+
+        for path in candidates:
+            if path and os.path.exists(path):
+                return path
+        return candidates[0] if candidates else ""
+
+    def _set_compare_item_done(
+        self,
+        session: CompareSession,
+        variant_id: str,
+        path: str,
+        unresolved: bool = False
+    ) -> None:
+        item = session.items.get(variant_id)
+        if not item:
+            return
+
+        if item.get("status") != "done":
+            session.completed_count += 1
+        item["status"] = "done"
+        if path and os.path.exists(path):
+            item["path"] = path
+        if unresolved:
+            item["label"] = f"{item.get('label', variant_id)} (结果未定位)"
+        self._save_last_compare_session()
+
+        if self.compare_dialog:
+            self.compare_dialog.upsert_item(
+                variant_id=variant_id,
+                status=item["status"],
+                path=item.get("path"),
+                label=item.get("label"),
+                meta=item.get("meta"),
+            )
+            self.compare_dialog.set_session(
+                {
+                    "name": session.name,
+                    "expected_count": session.expected_count,
+                    "completed_count": session.completed_count,
+                    "mode": session.mode,
+                }
+            )
+
+    def _resolve_compare_image_with_retry(
+        self,
+        session_id: str,
+        variant_id: str,
+        image_info: Dict[str, Any],
+        retry: int = 0
+    ) -> None:
+        session = self.compare_sessions.get(session_id)
+        if not session:
+            return
+        path = self._resolve_comfy_image_path(image_info)
+        if path and os.path.exists(path):
+            self._set_compare_item_done(session, variant_id, path, unresolved=False)
+            return
+        if retry < 3:
+            QTimer.singleShot(
+                500 * (retry + 1),
+                lambda: self._resolve_compare_image_with_retry(session_id, variant_id, image_info, retry + 1),
+            )
+            return
+        self._set_compare_item_done(session, variant_id, path, unresolved=True)
+
+    def _on_prompt_executed_images(self, prompt_id: str, images: List[Dict[str, Any]], context: Dict[str, Any]):
+        session_id = str(context.get("session_id") or "")
+        variant_id = str(context.get("variant_id") or "")
+        session = self.compare_sessions.get(session_id)
+        if not session:
+            return
+        if not variant_id:
+            variant_id = session.prompt_to_variant.get(prompt_id, "")
+        if not variant_id:
+            return
+        if not images:
+            return
+        image_info = images[0]
+        self._resolve_compare_image_with_retry(session_id, variant_id, image_info, retry=0)
 
     def apply_theme(self):
         """应用界面主题 (Windows 11 Fluent Design 风格)"""
@@ -805,7 +1249,16 @@ class MainWindow(QMainWindow):
                 "text_secondary": "#a1a1a1",
                 "accent": "#60cdff",          # Win11 默认蓝色高亮
                 "border": "#3c3c3c",
-                "separator": "#333333"
+                "separator": "#333333",
+                # VSCode-like top bar tokens
+                "topbar_bg": "#2d2d30",
+                "topbar_text": "#cccccc",
+                "topbar_text_active": "#ffffff",
+                "topbar_hover": "#37373d",
+                "topbar_pressed": "#3e3e42",
+                "topbar_checked": "#094771",
+                "topbar_border": "#3c3c3c",
+                "topbar_accent": "#007acc",
             }
         else:
             colors = {
@@ -818,7 +1271,16 @@ class MainWindow(QMainWindow):
                 "text_secondary": "#5f5f5f",
                 "accent": "#005a9e",
                 "border": "#d2d2d2",
-                "separator": "#e5e5e5"
+                "separator": "#e5e5e5",
+                # VSCode-like top bar tokens (light)
+                "topbar_bg": "#f3f3f3",
+                "topbar_text": "#4b4b4b",
+                "topbar_text_active": "#1f1f1f",
+                "topbar_hover": "#e7e7e7",
+                "topbar_pressed": "#dddddd",
+                "topbar_checked": "#d6ebff",
+                "topbar_border": "#d0d0d0",
+                "topbar_accent": "#0066b8",
             }
 
         qss = f"""
@@ -843,31 +1305,88 @@ class MainWindow(QMainWindow):
                 background-color: {colors['separator']};
             }}
 
-            /* 工具栏 */
-            QToolBar {{
-                background-color: {colors['bg_main']};
-                border-bottom: 1px solid {colors['separator']};
-                spacing: 4px;
-                padding: 4px 8px;
+            /* 顶栏工具区 (VSCode-like) */
+            QToolBar#TopToolbar {{
+                background-color: {colors['topbar_bg']};
+                border: none;
+                border-bottom: 1px solid {colors['topbar_border']};
+                spacing: 2px;
+                padding: 3px 8px;
+                margin: 0;
             }}
-            QToolButton {{
+            QToolBar#TopToolbar::separator {{
+                width: 1px;
+                margin: 5px 6px;
+                background-color: {colors['topbar_border']};
+            }}
+            QToolBar#TopToolbar QToolButton {{
                 background-color: transparent;
                 border: 1px solid transparent;
-                border-radius: 6px;
-                padding: 6px 10px;
-                color: {colors['text_secondary']};
+                border-radius: 4px;
+                padding: 4px 10px;
+                min-height: 24px;
+                color: {colors['topbar_text']};
+                font-weight: 500;
             }}
-            QToolButton:hover {{
-                background-color: {colors['bg_hover']};
-                color: {colors['text_main']};
+            QToolBar#TopToolbar QToolButton:hover {{
+                background-color: {colors['topbar_hover']};
+                border-color: {colors['topbar_border']};
+                color: {colors['topbar_text_active']};
             }}
-            QToolButton:pressed {{
-                background-color: {colors['bg_pressed']};
+            QToolBar#TopToolbar QToolButton:pressed {{
+                background-color: {colors['topbar_pressed']};
             }}
-            QToolButton:checked {{
+            QToolBar#TopToolbar QToolButton:checked {{
+                background-color: {colors['topbar_checked']};
+                border-color: {colors['topbar_accent']};
+                color: {colors['topbar_text_active']};
+            }}
+            QToolBar#TopToolbar QToolButton::menu-indicator {{
+                subcontrol-origin: padding;
+                subcontrol-position: right center;
+                left: -4px;
+            }}
+            QToolBar#TopToolbar QToolButton#TopBarMenuButton {{
+                padding-right: 18px;
+            }}
+            QToolBar#TopToolbar QComboBox {{
                 background-color: {colors['bg_card']};
-                border: 1px solid {colors['border']};
-                color: {colors['accent']};
+                border: 1px solid {colors['topbar_border']};
+                border-radius: 4px;
+                padding: 2px 24px 2px 8px;
+                min-height: 24px;
+                color: {colors['topbar_text_active']};
+            }}
+            QToolBar#TopToolbar QComboBox:hover {{
+                border-color: {colors['topbar_accent']};
+                background-color: {colors['topbar_hover']};
+            }}
+            QToolBar#TopToolbar QComboBox:focus {{
+                border-color: {colors['topbar_accent']};
+            }}
+            QToolBar#TopToolbar QComboBox::drop-down {{
+                border: none;
+                width: 18px;
+            }}
+            QMenu {{
+                background-color: {colors['topbar_bg']};
+                border: 1px solid {colors['topbar_border']};
+                padding: 4px 0;
+            }}
+            QMenu::item {{
+                color: {colors['topbar_text']};
+                padding: 6px 22px 6px 12px;
+                margin: 0 4px;
+                border-radius: 4px;
+            }}
+            QMenu::item:selected {{
+                background-color: {colors['topbar_hover']};
+                color: {colors['topbar_text_active']};
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background: {colors['topbar_border']};
+                margin: 4px 10px;
             }}
 
             /* 输入框 */
@@ -1073,11 +1592,54 @@ class MainWindow(QMainWindow):
         self.comparison_view.viewer_left.set_background_color(bg_viewer)
         self.comparison_view.viewer_right.set_background_color(bg_viewer)
 
-    def _on_zoom_changed(self, index):
-        """处理缩放下拉框变化"""
-        data = self.zoom_combo.itemData(index)
-        if not data: return
-        
+    def _zoom_label_for_mode(self, mode: str) -> str:
+        for label, value in getattr(self, "_zoom_options", []):
+            if value == mode:
+                return label
+        return "适应窗口"
+
+    def _sort_label_for_mode(self, mode: str) -> str:
+        for label, value in getattr(self, "_sort_options", []):
+            if value == mode:
+                return label
+        return "时间倒序 (最新在前)"
+
+    def _set_zoom_mode(self, mode: str, apply: bool = True):
+        if mode not in {v for _, v in getattr(self, "_zoom_options", [])}:
+            mode = "fit"
+        self.current_zoom_mode = mode
+        self.settings.setValue("zoom_mode", mode)
+        if hasattr(self, "zoom_actions"):
+            act = self.zoom_actions.get(mode)
+            if act:
+                act.setChecked(True)
+        if hasattr(self, "zoom_menu_btn"):
+            self.zoom_menu_btn.setText(f"缩放: {self._zoom_label_for_mode(mode)}")
+        if apply:
+            self._on_zoom_changed()
+
+    def _set_sort_mode(self, sort_by: str, trigger_search: bool = True):
+        if sort_by not in {v for _, v in getattr(self, "_sort_options", [])}:
+            sort_by = "time_desc"
+        self.current_sort_by = sort_by
+        self.settings.setValue("sort_by", sort_by)
+        if hasattr(self, "sort_actions"):
+            act = self.sort_actions.get(sort_by)
+            if act:
+                act.setChecked(True)
+        if hasattr(self, "sort_menu_btn"):
+            self.sort_menu_btn.setText(f"排序: {self._sort_label_for_mode(sort_by)}")
+        if trigger_search:
+            self.search_controller.perform_search()
+
+    def _on_zoom_changed(self, index=None):
+        """处理缩放变化（兼容旧下拉和新菜单）"""
+        data = getattr(self, "current_zoom_mode", "fit")
+        if hasattr(self, "zoom_combo") and self.zoom_combo is not None and index is not None:
+            legacy_data = self.zoom_combo.itemData(index)
+            if legacy_data:
+                data = legacy_data
+
         if data == "fit":
             self.viewer.fit_to_window()
         elif data == "fill":
@@ -1085,20 +1647,20 @@ class MainWindow(QMainWindow):
         else:
             try:
                 scale_val = float(data)
-                self.viewer.fit_to_original() # 先重置
+                self.viewer.fit_to_original()
                 if scale_val != 1.0:
                     self.viewer.scale(scale_val, scale_val)
             except ValueError:
                 pass
 
-    def _on_sort_changed(self, index):
-        """排序方式变更"""
-        if index < 0: return
-        sort_by = self.sort_combo.itemData(index)
-        if sort_by:
-            self.current_sort_by = sort_by
-            self.settings.setValue("sort_by", sort_by)
-            self.search_controller.perform_search()
+    def _on_sort_changed(self, index=None):
+        """排序方式变更（兼容旧下拉和新菜单）"""
+        sort_by = getattr(self, "current_sort_by", "time_desc")
+        if hasattr(self, "sort_combo") and self.sort_combo is not None and index is not None:
+            legacy_sort = self.sort_combo.itemData(index)
+            if legacy_sort:
+                sort_by = legacy_sort
+        self._set_sort_mode(sort_by, trigger_search=True)
 
     # --- Web 服务控制 ---
     def _is_web_running(self) -> bool:
@@ -1121,6 +1683,8 @@ class MainWindow(QMainWindow):
         self._web_last_url = url
         if hasattr(self, 'action_web'):
             self.action_web.setText("停止 Web")
+        if hasattr(self, "tool_menu_btn"):
+            self.tool_menu_btn.setText("服务*")
         self.statusBar().showMessage(f"Web 服务已启动: {url}", 5000)
 
         # 默认打开本机地址
@@ -1130,6 +1694,8 @@ class MainWindow(QMainWindow):
     def _on_web_service_stopped(self):
         if hasattr(self, 'action_web'):
             self.action_web.setText("启动 Web")
+        if hasattr(self, "tool_menu_btn"):
+            self.tool_menu_btn.setText("服务")
         self.statusBar().showMessage("Web 服务已停止", 5000)
 
     def _on_web_service_log(self, msg: str):
@@ -1188,6 +1754,7 @@ class MainWindow(QMainWindow):
     def _on_comfy_progress(self, current, total):
         """处理 ComfyUI 进度更新"""
         if hasattr(self, 'progress_bar'):
+            self._has_realtime_progress = True
             # 确保处于确定进度状态
             if self.progress_bar.maximum() == 0:
                 self.progress_bar.setMaximum(total)
@@ -1230,9 +1797,26 @@ class MainWindow(QMainWindow):
             self.queue_btn.setText("📋 队列")
             self.queue_btn.setStyleSheet("") # 恢复默认样式
 
+        if total > 0:
+            if not self.queue_sync_timer.isActive():
+                self.queue_sync_timer.start()
+        else:
+            if self.queue_sync_timer.isActive():
+                self.queue_sync_timer.stop()
+            self._has_realtime_progress = False
+            if hasattr(self, 'progress_bar'):
+                self.progress_container.setVisible(False)
+
+        if len(running) > 0 and hasattr(self, 'progress_bar') and not self._has_realtime_progress:
+            self.progress_container.setVisible(True)
+            self.progress_bar.setMaximum(0)
+            self.progress_bar.setFormat("正在恢复跟踪... 队列执行中")
+            self.interrupt_btn.raise_()
+
     def _on_comfy_node_start(self, node_id, node_type):
         """处理节点开始执行"""
         if hasattr(self, 'progress_bar'):
+            self._has_realtime_progress = True
             self.progress_container.setVisible(True)
             
             # 常用节点名称翻译
@@ -1263,6 +1847,7 @@ class MainWindow(QMainWindow):
 
     def _on_comfy_done(self, result=None):
         """处理执行完成"""
+        self._has_realtime_progress = False
         if hasattr(self, 'progress_bar'):
             self.progress_container.setVisible(False) # 隐藏整个容器
         self.statusBar().showMessage("生成任务已完成", 5000)
@@ -1310,6 +1895,8 @@ class MainWindow(QMainWindow):
             if self.comfy_client.reconnect_timer.isActive():
                 self.comfy_client.reconnect_timer.stop()
             self.comfy_client.ws.close()
+        if hasattr(self, "queue_sync_timer") and self.queue_sync_timer.isActive():
+            self.queue_sync_timer.stop()
 
         if hasattr(self, "web_service"):
             self.web_service.stop_server()
@@ -1327,6 +1914,9 @@ class MainWindow(QMainWindow):
         if self.current_folder:
             self.settings.setValue("last_folder", self.current_folder)
             print(f"[Window] 已保存当前文件夹: {self.current_folder}")
+
+        # 保存最近一次对比会话（跨重启恢复）
+        self._save_last_compare_session()
         
         # 强制同步到磁盘
         self.settings.sync()

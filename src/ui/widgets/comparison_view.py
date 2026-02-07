@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QSplitter
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from src.ui.widgets.image_viewer import ImageViewer
 
 class ComparisonView(QWidget):
@@ -34,13 +34,42 @@ class ComparisonView(QWidget):
 
     def load_images(self, left_path, right_path):
         """同时加载两张图片"""
+        # 关键修复：先重置两侧视图状态，避免复用上一轮的缩放/滚动导致裁切
+        self.viewer_left.auto_fit = True
+        self.viewer_right.auto_fit = True
+        self.viewer_left.resetTransform()
+        self.viewer_right.resetTransform()
+        self.viewer_left.horizontalScrollBar().setValue(0)
+        self.viewer_left.verticalScrollBar().setValue(0)
+        self.viewer_right.horizontalScrollBar().setValue(0)
+        self.viewer_right.verticalScrollBar().setValue(0)
+
         self.viewer_left.load_image(left_path)
         self.viewer_right.load_image(right_path)
-        
-        # 初始强行同步一次
-        self.viewer_right.sync_view(self.viewer_left.transform(), 
-                                    (self.viewer_left.horizontalScrollBar().value(), 
-                                     self.viewer_left.verticalScrollBar().value()))
+
+        # 异步加载完成后再同步，避免在图片未就绪时把旧transform套到新图上
+        self._sync_retry_count = 0
+        QTimer.singleShot(80, self._sync_after_load)
+
+    def _sync_after_load(self):
+        left_ready = not self.viewer_left.pixmap_item.pixmap().isNull()
+        right_ready = not self.viewer_right.pixmap_item.pixmap().isNull()
+
+        if not (left_ready and right_ready):
+            self._sync_retry_count += 1
+            if self._sync_retry_count <= 12:
+                QTimer.singleShot(80, self._sync_after_load)
+            return
+
+        self.viewer_left.fit_to_window()
+        self.viewer_right.fit_to_window()
+        self.viewer_right.sync_view(
+            self.viewer_left.transform(),
+            (
+                self.viewer_left.horizontalScrollBar().value(),
+                self.viewer_left.verticalScrollBar().value(),
+            ),
+        )
 
     def clear(self):
         self.viewer_left.clear_view()

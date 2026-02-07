@@ -1,6 +1,7 @@
+import copy
 import json
 import uuid
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from PyQt6.QtCore import QObject, pyqtSignal, QUrl, QByteArray, QTimer
 from PyQt6.QtWebSockets import QWebSocket
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply, QAbstractSocket
@@ -15,6 +16,8 @@ class ComfyClient(QObject):
     execution_start = pyqtSignal(str, str) # 节点ID, 节点类型/名称
     execution_done = pyqtSignal(str) # 执行完成的图片路径(或ID)
     prompt_submitted = pyqtSignal(str) # 任务提交成功，携带 prompt_id
+    prompt_submitted_with_context = pyqtSignal(str, dict) # (prompt_id, context)
+    prompt_executed_images = pyqtSignal(str, list, dict) # (prompt_id, images, context)
     models_fetched = pyqtSignal(list) # 获取到可用模型列表
     
     # 队列管理信号
@@ -34,6 +37,7 @@ class ComfyClient(QObject):
         self.ws.textMessageReceived.connect(self._on_message)
         self.ws.errorOccurred.connect(self._on_error)
         self.current_prompt_graph = {} # 存储当前执行的图
+        self._prompt_context_by_id: Dict[str, Dict[str, Any]] = {}
         
         self.nam = QNetworkAccessManager() # 用于非阻塞 HTTP 请求
         
@@ -50,14 +54,14 @@ class ComfyClient(QObject):
             
         ws_url = f"ws://{self.server_address}/ws?clientId={self.client_id}"
         self.ws.open(QUrl(ws_url))
-
     def _on_connected(self):
         print(f"[Comfy] WebSocket 已连接: {self.server_address}")
         self.status_changed.emit("ComfyUI 已连接")
-        self.reconnect_timer.stop() # 连接成功，停止重连
-        # 连接成功后立即获取可用模型列表
+        # 连接成功后停止重连并同步基础状态
+        self.reconnect_timer.stop()
         self.fetch_available_models()
-
+        # 重启后尽快同步队列，便于主界面恢复进度展示
+        QTimer.singleShot(100, self.get_queue)
     def _on_disconnected(self):
         print(f"[Comfy] WebSocket 连接断开")
         self.status_changed.emit("连接断开，正在重连...")
@@ -117,11 +121,50 @@ class ComfyClient(QObject):
                 value = data["data"]["value"]
                 max_val = data["data"]["max"]
                 self.progress_updated.emit(value, max_val)
+
+            elif msg_type == "executed":
+                payload = data.get("data", {}) if isinstance(data, dict) else {}
+                prompt_id = str(payload.get("prompt_id") or "")
+                output = payload.get("output") if isinstance(payload, dict) else None
+                images = self._extract_images_from_output(output)
+                if images:
+                    context = self._prompt_context_by_id.get(prompt_id, {})
+                    self.prompt_executed_images.emit(prompt_id, images, context)
                 
         except Exception as e:
             print(f"[Comfy] 消息处理异常: {e}")
 
-    def send_prompt(self, workflow_json: Dict[str, Any]) -> None:
+    def _extract_images_from_output(self, output: Any) -> List[Dict[str, Any]]:
+        """从 executed.output 中提取 images 列表。"""
+        images: List[Dict[str, Any]] = []
+        if not isinstance(output, dict):
+            return images
+
+        direct_images = output.get("images")
+        if isinstance(direct_images, list):
+            for img in direct_images:
+                if isinstance(img, dict):
+                    images.append(img)
+            return images
+
+        for value in output.values():
+            if isinstance(value, dict):
+                nested = value.get("images")
+                if isinstance(nested, list):
+                    for img in nested:
+                        if isinstance(img, dict):
+                            images.append(img)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        nested = item.get("images")
+                        if isinstance(nested, list):
+                            for img in nested:
+                                if isinstance(img, dict):
+                                    images.append(img)
+        return images
+
+    def send_prompt(self, workflow_json: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> None:
         """
         向 ComfyUI 发送提示词任务 (异步)
         workflow_json: 完整的工作流字典
@@ -135,12 +178,18 @@ class ComfyClient(QObject):
         
         json_data = json.dumps(p).encode('utf-8')
         reply = self.nam.post(request, QByteArray(json_data))
-        reply.finished.connect(lambda: self._handle_prompt_response(reply, workflow_json))
+        ctx = dict(context or {})
+        reply.finished.connect(lambda: self._handle_prompt_response(reply, workflow_json, ctx))
         
         # 在发送前检查队列状态，方便调试 (异步)
         self.check_system_stats()
 
-    def _handle_prompt_response(self, reply: QNetworkReply, workflow_json: Dict[str, Any] = None) -> None:
+    def _handle_prompt_response(
+        self,
+        reply: QNetworkReply,
+        workflow_json: Dict[str, Any] = None,
+        context: Optional[Dict[str, Any]] = None
+    ) -> None:
         """处理发送任务的响应"""
         try:
             if reply.error() == QNetworkReply.NetworkError.NoError:
@@ -149,6 +198,9 @@ class ComfyClient(QObject):
                 print(f"[Comfy] 任务提交成功, Prompt ID: {prompt_id}")
                 if prompt_id:
                     self.prompt_submitted.emit(prompt_id)
+                    ctx = dict(context or {})
+                    self._prompt_context_by_id[str(prompt_id)] = ctx
+                    self.prompt_submitted_with_context.emit(str(prompt_id), ctx)
             else:
                 err_msg = reply.errorString()
                 print(f"[Comfy] 任务提交失败: {err_msg}")
@@ -193,6 +245,22 @@ class ComfyClient(QObject):
         finally:
             reply.deleteLater()
 
+    def submit_workflow_batch(
+        self,
+        workflows: List[Dict[str, Any]],
+        contexts: Optional[List[Dict[str, Any]]] = None
+    ) -> None:
+        """按顺序提交多个 workflow，并附带上下文。"""
+        if not workflows:
+            return
+
+        self.status_changed.emit(f"正在提交 {len(workflows)} 个任务...")
+        for idx, workflow in enumerate(workflows):
+            context = None
+            if contexts and idx < len(contexts):
+                context = contexts[idx]
+            self.send_prompt(workflow, context=context)
+
     def get_history(self, prompt_id: str) -> None:
         """获取任务执行历史（异步，暂未完全实现信号回调，仅用于兼容性）"""
         # 注意：如果外部通过返回值调用此方法，将会失败。
@@ -221,7 +289,12 @@ class ComfyClient(QObject):
         finally:
             reply.deleteLater()
 
-    def queue_current_prompt(self, workflow: Optional[Dict[str, Any]] = None, batch_count: int = 1) -> None:
+    def queue_current_prompt(
+        self,
+        workflow: Optional[Dict[str, Any]] = None,
+        batch_count: int = 1,
+        randomize_seed: bool = True
+    ) -> None:
         """
         重新提交workflow（修改随机种子）
         如果提供了workflow参数，直接使用；否则从 /history 获取最近的workflow
@@ -232,8 +305,11 @@ class ComfyClient(QObject):
             self.status_changed.emit(f"正在提交 {batch_count} 个任务...")
             
             for i in range(batch_count):
-                modified_workflow = ComfyClient.randomize_workflow_seeds(workflow)
-                self.send_prompt(modified_workflow)
+                if randomize_seed:
+                    submit_workflow = ComfyClient.randomize_workflow_seeds(workflow)
+                else:
+                    submit_workflow = copy.deepcopy(workflow)
+                self.send_prompt(submit_workflow)
         else:
             # 从历史记录获取
             print("[Comfy] queue_current_prompt: 正在获取最近的工作流...")
@@ -309,7 +385,7 @@ class ComfyClient(QObject):
             
             for i in range(batch_count):
                 # 修改随机种子避免生成相同图片
-                modified_workflow = self._randomize_seeds(workflow)
+                modified_workflow = ComfyClient.randomize_workflow_seeds(workflow)
                 # 提交到队列
                 self.send_prompt(modified_workflow)
             
@@ -520,3 +596,4 @@ class ComfyClient(QObject):
             print(f"[Comfy Queue] 中断任务错误: {e}")
         finally:
             reply.deleteLater()
+

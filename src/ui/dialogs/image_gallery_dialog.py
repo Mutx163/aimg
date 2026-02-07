@@ -1,13 +1,14 @@
 from PyQt6.QtCore import Qt, QSize, pyqtSignal, QTimer
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QListView, 
-                             QPushButton, QLabel, QFrame, QWidget, QLineEdit)
+                             QPushButton, QLabel, QFrame, QWidget, QLineEdit, QAbstractItemView, QMessageBox)
 
 class ImageGalleryDialog(QDialog):
     """
     图片库展开视图弹窗，以大网格形式展示所有图片。
     """
     image_selected = pyqtSignal(str) # 当在画廊中选择图片时发出
+    compare_selected = pyqtSignal(list) # 当多选后发起对比
 
     def __init__(self, image_model, parent=None):
         super().__init__(parent)
@@ -42,6 +43,12 @@ class ImageGalleryDialog(QDialog):
         btn_close = QPushButton("关闭")
         btn_close.setFixedWidth(80)
         btn_close.clicked.connect(self.accept)
+
+        self.btn_compare = QPushButton("对比选中")
+        self.btn_compare.setFixedWidth(90)
+        self.btn_compare.clicked.connect(self._on_compare_selected_click)
+        header.addWidget(self.btn_compare)
+
         header.addWidget(btn_close)
         
         layout.addLayout(header)
@@ -55,6 +62,7 @@ class ImageGalleryDialog(QDialog):
         self.list_view.setGridSize(QSize(160, 200)) # 略大于主界面的网格
         self.list_view.setIconSize(QSize(140, 140))
         self.list_view.setWordWrap(True)
+        self.list_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         
         # 复用主界面的 Model
         self.list_view.setModel(self.image_model)
@@ -98,6 +106,22 @@ class ImageGalleryDialog(QDialog):
                 # 用户点击后跳转并保持弹窗开启，还是直接关闭？
                 # 按照一般逻辑，展开视图是为了寻找图片，找到后点击跳转，弹窗可以保留也可以关闭。
                 # 简单起见，点击后跳转。
+
+    def _on_compare_selected_click(self):
+        indexes = self.list_view.selectionModel().selectedIndexes() if self.list_view.selectionModel() else []
+        if len(indexes) < 2:
+            QMessageBox.information(self, "提示", "请至少选中 2 张图片后再对比。")
+            return
+        paths = []
+        for idx in indexes:
+            if idx.isValid():
+                path = self.image_model.get_path(idx.row())
+                if path:
+                    paths.append(path)
+        if len(paths) < 2:
+            QMessageBox.information(self, "提示", "未获取到足够的图片路径。")
+            return
+        self.compare_selected.emit(paths)
     
     def _on_search(self, text):
         pass
