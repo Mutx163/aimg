@@ -974,11 +974,55 @@ class MainWindow(QMainWindow):
             self.compare_dialog = ComparePopupDialog(self)
         return self.compare_dialog
 
+    def _get_latest_gallery_image_path(self) -> str:
+        model = getattr(self.thumbnail_list, "image_model", None)
+        if model is None:
+            return ""
+        latest_path = ""
+        latest_mtime = -1.0
+        try:
+            count = int(model.rowCount())
+        except Exception:
+            return ""
+
+        for idx in range(count):
+            try:
+                path = model.get_path(idx)
+            except Exception:
+                continue
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                mtime = float(os.path.getmtime(path))
+            except OSError:
+                continue
+            if mtime >= latest_mtime:
+                latest_mtime = mtime
+                latest_path = path
+        return latest_path
+
+    def _get_latest_gallery_image_ratio(self) -> float | None:
+        latest_path = self._get_latest_gallery_image_path()
+        if not latest_path:
+            return None
+        image = QImage(latest_path)
+        if image.isNull() or image.height() <= 0:
+            return None
+        return float(image.width()) / float(image.height())
+
+    def _apply_compare_default_ratio(self, dlg: ComparePopupDialog | None = None) -> None:
+        target = dlg if dlg is not None else self.compare_dialog
+        if target is None:
+            return
+        ratio = self._get_latest_gallery_image_ratio()
+        target.set_preferred_aspect_ratio(ratio)
+
     def _session_items_as_list(self, session: CompareSession) -> List[Dict[str, Any]]:
         return [session.items[k] for k in session.items.keys()]
 
     def _refresh_compare_dialog_for_session(self, session: CompareSession) -> None:
         dlg = self._ensure_compare_dialog()
+        self._apply_compare_default_ratio(dlg)
         dlg.set_session(
             {
                 "name": session.name,
@@ -1020,6 +1064,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "提示", "可对比图片少于 2 张。")
                 return
             dlg = self._ensure_compare_dialog()
+            self._apply_compare_default_ratio(dlg)
             session_title = title or "手动对比"
             dlg.open_with_paths(valid_paths, title=session_title)
             self._remember_manual_compare_session(valid_paths, session_title)
@@ -1029,6 +1074,7 @@ class MainWindow(QMainWindow):
             session = self.last_compare_session
             self._refresh_compare_dialog_for_session(session)
             dlg = self._ensure_compare_dialog()
+            self._apply_compare_default_ratio(dlg)
             dlg.show()
             dlg.raise_()
             dlg.activateWindow()

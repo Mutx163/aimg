@@ -2,7 +2,8 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QTextEdit, QScrollAre
                              QFrame, QGridLayout, QHBoxLayout, QPushButton, QApplication, 
                              QSplitter, QGroupBox, QSpinBox, QDoubleSpinBox, QSlider, 
                              QComboBox, QLineEdit, QCheckBox, QDialog, QToolButton,
-                             QAbstractSpinBox, QSizePolicy, QListWidget, QListWidgetItem, QMessageBox)
+                             QAbstractSpinBox, QSizePolicy, QListWidget, QListWidgetItem, QMessageBox,
+                             QStackedWidget)
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSettings, QThread, QEvent, QBuffer, QIODevice, QByteArray
 from PyQt6.QtGui import QFont, QAction, QImage, QGuiApplication
 from typing import List, Dict, Any, Tuple, Optional
@@ -152,11 +153,12 @@ class AIWorker(QThread):
     finished = pyqtSignal(bool, str)  # (success, result)
     stream_update = pyqtSignal(str)   # (chunk)
     
-    def __init__(self, user_input, existing_prompt, is_negative):
+    def __init__(self, user_input, existing_prompt, is_negative, lora_guidance: Optional[Dict[str, Any]] = None):
         super().__init__()
         self.user_input = user_input
         self.existing_prompt = existing_prompt
         self.is_negative = is_negative
+        self.lora_guidance = dict(lora_guidance or {})
         self.is_cancelled = False
     
     def run(self):
@@ -176,7 +178,8 @@ class AIWorker(QThread):
                 self.user_input, 
                 self.existing_prompt,
                 is_negative=self.is_negative,
-                stream_callback=on_stream_callback
+                stream_callback=on_stream_callback,
+                lora_guidance=self.lora_guidance,
             )
             if not self.is_cancelled:
                 self.finished.emit(success, result)
@@ -196,9 +199,10 @@ class ImagePromptWorker(QThread):
     finished = pyqtSignal(bool, str)
     stream_update = pyqtSignal(str)
     
-    def __init__(self, image_b64: str):
+    def __init__(self, image_b64: str, lora_guidance: Optional[Dict[str, Any]] = None):
         super().__init__()
         self.image_b64 = image_b64
+        self.lora_guidance = dict(lora_guidance or {})
         self.is_cancelled = False
     
     def run(self):
@@ -212,7 +216,11 @@ class ImagePromptWorker(QThread):
                 if not self.is_cancelled:
                     self.stream_update.emit(chunk)
             
-            success, result = optimizer.generate_prompt_from_image(self.image_b64, stream_callback=on_stream_callback)
+            success, result = optimizer.generate_prompt_from_image(
+                self.image_b64,
+                stream_callback=on_stream_callback,
+                lora_guidance=self.lora_guidance,
+            )
             if not self.is_cancelled:
                 self.finished.emit(success, result)
         except Exception as e:
@@ -981,210 +989,211 @@ class ParameterPanel(QWidget):
             return title_row, height
 
         # 正向提示词
-        prompt_title_row, prompt_height = create_edit_block("✨ 正向提示词", "输入新的提示词进行创作...", 70)
-
-        # AI处理状态标签 (不再设置固定宽度，避免空隙)
         self.ai_status_label = QLabel("")
-        self.ai_status_label.setStyleSheet("color: #8b5cf6; font-size: 10px;")
-        # 移除 setFixedWidth(80)
-        # prompt_title_row.addWidget(self.ai_status_label) # 移入下方容器或暂时隐藏，避免占据左侧空间
+        self.ai_status_label.setStyleSheet("color: #6366f1; font-size: 10px;")
+        self.neg_ai_status_label = QLabel("")
+        self.neg_ai_status_label.setStyleSheet("color: #6366f1; font-size: 10px;")
 
-        history_btn_style = """
-            QPushButton {
-                background-color: palette(button);
-                border: 1px solid palette(mid);
-                border-radius: 3px;
-                color: palette(text);
-                font-size: 10px;
-            }
-            QPushButton:hover { background-color: palette(midlight); }
-            QPushButton:pressed { background-color: palette(light); }
-        """
+        tab_idle_style = (
+            "QToolButton {"
+            "padding: 4px 10px; border: none; border-radius: 6px; color: #64748b; "
+            "font-size: 11px; font-weight: 600; background: transparent;}"
+            "QToolButton:hover { background: #e2e8f0; color: #334155; }"
+        )
+        tab_active_style = (
+            "QToolButton {"
+            "padding: 4px 10px; border: none; border-radius: 6px; color: white; "
+            "font-size: 11px; font-weight: 700; background: #1e293b;}"
+        )
+        icon_btn_style = (
+            "QPushButton {"
+            "min-width: 24px; max-width: 24px; min-height: 24px; max-height: 24px;"
+            "border: none; border-radius: 6px; color: #64748b; background: transparent; font-size: 12px;}"
+            "QPushButton:hover { background: #e2e8f0; color: #334155; }"
+            "QPushButton:pressed { background: #cbd5e1; }"
+            "QPushButton:disabled { color: #94a3b8; }"
+        )
+        ai_icon_btn_style = (
+            "QPushButton {"
+            "min-width: 24px; max-width: 24px; min-height: 24px; max-height: 24px;"
+            "border: none; border-radius: 6px; color: #4f46e5; background: #eef2ff; font-size: 12px; font-weight: 700;}"
+            "QPushButton:hover { background: #e0e7ff; color: #4338ca; }"
+            "QPushButton:pressed { background: #c7d2fe; }"
+            "QPushButton:disabled { color: #94a3b8; background: #e2e8f0; }"
+        )
 
-        # 历史记录按钮
-        self.btn_history = QPushButton("历史")
-        self.btn_history.setToolTip("查看正向提示词历史记录")
+        self.btn_history = QPushButton("历")
+        self.btn_history.setToolTip("History (Positive)")
         self.btn_history.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_history.setFixedSize(52, 22)
-        self.btn_history.setStyleSheet(history_btn_style)
+        self.btn_history.setStyleSheet(icon_btn_style)
         self.btn_history.clicked.connect(lambda: self._show_history_dialog('positive'))
-        # prompt_title_row.addWidget(self.btn_history) # 移至右侧按钮组
 
-        # AI优化按钮
-        self.btn_ai_optimize = QPushButton("AI优化")
-        self.btn_ai_optimize.setToolTip("使用AI优化提示词")
+        self.btn_ai_optimize = QPushButton("AI")
+        self.btn_ai_optimize.setToolTip("AI Optimize (Positive)")
         self.btn_ai_optimize.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_ai_optimize.setFixedSize(72, 24)
-        self.btn_ai_optimize.setStyleSheet("""
-            QPushButton {
-                background-color: #2563eb;
-                color: white;
-                border-radius: 3px;
-                font-size: 10px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #1d4ed8; }
-            QPushButton:pressed { background-color: #1e40af; }
-            QPushButton:disabled { background-color: #555; color: #aaa; }
-        """)
+        self.btn_ai_optimize.setStyleSheet(ai_icon_btn_style)
         self.btn_ai_optimize.clicked.connect(self._on_ai_optimize_click)
-        
-        self.btn_clipboard_import = QPushButton("剪贴板导入")
-        self.btn_clipboard_import.setToolTip("从剪贴板导入图片生成提示词")
-        self.btn_clipboard_import.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_clipboard_import.setFixedSize(88, 24)
-        self.btn_clipboard_import.setStyleSheet("""
-            QPushButton {
-                background-color: #3b82f6;
-                color: white;
-                border-radius: 3px;
-                font-size: 10px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #2563eb; }
-            QPushButton:pressed { background-color: #1d4ed8; }
-            QPushButton:disabled { background-color: #555; color: #aaa; }
-        """)
-        self.btn_clipboard_import.clicked.connect(self._on_clipboard_import_click)
 
-        self.btn_file_import = QPushButton("文件导入")
-        self.btn_file_import.setToolTip("从文件导入图片生成提示词")
+        self.btn_file_import = QPushButton("文")
+        self.btn_file_import.setToolTip("Import Image from File")
         self.btn_file_import.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_file_import.setFixedSize(72, 24)
-        self.btn_file_import.setStyleSheet("""
-            QPushButton {
-                background-color: #3b82f6;
-                color: white;
-                border-radius: 3px;
-                font-size: 10px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #2563eb; }
-            QPushButton:pressed { background-color: #1d4ed8; }
-            QPushButton:disabled { background-color: #555; color: #aaa; }
-        """)
+        self.btn_file_import.setStyleSheet(icon_btn_style)
         self.btn_file_import.clicked.connect(self._on_file_import_click)
 
-        prompt_container = QWidget()
-        prompt_layout = QVBoxLayout(prompt_container)
-        prompt_layout.setContentsMargins(0, 0, 0, 0)
-        prompt_layout.setSpacing(4)
-        prompt_layout.addLayout(prompt_title_row)
+        self.btn_clipboard_import = QPushButton("贴")
+        self.btn_clipboard_import.setToolTip("Import from Clipboard")
+        self.btn_clipboard_import.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clipboard_import.setStyleSheet(icon_btn_style)
+        self.btn_clipboard_import.clicked.connect(self._on_clipboard_import_click)
 
-        # 正向提示词工具栏（永不隐藏，固定两行保证所有功能可见）
-        prompt_actions_container = QWidget()
-        self.prompt_actions_layout = QGridLayout(prompt_actions_container)
-        self.prompt_actions_layout.setContentsMargins(0, 0, 0, 0)
-        self.prompt_actions_layout.setHorizontalSpacing(4)
-        self.prompt_actions_layout.setVerticalSpacing(4)
-        self.prompt_actions_layout.addWidget(self.btn_history, 0, 0)
-        self.prompt_actions_layout.addWidget(self.btn_ai_optimize, 0, 1)
-        self.prompt_actions_layout.addWidget(self.btn_file_import, 1, 0)
-        self.prompt_actions_layout.addWidget(self.btn_clipboard_import, 1, 1)
-        self.prompt_actions_layout.setColumnStretch(2, 1)
-        prompt_layout.addWidget(prompt_actions_container)
-        prompt_container.setMinimumHeight(96)
-
-        self.prompt_edit = QTextEdit()
-        self.prompt_edit.setPlaceholderText("输入新的提示词进行创作...")
-        self.prompt_edit.setMinimumHeight(48)
-        self.prompt_edit.setStyleSheet("background-color: palette(base); border: 1px solid palette(mid); border-radius: 4px; padding: 4px;")
-        prompt_layout.addWidget(self.prompt_edit)
-
-        # 反向提示词
-        neg_title_row, neg_height = create_edit_block("🚫 反向提示词", "输入过滤词...", 60)
-
-        # AI优化反向提示词按钮
-        self.btn_neg_ai_optimize = QPushButton("AI优化")
-        self.btn_neg_ai_optimize.setToolTip("使用AI优化反向提示词")
-        self.btn_neg_ai_optimize.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_neg_ai_optimize.setFixedSize(72, 24)
-        self.btn_neg_ai_optimize.setStyleSheet("""
-            QPushButton {
-                background-color: #2563eb;
-                color: white;
-                border-radius: 3px;
-                font-size: 10px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #1d4ed8; }
-            QPushButton:pressed { background-color: #1e40af; }
-            QPushButton:disabled { background-color: #555; color: #aaa; }
-        """)
-        self.btn_neg_ai_optimize.clicked.connect(self._on_neg_ai_optimize_click)
-
-        # 反向历史记录按钮
-        self.btn_neg_history = QPushButton("历史")
-        self.btn_neg_history.setToolTip("查看反向提示词历史记录")
+        self.btn_neg_history = QPushButton("历")
+        self.btn_neg_history.setToolTip("History (Negative)")
         self.btn_neg_history.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_neg_history.setFixedSize(52, 22)
-        self.btn_neg_history.setStyleSheet(history_btn_style)
+        self.btn_neg_history.setStyleSheet(icon_btn_style)
         self.btn_neg_history.clicked.connect(lambda: self._show_history_dialog('negative'))
 
-        # AI处理状态标签(反向提示词)
-        self.neg_ai_status_label = QLabel("")
-        self.neg_ai_status_label.setStyleSheet("color: #8b5cf6; font-size: 10px;")
-        # 移除 setFixedWidth
-        # neg_title_row.addWidget(self.neg_ai_status_label) # 移除反向状态标签
-        
-        neg_container = QWidget()
-        neg_layout = QVBoxLayout(neg_container)
-        neg_layout.setContentsMargins(0, 0, 0, 0)
-        neg_layout.setSpacing(4)
-        neg_layout.addLayout(neg_title_row)
+        self.btn_neg_ai_optimize = QPushButton("AI")
+        self.btn_neg_ai_optimize.setToolTip("AI Optimize (Negative)")
+        self.btn_neg_ai_optimize.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_neg_ai_optimize.setStyleSheet(ai_icon_btn_style)
+        self.btn_neg_ai_optimize.clicked.connect(self._on_neg_ai_optimize_click)
 
-        # 反向提示词工具栏（永不隐藏）
-        neg_actions_container = QWidget()
-        self.neg_actions_layout = QGridLayout(neg_actions_container)
+        self.btn_neg_file_import = QPushButton("文")
+        self.btn_neg_file_import.setToolTip("Import Image from File")
+        self.btn_neg_file_import.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_neg_file_import.setStyleSheet(icon_btn_style)
+        self.btn_neg_file_import.clicked.connect(self._on_file_import_click)
+
+        self.btn_neg_clipboard_import = QPushButton("贴")
+        self.btn_neg_clipboard_import.setToolTip("Import from Clipboard")
+        self.btn_neg_clipboard_import.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_neg_clipboard_import.setStyleSheet(icon_btn_style)
+        self.btn_neg_clipboard_import.clicked.connect(self._on_clipboard_import_click)
+
+        prompt_card = QFrame()
+        prompt_card.setStyleSheet("""
+            QFrame {
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 10px;
+            }
+        """)
+        prompt_card_layout = QVBoxLayout(prompt_card)
+        prompt_card_layout.setContentsMargins(0, 0, 0, 0)
+        prompt_card_layout.setSpacing(0)
+
+        prompt_header = QWidget()
+        prompt_header.setStyleSheet("""
+            QWidget {
+                background: #f8fafc;
+                border-bottom: 1px solid #e2e8f0;
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
+            }
+        """)
+        prompt_header_layout = QHBoxLayout(prompt_header)
+        prompt_header_layout.setContentsMargins(8, 6, 8, 6)
+        prompt_header_layout.setSpacing(6)
+
+        tab_wrap = QWidget()
+        tab_wrap.setStyleSheet("QWidget { background: #e2e8f0; border-radius: 8px; }")
+        tab_layout = QHBoxLayout(tab_wrap)
+        tab_layout.setContentsMargins(2, 2, 2, 2)
+        tab_layout.setSpacing(2)
+
+        self.prompt_tab_positive = QToolButton()
+        self.prompt_tab_positive.setText("正向提示")
+        self.prompt_tab_positive.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.prompt_tab_positive.setCheckable(True)
+        self.prompt_tab_positive.clicked.connect(lambda: self._set_prompt_mode("positive"))
+        tab_layout.addWidget(self.prompt_tab_positive)
+
+        self.prompt_tab_negative = QToolButton()
+        self.prompt_tab_negative.setText("反向提示")
+        self.prompt_tab_negative.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.prompt_tab_negative.setCheckable(True)
+        self.prompt_tab_negative.clicked.connect(lambda: self._set_prompt_mode("negative"))
+        tab_layout.addWidget(self.prompt_tab_negative)
+
+        prompt_header_layout.addWidget(tab_wrap, 0, Qt.AlignmentFlag.AlignLeft)
+        prompt_header_layout.addStretch()
+
+        self.prompt_action_stack = QStackedWidget()
+        prompt_actions = QWidget()
+        prompt_actions_layout = QHBoxLayout(prompt_actions)
+        prompt_actions_layout.setContentsMargins(0, 0, 0, 0)
+        prompt_actions_layout.setSpacing(2)
+        prompt_actions_layout.addWidget(self.btn_history)
+        prompt_actions_layout.addWidget(self.btn_ai_optimize)
+        prompt_actions_layout.addWidget(self.btn_file_import)
+        prompt_actions_layout.addWidget(self.btn_clipboard_import)
+
+        neg_actions = QWidget()
+        self.neg_actions_layout = QHBoxLayout(neg_actions)
         self.neg_actions_layout.setContentsMargins(0, 0, 0, 0)
-        self.neg_actions_layout.setHorizontalSpacing(4)
-        self.neg_actions_layout.setVerticalSpacing(4)
-        self.neg_actions_layout.addWidget(self.btn_neg_history, 0, 0)
-        self.neg_actions_layout.addWidget(self.btn_neg_ai_optimize, 0, 1)
-        self.neg_actions_layout.setColumnStretch(2, 1)
-        neg_layout.addWidget(neg_actions_container)
-        neg_container.setMinimumHeight(72)
+        self.neg_actions_layout.setSpacing(2)
+        self.neg_actions_layout.addWidget(self.btn_neg_history)
+        self.neg_actions_layout.addWidget(self.btn_neg_ai_optimize)
+        self.neg_actions_layout.addWidget(self.btn_neg_file_import)
+        self.neg_actions_layout.addWidget(self.btn_neg_clipboard_import)
+
+        self.prompt_action_stack.addWidget(prompt_actions)
+        self.prompt_action_stack.addWidget(neg_actions)
+        prompt_header_layout.addWidget(self.prompt_action_stack, 0, Qt.AlignmentFlag.AlignRight)
+        prompt_card_layout.addWidget(prompt_header)
+
+        self.prompt_edit = QTextEdit()
+        self.prompt_edit.setPlaceholderText("输入画面描述...")
+        self.prompt_edit.setMinimumHeight(96)
+        self.prompt_edit.setStyleSheet("""
+            QTextEdit {
+                border: none;
+                background: #ffffff;
+                color: #0f172a;
+                padding: 10px;
+                font-size: 13px;
+                line-height: 1.6;
+            }
+        """)
 
         self.neg_prompt_edit = QTextEdit()
         self.neg_prompt_edit.setPlaceholderText("输入过滤词...")
-        self.neg_prompt_edit.setMinimumHeight(40)
-        self.neg_prompt_edit.setStyleSheet("background-color: palette(base); border: 1px solid palette(mid); border-radius: 4px; padding: 4px;")
+        self.neg_prompt_edit.setMinimumHeight(96)
+        self.neg_prompt_edit.setStyleSheet("""
+            QTextEdit {
+                border: none;
+                background: #ffffff;
+                color: #0f172a;
+                padding: 10px;
+                font-size: 13px;
+                line-height: 1.6;
+            }
+        """)
         saved_neg_height = self.settings.value("param_panel/neg_prompt_height", 0, type=int)
         if saved_neg_height and saved_neg_height > 0:
             self.neg_prompt_edit.setFixedHeight(max(40, min(saved_neg_height, 520)))
-        neg_layout.addWidget(self.neg_prompt_edit)
 
-        self.neg_bottom_handle = QFrame()
-        self.neg_bottom_handle.setFixedHeight(6)
-        self.neg_bottom_handle.setCursor(Qt.CursorShape.SizeVerCursor)
-        self.neg_bottom_handle.setStyleSheet("""
-            QFrame {
-                background-color: palette(mid);
-                border-radius: 2px;
-            }
-            QFrame:hover {
-                background-color: palette(highlight);
-            }
-        """)
-        self.neg_bottom_handle.installEventFilter(self)
-        neg_layout.addWidget(self.neg_bottom_handle)
+        self.prompt_mode_stack = QStackedWidget()
+        self.prompt_mode_stack.addWidget(self.prompt_edit)
+        self.prompt_mode_stack.addWidget(self.neg_prompt_edit)
+        prompt_card_layout.addWidget(self.prompt_mode_stack, 1)
 
-        self.prompt_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.prompt_splitter.setChildrenCollapsible(False)
-        self.prompt_splitter.setHandleWidth(6)
-        self.prompt_splitter.addWidget(prompt_container)
-        self.prompt_splitter.addWidget(neg_container)
-        self.prompt_splitter.setStretchFactor(0, 1)
-        self.prompt_splitter.setStretchFactor(1, 1)
-        prompt_handle = self.prompt_splitter.handle(1)
-        prompt_handle.setCursor(Qt.CursorShape.SizeVerCursor)
-        saved_prompt_splitter = self.settings.value("param_panel/prompt_splitter")
-        if saved_prompt_splitter:
-            self.prompt_splitter.restoreState(saved_prompt_splitter)
-        else:
-            self.prompt_splitter.setSizes([170, 95])
-        self.prompt_splitter.splitterMoved.connect(lambda *_: self._save_prompt_splitter_state())
-        workspace_layout.addWidget(self.prompt_splitter)
+        counter_row = QHBoxLayout()
+        counter_row.setContentsMargins(8, 0, 8, 6)
+        counter_row.setSpacing(4)
+        counter_row.addStretch()
+        self.prompt_counter_label = QLabel("0")
+        self.prompt_counter_label.setStyleSheet("color: #94a3b8; font-size: 10px;")
+        counter_row.addWidget(self.prompt_counter_label)
+        prompt_card_layout.addLayout(counter_row)
+
+        self.prompt_tab_idle_style = tab_idle_style
+        self.prompt_tab_active_style = tab_active_style
+        self.prompt_edit.textChanged.connect(self._update_prompt_counter)
+        self.neg_prompt_edit.textChanged.connect(self._update_prompt_counter)
+        self._set_prompt_mode("positive")
+        self._update_prompt_counter()
+        workspace_layout.addWidget(prompt_card)
         
 
         # --- 2. 其他参数设置 ---
@@ -1664,6 +1673,40 @@ class ParameterPanel(QWidget):
     def _on_compare_section_toggled(self, checked: bool):
         self._set_compare_section_expanded(bool(checked))
 
+    def _set_prompt_mode(self, mode: str, tab_idle_style: str | None = None, tab_active_style: str | None = None):
+        mode = "negative" if str(mode) == "negative" else "positive"
+        idle = tab_idle_style or getattr(self, "prompt_tab_idle_style", "")
+        active = tab_active_style or getattr(self, "prompt_tab_active_style", "")
+
+        if not hasattr(self, "prompt_mode_stack"):
+            return
+        self.prompt_mode_stack.setCurrentIndex(0 if mode == "positive" else 1)
+        if hasattr(self, "prompt_action_stack"):
+            self.prompt_action_stack.setCurrentIndex(0 if mode == "positive" else 1)
+
+        if hasattr(self, "prompt_tab_positive"):
+            self.prompt_tab_positive.setChecked(mode == "positive")
+            self.prompt_tab_positive.setStyleSheet(active if mode == "positive" else idle)
+        if hasattr(self, "prompt_tab_negative"):
+            self.prompt_tab_negative.setChecked(mode == "negative")
+            self.prompt_tab_negative.setStyleSheet(active if mode == "negative" else idle)
+
+        target = self.prompt_edit if mode == "positive" else self.neg_prompt_edit
+        try:
+            target.setFocus()
+        except Exception:
+            pass
+        self._update_prompt_counter()
+
+    def _update_prompt_counter(self):
+        if not hasattr(self, "prompt_counter_label"):
+            return
+        current_mode_negative = (
+            hasattr(self, "prompt_mode_stack") and self.prompt_mode_stack.currentIndex() == 1
+        )
+        text = self.neg_prompt_edit.toPlainText() if current_mode_negative else self.prompt_edit.toPlainText()
+        self.prompt_counter_label.setText(f"{len((text or '').strip())}/75")
+
     def _reset_layout_items(self, layout):
         while layout.count():
             layout.takeAt(0)
@@ -1708,6 +1751,8 @@ class ParameterPanel(QWidget):
 
     def _layout_neg_prompt_actions(self, compact: bool):
         if not hasattr(self, "neg_actions_layout"):
+            return
+        if not isinstance(self.neg_actions_layout, QGridLayout):
             return
         self._reset_layout_items(self.neg_actions_layout)
         for i in range(3):
@@ -1759,7 +1804,23 @@ class ParameterPanel(QWidget):
         self._reset_layout_items(self.gen_btn_layout)
         for i in range(6):
             self.gen_btn_layout.setColumnStretch(i, 0)
-        if compact:
+        available_width = 0
+        if hasattr(self, "workspace_scroll"):
+            available_width = max(0, int(self.workspace_scroll.viewport().width()) - 20)
+        spacing = self.gen_btn_layout.horizontalSpacing()
+        if spacing < 0:
+            spacing = 8
+        needed_width = (
+            self.lbl_batch.sizeHint().width()
+            + self.batch_count_spin.sizeHint().width()
+            + self.lbl_batch_unit.sizeHint().width()
+            + max(self.btn_remote_gen.sizeHint().width(), self.btn_remote_gen.minimumSizeHint().width())
+            + spacing * 3
+            + 20
+        )
+        force_single_row = available_width >= needed_width
+
+        if compact and not force_single_row:
             self.gen_btn_layout.addWidget(self.lbl_batch, 0, 0)
             self.gen_btn_layout.addWidget(self.batch_count_spin, 0, 1)
             self.gen_btn_layout.addWidget(self.lbl_batch_unit, 0, 2)
@@ -1779,8 +1840,6 @@ class ParameterPanel(QWidget):
         current_width = self.workspace_scroll.viewport().width()
         compact = current_width <= self._compact_breakpoint
         mode = "compact" if compact else "normal"
-        if mode == self._layout_mode:
-            return
         self._layout_mode = mode
         self._layout_steps_cfg_row(compact)
         self._layout_sampler_scheduler_row(compact)
@@ -2258,14 +2317,23 @@ class ParameterPanel(QWidget):
             return
         self._img_prompt_processing = True
         # self.ai_status_label.setText("⏳ 识图中...")
-        self.btn_file_import.setText("⏳") # 简略显示状态
+        self.btn_file_import.setText("...")
+        if hasattr(self, "btn_neg_file_import"):
+            self.btn_neg_file_import.setText("...")
         self.btn_clipboard_import.setEnabled(False)
         self.btn_file_import.setEnabled(False)
+        if hasattr(self, "btn_neg_clipboard_import"):
+            self.btn_neg_clipboard_import.setEnabled(False)
+        if hasattr(self, "btn_neg_file_import"):
+            self.btn_neg_file_import.setEnabled(False)
         self.btn_ai_optimize.setEnabled(False)
         self.btn_neg_ai_optimize.setEnabled(False)
         
         original_prompt = self.prompt_edit.toPlainText().strip()
-        self.current_img_worker = ImagePromptWorker(image_b64)
+        self.current_img_worker = ImagePromptWorker(
+            image_b64,
+            lora_guidance=self._build_lora_guidance_payload(),
+        )
         self._img_stream_started = False
         self.current_img_worker.stream_update.connect(self._on_img_stream_update)
         self.current_img_worker.finished.connect(lambda s, r: self._on_image_prompt_finished(s, r, original_prompt))
@@ -2288,7 +2356,12 @@ class ParameterPanel(QWidget):
         self._img_prompt_processing = False
         self.btn_clipboard_import.setEnabled(True)
         self.btn_file_import.setEnabled(True)
-        self.btn_file_import.setText("文件导入") # 恢复文字
+        self.btn_file_import.setText("文")
+        if hasattr(self, "btn_neg_clipboard_import"):
+            self.btn_neg_clipboard_import.setEnabled(True)
+        if hasattr(self, "btn_neg_file_import"):
+            self.btn_neg_file_import.setEnabled(True)
+            self.btn_neg_file_import.setText("文")
         self.btn_ai_optimize.setEnabled(True)
         self.btn_neg_ai_optimize.setEnabled(True)
         self.current_img_worker = None
@@ -2297,8 +2370,9 @@ class ParameterPanel(QWidget):
             # self.ai_status_label.setText("✅ 识图完成")
             # QTimer.singleShot(3000, lambda: self.ai_status_label.setText(""))
             self._temp_notify("✅ 识图完成")
-            self.prompt_edit.setPlainText(result)
-            self.history_manager.add_record("positive", original_prompt, result)
+            merged_prompt, _ = self._merge_prompt_with_lora_extras(result)
+            self.prompt_edit.setPlainText(merged_prompt)
+            self.history_manager.add_record("positive", original_prompt, merged_prompt)
         else:
             # self.ai_status_label.setText("❌ 识图失败")
             # QTimer.singleShot(3000, lambda: self.ai_status_label.setText(""))
@@ -2560,7 +2634,7 @@ class ParameterPanel(QWidget):
             return
 
         self._ai_is_processing = False
-        target_btn.setText("AI优化") # Removed emoji
+        target_btn.setText("AI")
         target_btn.setEnabled(True)
         self.current_ai_worker = None
         self._ai_original_prompt = None
@@ -2604,7 +2678,7 @@ class ParameterPanel(QWidget):
             
             # Reset UI
             self._ai_is_processing = False
-            target_btn.setText("AI优化")
+            target_btn.setText("AI")
             # status_label.setText("🚫 已取消") # Label removed
             if hasattr(self, '_temp_notify'): self._temp_notify("🚫 已取消")
             # QTimer.singleShot(2000, lambda: status_label.setText(""))
@@ -2642,6 +2716,8 @@ class ParameterPanel(QWidget):
         
         # 1. 弹出自定义对话框,询问用户需求
         existing_prompt = target_edit.toPlainText().strip()
+        if not is_negative:
+            existing_prompt = self._replace_current_lora_aliases_with_triggers(existing_prompt)
         label_prefix = "反向" if is_negative else ""
         
         # 预设标签
@@ -2673,12 +2749,18 @@ class ParameterPanel(QWidget):
         
         # 2. 锁定并显示处理状态
         self._ai_is_processing = True
-        target_btn.setText("⏳ 正在优化...")
+        target_btn.setText("...")
         # status_label.setText("⏳ AI正在处理...")
         self._ai_original_prompt = existing_prompt
         
         # 3. 启动后台线程
-        self.current_ai_worker = AIWorker(user_input, existing_prompt, is_negative)
+        lora_guidance = {} if is_negative else self._build_lora_guidance_payload()
+        self.current_ai_worker = AIWorker(
+            user_input,
+            existing_prompt,
+            is_negative,
+            lora_guidance=lora_guidance,
+        )
         self.current_ai_worker.finished.connect(lambda s, r: self._on_ai_finished(s, r, is_negative, existing_prompt))
         
         # 连接流式更新信号
@@ -3106,12 +3188,13 @@ class ParameterPanel(QWidget):
             print(f"Error loading LoRAs: {e}")
 
     def _normalize_prompt_piece(self, text: str) -> str:
-        return re.sub(r"\s+", " ", (text or "").strip()).lower()
+        normalized = re.sub(r"\s+", " ", (text or "").strip()).lower()
+        return re.sub(r"[，,;；。.!！？?\-_/|]+", "", normalized)
 
     def _split_prompt_pieces(self, prompt: str) -> List[str]:
         if not prompt:
             return []
-        parts = re.split(r"[,，;\n；]+", prompt)
+        parts = re.split(r"[,，;；。\.\n!?！？]+", prompt)
         return [p.strip() for p in parts if p and p.strip()]
 
     def _collect_lora_prompt_extras(self) -> List[str]:
@@ -3132,13 +3215,73 @@ class ParameterPanel(QWidget):
                 extras.append(prompt)
         return extras
 
+    def _build_lora_guidance_payload(self) -> Dict[str, Any]:
+        loras: List[Dict[str, Any]] = []
+        extras = self._collect_lora_prompt_extras()
+        for name, weight in self.current_loras.items():
+            meta = self._normalize_lora_profile_meta(self.current_lora_meta.get(name, {}))
+            loras.append(
+                {
+                    "name": name,
+                    "weight": float(weight),
+                    "prompt": str(meta.get("prompt", "") or "").strip(),
+                    "auto_use_prompt": bool(meta.get("auto_use_prompt", True)),
+                }
+            )
+        return {"loras": loras, "extras": extras}
+
+    def _replace_current_lora_aliases_with_triggers(self, text: str) -> str:
+        if not text:
+            return text
+        guidance = self._build_lora_guidance_payload()
+        mappings: List[Tuple[str, str]] = []
+        for item in guidance.get("loras", []):
+            trigger = str(item.get("prompt", "") or "").strip()
+            name = str(item.get("name", "") or "").strip()
+            if not trigger or not name:
+                continue
+
+            aliases = {name, os.path.basename(name)}
+            stem, _ = os.path.splitext(os.path.basename(name))
+            if stem:
+                aliases.add(stem)
+                for token in re.split(r"[-_.\s]+", stem):
+                    token = token.strip()
+                    if len(token) >= 2:
+                        aliases.add(token)
+
+            norm_trigger = self._normalize_prompt_piece(trigger)
+            for alias in aliases:
+                alias = str(alias or "").strip()
+                if not alias:
+                    continue
+                if self._normalize_prompt_piece(alias) == norm_trigger:
+                    continue
+                mappings.append((alias, trigger))
+
+        merged = text
+        for alias, trigger in sorted(mappings, key=lambda x: len(x[0]), reverse=True):
+            pattern = rf"(?<![A-Za-z0-9_]){re.escape(alias)}(?![A-Za-z0-9_])"
+            merged = re.sub(pattern, trigger, merged, flags=re.IGNORECASE)
+        return merged
+
     def _merge_prompt_with_lora_extras(self, base_prompt: str):
-        base_prompt = (base_prompt or "").strip()
+        base_prompt = self._replace_current_lora_aliases_with_triggers((base_prompt or "").strip())
         extras = self._collect_lora_prompt_extras()
         if not extras:
             return base_prompt, 0
 
-        existing = {self._normalize_prompt_piece(p) for p in self._split_prompt_pieces(base_prompt)}
+        pieces = self._split_prompt_pieces(base_prompt)
+        deduped_pieces: List[str] = []
+        existing = set()
+        for piece in pieces:
+            norm_piece = self._normalize_prompt_piece(piece)
+            if not norm_piece or norm_piece in existing:
+                continue
+            existing.add(norm_piece)
+            deduped_pieces.append(piece)
+        base_prompt = "，".join(deduped_pieces) if deduped_pieces else ""
+
         append_parts = []
         for text in extras:
             norm = self._normalize_prompt_piece(text)
@@ -3147,10 +3290,40 @@ class ParameterPanel(QWidget):
                 append_parts.append(text)
 
         if not append_parts:
-            return base_prompt, 0
+            return self._enforce_single_lora_trigger_occurrence(base_prompt, extras), 0
         if base_prompt:
-            return f"{base_prompt}, {', '.join(append_parts)}", len(append_parts)
-        return ", ".join(append_parts), len(append_parts)
+            merged = f"{base_prompt}，{'，'.join(append_parts)}"
+        else:
+            merged = "，".join(append_parts)
+        return self._enforce_single_lora_trigger_occurrence(merged, extras), len(append_parts)
+
+    def _enforce_single_lora_trigger_occurrence(self, prompt: str, extras: List[str]) -> str:
+        text = (prompt or "").strip()
+        if not text or not extras:
+            return text
+
+        for extra in extras:
+            trigger = str(extra or "").strip()
+            if not trigger:
+                continue
+            pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(trigger)}(?![A-Za-z0-9_])", re.IGNORECASE)
+            matches = list(pattern.finditer(text))
+            if len(matches) <= 1:
+                continue
+
+            rebuilt: List[str] = []
+            last_idx = 0
+            for idx, m in enumerate(matches):
+                if idx == 0:
+                    rebuilt.append(text[last_idx:m.end()])
+                else:
+                    rebuilt.append(text[last_idx:m.start()])
+                last_idx = m.end()
+            rebuilt.append(text[last_idx:])
+            text = "".join(rebuilt)
+
+        pieces = self._split_prompt_pieces(text)
+        return "，".join(pieces) if pieces else text
 
     def _init_workspace_persistence(self):
         """初始化工作区持久化：连接信号并加载初始值"""
@@ -4296,4 +4469,3 @@ class ParameterPanel(QWidget):
         if text:
             QApplication.clipboard().setText(text)
             self._temp_notify(f"✅ {msg}")
-
