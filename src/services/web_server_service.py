@@ -1,5 +1,6 @@
 import os
 import sys
+import secrets
 from PyQt6.QtCore import QObject, pyqtSignal, QProcess, QProcessEnvironment, QSettings
 from src.utils.network import get_free_port, get_local_ip
 
@@ -18,11 +19,25 @@ class WebServerService(QObject):
         self.port = 8000
         self.host = "127.0.0.1"
         self.is_ready = False
+        self.remote_auth_enabled = False
+        self.remote_access_code = ""
+
+    def _is_loopback_host(self, host: str) -> bool:
+        host = str(host or "").strip().lower()
+        return host in ("127.0.0.1", "localhost", "::1")
+
+    def _build_access_code(self, configured_code: str) -> str:
+        code = str(configured_code or "").strip().upper()
+        if code:
+            return code
+        alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+        return "".join(secrets.choice(alphabet) for _ in range(6))
 
     def start_server(self):
         """启动 Web 服务"""
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
             return
+        self.is_ready = False
 
         try:
             self.port = get_free_port(8000, 9000)
@@ -37,6 +52,11 @@ class WebServerService(QObject):
         settings = QSettings("ComfyUIImageManager", "Settings")
         comfy_address = settings.value("comfy_address", "127.0.0.1:8188")
         self.host = settings.value("web_bind", "127.0.0.1")
+        self.remote_auth_enabled = not self._is_loopback_host(self.host)
+        self.remote_access_code = ""
+        if self.remote_auth_enabled:
+            self.remote_access_code = self._build_access_code(settings.value("web_auth_code", ""))
+
         if ":" in comfy_address:
             host, port = comfy_address.split(":", 1)
         else:
@@ -44,14 +64,17 @@ class WebServerService(QObject):
 
         # 使用 -m server.app 方式启动，确保 imports 正常
         # 传递 --port 参数 和 --no-scan (避免双重扫描导致锁死)
-        self.process.setArguments([
+        args = [
             "-m", "server.app", 
             "--host", str(self.host),
             "--port", str(self.port), 
             "--no-scan",
             "--comfy-host", host,
             "--comfy-port", port
-        ])
+        ]
+        if self.remote_auth_enabled:
+            args.extend(["--remote-access-code", self.remote_access_code])
+        self.process.setArguments(args)
         
         # 设置 PYTHONPATH，确保子进程能找到 src
         env = QProcessEnvironment.systemEnvironment()
@@ -89,6 +112,8 @@ class WebServerService(QObject):
              else:
                  local_ip = get_local_ip()
                  url = f"http://{local_ip}:{self.port}"
+                 if self.remote_auth_enabled:
+                     self.log_message.emit(f"[Auth] 局域网访问已启用，验证码: {self.remote_access_code}")
              self.service_ready.emit(url)
 
     def _filter_logs(self, message):
@@ -129,5 +154,6 @@ class WebServerService(QObject):
         self.log_message.emit(f"[System] Web 服务进程已启动 (PID: {self.process.processId()})")
 
     def _on_finished(self, exit_code, exit_status):
+        self.is_ready = False
         self.log_message.emit(f"[System] Web 服务已停止 (Code: {exit_code})")
         self.service_stopped.emit()

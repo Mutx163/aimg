@@ -747,6 +747,8 @@ class MainWindow(QMainWindow):
         old_addr = self.settings.value("comfy_address", "127.0.0.1:8188")
         old_root = self.settings.value("comfy_root", "")
         old_watch_recursive = self.settings.value("watch_recursive", False, type=bool)
+        old_web_bind = str(self.settings.value("web_bind", "127.0.0.1")).strip()
+        old_web_auth_code = str(self.settings.value("web_auth_code", "")).strip()
         if dlg.exec():
             # 重新应用主题以响应设置变化
             new_addr = self.settings.value("comfy_address", "127.0.0.1:8188")
@@ -767,6 +769,13 @@ class MainWindow(QMainWindow):
                 if self.watcher.start_monitoring(self.current_folder, recursive=new_watch_recursive):
                     mode = "递归" if new_watch_recursive else "非递归"
                     self.statusBar().showMessage(f"监控模式已更新: {mode}", 3000)
+
+            new_web_bind = str(self.settings.value("web_bind", "127.0.0.1")).strip()
+            new_web_auth_code = str(self.settings.value("web_auth_code", "")).strip()
+            if (new_web_bind != old_web_bind or new_web_auth_code != old_web_auth_code) and self._is_web_running():
+                self.statusBar().showMessage("Web 访问设置已变更，正在重启 Web 服务...", 3000)
+                self.web_service.stop_server()
+                self.web_service.start_server()
 
     def _poll_logs(self):
         """定时轮询param_panel的日志列表并更新UI"""
@@ -1731,11 +1740,16 @@ class MainWindow(QMainWindow):
             self.action_web.setText("停止 Web")
         if hasattr(self, "tool_menu_btn"):
             self.tool_menu_btn.setText("服务*")
-        self.statusBar().showMessage(f"Web 服务已启动: {url}", 5000)
+        if getattr(self.web_service, "remote_auth_enabled", False):
+            code = getattr(self.web_service, "remote_access_code", "")
+            self.statusBar().showMessage(f"Web 服务已启动: {url}  验证码: {code}", 12000)
+        else:
+            self.statusBar().showMessage(f"Web 服务已启动: {url}", 5000)
 
-        # 默认打开本机地址
-        local_url = f"http://127.0.0.1:{self.web_service.port}"
-        webbrowser.open(local_url)
+        if self.settings.value("web_auto_open_browser", True, type=bool):
+            # 默认打开本机地址
+            local_url = f"http://127.0.0.1:{self.web_service.port}"
+            webbrowser.open(local_url)
 
     def _on_web_service_stopped(self):
         if hasattr(self, 'action_web'):

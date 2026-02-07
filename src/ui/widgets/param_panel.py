@@ -2642,12 +2642,17 @@ class ParameterPanel(QWidget):
         if success:
             # status_label.setText("✅ 优化成功") # Label removed
             # QTimer.singleShot(3000, lambda: status_label.setText(""))
-            self._temp_notify("✅ AI优化成功")
-            target_edit.setPlainText(result)
-            
-            # Record History
-            p_type = 'negative' if is_negative else 'positive'
-            self.history_manager.add_record(p_type, original_prompt, result)
+            final_text = (result or "").strip()
+            original_text = (original_prompt or "").strip()
+            target_edit.setPlainText(final_text or original_text)
+
+            if final_text == original_text:
+                self._temp_notify("ℹ️ 未检测到可优化内容，已保持原提示词")
+            else:
+                self._temp_notify("✅ AI优化成功")
+                # Record History
+                p_type = 'negative' if is_negative else 'positive'
+                self.history_manager.add_record(p_type, original_prompt, final_text)
         else:
             # status_label.setText("❌ 失败")
             self._temp_notify("❌ 优化失败")

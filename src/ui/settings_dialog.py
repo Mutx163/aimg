@@ -6,7 +6,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.resize(400, 300)
+        self.resize(520, 420)
         self.settings = QSettings("ComfyUIImageManager", "Settings")
         
         layout = QVBoxLayout(self)
@@ -96,6 +96,28 @@ class SettingsDialog(QDialog):
         btn_browse_run.clicked.connect(self._browse_comfy_run_path)
         comfy_run_layout.addWidget(btn_browse_run)
         form_layout.addRow("ComfyUI 启动路径:", comfy_run_row)
+
+        # Web 服务访问控制
+        self.combo_web_bind = QComboBox()
+        self.combo_web_bind.addItem("仅本机 (推荐)", "127.0.0.1")
+        self.combo_web_bind.addItem("局域网访问 (需验证码)", "0.0.0.0")
+        current_web_bind = str(self.settings.value("web_bind", "127.0.0.1")).strip()
+        bind_idx = 1 if current_web_bind not in ("127.0.0.1", "localhost", "::1") else 0
+        self.combo_web_bind.setCurrentIndex(bind_idx)
+        form_layout.addRow("Web 访问范围:", self.combo_web_bind)
+
+        self.edit_web_auth_code = QLineEdit()
+        self.edit_web_auth_code.setPlaceholderText("可选：自定义 6-12 位验证码，留空自动生成")
+        self.edit_web_auth_code.setText(str(self.settings.value("web_auth_code", "")).strip())
+        form_layout.addRow("Web 验证码:", self.edit_web_auth_code)
+
+        self.check_web_auto_open = QCheckBox("启动 Web 服务时自动打开浏览器")
+        self.check_web_auto_open.setChecked(self.settings.value("web_auto_open_browser", True, type=bool))
+        form_layout.addRow("", self.check_web_auto_open)
+
+        web_help = QLabel("说明：开启“局域网访问”后，其他设备首次访问需要输入验证码。")
+        web_help.setStyleSheet("color: #6b7280; font-size: 10px;")
+        form_layout.addRow("", web_help)
         
         layout.addWidget(group_input)
         
@@ -130,6 +152,9 @@ class SettingsDialog(QDialog):
         self.settings.setValue("comfy_address", self.edit_comfy_addr.text().strip())
         self.settings.setValue("comfy_root", self.edit_comfy_root.text().strip())
         self.settings.setValue("comfy_run_path", self.edit_comfy_run_path.text().strip())
+        self.settings.setValue("web_bind", self.combo_web_bind.currentData())
+        self.settings.setValue("web_auth_code", self.edit_web_auth_code.text().strip().upper())
+        self.settings.setValue("web_auto_open_browser", self.check_web_auto_open.isChecked())
         
         self.accept()
 

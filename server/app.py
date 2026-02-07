@@ -4,9 +4,11 @@ import json
 import socket
 import asyncio
 import urllib.parse
+import secrets
+import ipaddress
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from fastapi import FastAPI, HTTPException, Query, Body, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -27,6 +29,12 @@ from src.core.scanner import ImageScanner
 # Default; will be overwritten by main args
 COMFY_ADDRESS = "127.0.0.1:8189"
 CLIENT_ID = "aimg_web_" + str(uuid.uuid4())[:8] # Persistent ID for this session
+AUTH_COOKIE_NAME = "aimg_web_session"
+REMOTE_ACCESS_AUTH_ENABLED = False
+REMOTE_ACCESS_CODE = ""
+AUTH_SESSION_TTL_SECONDS = 12 * 60 * 60
+AUTH_PUBLIC_PATHS = {"/api/auth/status", "/api/auth/login", "/api/auth/logout"}
+_auth_sessions: Dict[str, float] = {}
 
 # --- Global Progress Tracker ---
 class ProgressTracker:
@@ -119,15 +127,71 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _is_loopback_host(host: str) -> bool:
+    host = str(host or "").strip().lower()
+    if not host:
+        return False
+    if host in {"localhost", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+def _is_local_request(request: Request) -> bool:
+    client = request.client
+    host = client.host if client else ""
+    return _is_loopback_host(host)
+
+def _cleanup_expired_auth_sessions() -> None:
+    now = time.time()
+    expired = [token for token, exp in _auth_sessions.items() if exp <= now]
+    for token in expired:
+        _auth_sessions.pop(token, None)
+
+def _is_authenticated_request(request: Request) -> bool:
+    _cleanup_expired_auth_sessions()
+    token = request.cookies.get(AUTH_COOKIE_NAME, "")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+    if not token:
+        return False
+    expiry = _auth_sessions.get(token, 0)
+    return expiry > time.time()
+
+def _create_auth_session_token() -> str:
+    token = secrets.token_urlsafe(32)
+    _auth_sessions[token] = time.time() + AUTH_SESSION_TTL_SECONDS
+    return token
+
+def _requires_remote_auth() -> bool:
+    return bool(REMOTE_ACCESS_AUTH_ENABLED and REMOTE_ACCESS_CODE)
+
 # 强制不缓存静态文件和 API
 @app.middleware("http")
 async def add_no_cache_headers(request: Request, call_next):
+    path = request.url.path
+
+    # Remote auth gate: local requests are always allowed.
+    if _requires_remote_auth() and (not _is_local_request(request)):
+        if request.method != "OPTIONS" and path.startswith("/api/") and path not in AUTH_PUBLIC_PATHS:
+            if not _is_authenticated_request(request):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": "AUTH_REQUIRED",
+                        "message": "Remote access requires login code.",
+                    },
+                )
+
     response = await call_next(request)
-    if request.url.path.startswith("/api/") and not request.url.path.startswith("/api/image/"):
+    if path.startswith("/api/") and not path.startswith("/api/image/"):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
-    elif request.url.path.startswith("/api/image/"):
+    elif path.startswith("/api/image/"):
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     return response
 
@@ -274,6 +338,51 @@ async def get_filters():
         "samplers": db.get_unique_samplers(),
         "schedulers": db.get_unique_schedulers()
     }
+
+@app.get("/api/auth/status")
+async def auth_status(request: Request):
+    local_request = _is_local_request(request)
+    requires_auth = _requires_remote_auth() and (not local_request)
+    authenticated = True if not requires_auth else _is_authenticated_request(request)
+    return {
+        "requires_auth": bool(requires_auth),
+        "authenticated": bool(authenticated),
+        "session_ttl_seconds": AUTH_SESSION_TTL_SECONDS,
+    }
+
+@app.post("/api/auth/login")
+async def auth_login(request: Request):
+    local_request = _is_local_request(request)
+    if local_request or (not _requires_remote_auth()):
+        return {"success": True, "authenticated": True}
+
+    data = await request.json()
+    code = str((data or {}).get("code", "")).strip()
+    if not code or code != REMOTE_ACCESS_CODE:
+        return JSONResponse(
+            status_code=401,
+            content={"success": False, "error": "INVALID_CODE", "message": "Invalid access code."},
+        )
+
+    token = _create_auth_session_token()
+    response = JSONResponse({"success": True, "authenticated": True})
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=token,
+        max_age=AUTH_SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+    )
+    return response
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request):
+    token = request.cookies.get(AUTH_COOKIE_NAME, "")
+    if token:
+        _auth_sessions.pop(token, None)
+    response = JSONResponse({"success": True})
+    response.delete_cookie(AUTH_COOKIE_NAME)
+    return response
 
 @app.get("/api/comfy/samplers_schedulers")
 async def get_comfy_samplers_schedulers():
@@ -500,11 +609,25 @@ if __name__ == "__main__":
     parser.add_argument("--no-scan", action="store_true", help="Disable initial folder scan on startup")
     parser.add_argument("--comfy-host", type=str, default="127.0.0.1", help="ComfyUI host")
     parser.add_argument("--comfy-port", type=str, default="8189", help="ComfyUI port")
+    parser.add_argument("--remote-access-code", type=str, default="", help="Remote web login code")
     args = parser.parse_args()
     
     # Update global config
     COMFY_ADDRESS = f"{args.comfy_host}:{args.comfy_port}"
     print(f"[API] Configured ComfyUI Address: {COMFY_ADDRESS}")
+
+    # Enable auth automatically when bound to non-loopback interfaces.
+    REMOTE_ACCESS_AUTH_ENABLED = not _is_loopback_host(args.host)
+    REMOTE_ACCESS_CODE = str(args.remote_access_code or "").strip()
+    if REMOTE_ACCESS_AUTH_ENABLED:
+        if not REMOTE_ACCESS_CODE:
+            alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+            REMOTE_ACCESS_CODE = "".join(secrets.choice(alphabet) for _ in range(6))
+        print(f"[Auth] Remote access auth enabled")
+        print(f"[Auth] Access code: {REMOTE_ACCESS_CODE}")
+        print(f"[Auth] Login URL: http://{get_local_ip()}:{args.port}")
+    else:
+        print("[Auth] Local-only mode (no remote auth required)")
     
     # only start initial scan if not disabled (Desktop app handles scanning usually)
     if not args.no_scan:

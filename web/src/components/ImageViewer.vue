@@ -247,7 +247,7 @@ const getTouchDistance = (touches) => {
 </script>
 
 <template>
-  <section class="flex-1 overflow-hidden relative bg-[#1c1c1c] flex flex-col" ref="containerRef">
+  <section class="flex-1 overflow-hidden relative bg-gray-100 dark:bg-[#1c1c1c] flex flex-col" ref="containerRef">
     <div v-if="selectedImage" 
             class="w-full h-full flex items-center justify-center cursor-move touch-none"
             @wheel="onWheel"

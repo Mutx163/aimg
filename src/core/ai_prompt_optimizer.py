@@ -122,6 +122,9 @@ class AIPromptOptimizer:
             # One-click optimize should not rewrite scene/character/clothes.
             if (not is_negative) and (existing_prompt or "").strip() and self._is_light_optimize_request(user_input):
                 result = self._light_optimize_preserve(existing_prompt, lora_guidance)
+                # Keep UI behavior consistent with streaming mode.
+                if stream_callback and result:
+                    stream_callback(result)
                 return True, result
 
             if (not is_negative) and (existing_prompt or "").strip():

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, onMounted, watch } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, watch } from 'vue'
 import { Settings2, Zap, Moon, Sun, Search } from 'lucide-vue-next'
 
 // Components
@@ -20,6 +20,12 @@ const meta = ref(null)
 const detailImageError = ref(false)
 const showFilters = ref(false)
 const debugMsg = ref("") // Debugging
+const authChecked = ref(false)
+const authRequired = ref(false)
+const isAuthenticated = ref(false)
+const authCode = ref("")
+const authError = ref("")
+const appInitialized = ref(false)
 
 // --- Resize & Mobile State ---
 const leftWidth = ref(parseInt(localStorage.getItem('aimg_left_width')) || 240)
@@ -130,8 +136,71 @@ const stopResizeRight = () => {
   document.removeEventListener('mouseup', stopResizeRight)
 }
 
+const handleAuthRequired = () => {
+  if (!authRequired.value) return
+  isAuthenticated.value = false
+  authError.value = "登录已过期，请重新输入验证码"
+}
+
+const initAppData = () => {
+  if (appInitialized.value) return
+  appInitialized.value = true
+  fetchImages()
+  fetchFilters()
+  pollComfyStatus()
+}
+
+const checkAuthStatus = async () => {
+  authError.value = ""
+  try {
+    const resp = await fetch('/api/auth/status', { cache: 'no-store' })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const data = await resp.json()
+    authRequired.value = !!data.requires_auth
+    isAuthenticated.value = authRequired.value ? !!data.authenticated : true
+  } catch (e) {
+    // 如果后端未实现状态接口，则保持兼容：直接放行
+    authRequired.value = false
+    isAuthenticated.value = true
+  } finally {
+    authChecked.value = true
+  }
+}
+
+const submitAuthLogin = async () => {
+  const code = authCode.value.trim()
+  if (!code) {
+    authError.value = "请输入验证码"
+    return
+  }
+  authError.value = ""
+  try {
+    const resp = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code })
+    })
+    if (!resp.ok) {
+      authError.value = "验证码错误"
+      return
+    }
+    const data = await resp.json()
+    if (data?.authenticated) {
+      isAuthenticated.value = true
+      authCode.value = ""
+      authError.value = ""
+      initAppData()
+    } else {
+      authError.value = "登录失败，请重试"
+    }
+  } catch (e) {
+    authError.value = `登录失败: ${e.message}`
+  }
+}
+
 // --- API Calls ---
 const fetchImages = async (isRefresh = false) => {
+  if (authRequired.value && !isAuthenticated.value) return
   if (loading.value) return
   if (isRefresh) {
     page.value = 1
@@ -177,6 +246,7 @@ const fetchImages = async (isRefresh = false) => {
 }
 
 const fetchFilters = async () => {
+  if (authRequired.value && !isAuthenticated.value) return
   try {
     const resp = await fetch('/api/filters')
     const data = await resp.json()
@@ -189,6 +259,7 @@ const fetchFilters = async () => {
 }
 
 const fetchComfyInfo = async () => {
+  if (authRequired.value && !isAuthenticated.value) return
   try {
     const resp = await fetch('/api/comfy/samplers_schedulers')
     const data = await resp.json()
@@ -198,6 +269,10 @@ const fetchComfyInfo = async () => {
 }
 
 const pollComfyStatus = async () => {
+  if (authRequired.value && !isAuthenticated.value) {
+    setTimeout(pollComfyStatus, 2000)
+    return
+  }
   try {
     const resp = await fetch('/api/comfy/queue')
     const data = await resp.json()
@@ -213,6 +288,7 @@ const pollComfyStatus = async () => {
 const isMetaLoading = ref(false)
 
 const viewDetail = async (img) => {
+  if (authRequired.value && !isAuthenticated.value) return
   selectedImage.value = img
   // Don't clear meta immediately to prevent flashing
   // meta.value = null 
@@ -235,6 +311,7 @@ const closeDetail = () => {
 }
 
 const deleteImage = async () => {
+    if (authRequired.value && !isAuthenticated.value) return
     if (!selectedImage.value) return
     if (!confirm(`确定要将此图片移至回收站吗？\n${selectedImage.value.file_name}`)) return
     
@@ -341,6 +418,7 @@ const applyToWorkspace = () => {
 }
 
 const submitGeneration = async () => {
+  if (authRequired.value && !isAuthenticated.value) return
   if (!comfyStatus.connected) return
   isGenerating.value = true
   try {
@@ -367,17 +445,25 @@ const handleImageSwitch = (direction) => {
     }
 }
 
-onMounted(() => {
+onMounted(async () => {
   checkMobile()
   window.addEventListener('resize', checkMobile)
+  window.addEventListener('aimg-auth-required', handleAuthRequired)
   initTheme()
-  fetchImages()
-  fetchFilters()
-  pollComfyStatus()
+  await checkAuthStatus()
+  if (isAuthenticated.value) {
+    initAppData()
+  }
+})
+
+onUnmounted(() => {
+  window.removeEventListener('resize', checkMobile)
+  window.removeEventListener('aimg-auth-required', handleAuthRequired)
 })
 
 // Watch for generation completion to refresh list
 watch(() => comfyStatus.queue_remaining, async (newVal, oldVal) => {
+    if (!appInitialized.value || (authRequired.value && !isAuthenticated.value)) return
     if (oldVal > 0 && newVal === 0) {
         console.log("[App] Generation finished, triggering scan...")
         // Force a scan to ensure new file is picked up
@@ -396,6 +482,38 @@ watch(() => comfyStatus.queue_remaining, async (newVal, oldVal) => {
 
 <template>
   <div class="h-screen flex flex-col overflow-hidden text-gray-800 dark:text-gray-100 bg-white dark:bg-[#0b0c10]" :class="isDark ? 'dark' : ''">
+    <div v-if="!authChecked" class="flex-1 flex items-center justify-center text-sm text-gray-500 dark:text-gray-400">
+      正在检查访问权限...
+    </div>
+    <template v-else-if="authRequired && !isAuthenticated">
+      <div class="flex-1 flex items-center justify-center p-4">
+        <div class="w-full max-w-sm rounded-2xl border border-black/10 dark:border-white/10 bg-white dark:bg-[#111216] p-6 shadow-xl">
+          <div class="flex items-center gap-3 mb-4">
+            <div class="w-9 h-9 bg-indigo-600 rounded-lg flex items-center justify-center shadow-lg shadow-indigo-500/25">
+              <Zap class="text-white w-5 h-5" />
+            </div>
+            <div>
+              <div class="font-semibold">远程访问验证</div>
+              <div class="text-xs text-gray-500 dark:text-gray-400">请输入桌面端显示的 6 位验证码</div>
+            </div>
+          </div>
+          <input
+            v-model="authCode"
+            @keyup.enter="submitAuthLogin"
+            placeholder="输入验证码"
+            class="w-full h-10 px-3 rounded-lg bg-gray-50 dark:bg-zinc-900 border border-black/10 dark:border-white/10 outline-none focus:border-indigo-500/60 mb-3"
+          />
+          <button
+            @click="submitAuthLogin"
+            class="w-full h-10 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium transition-colors"
+          >
+            登录
+          </button>
+          <p v-if="authError" class="text-xs text-red-500 mt-3">{{ authError }}</p>
+        </div>
+      </div>
+    </template>
+    <template v-else>
     <!-- Header -->
     <header class="h-12 flex-shrink-0 flex items-center justify-between px-4 bg-white dark:bg-[#0b0c10] border-b border-black/5 dark:border-white/5 z-40">
       <div class="flex items-center gap-2">
@@ -454,7 +572,7 @@ watch(() => comfyStatus.queue_remaining, async (newVal, oldVal) => {
       <!-- Viewer: Desktop (Embedded) vs Mobile (Overlay) -->
       <transition :name="isMobile ? 'fade' : ''">
         <div v-if="!isMobile || selectedImage" 
-             :class="isMobile ? 'fixed inset-0 z-50 bg-[#1c1c1c]' : 'relative flex-1 overflow-hidden'"
+             :class="isMobile ? (isDark ? 'fixed inset-0 z-50 bg-[#1c1c1c]' : 'fixed inset-0 z-50 bg-gray-100') : 'relative flex-1 overflow-hidden'"
              class="flex flex-col">
              
           <!-- Mobile Close Bar -->
@@ -534,6 +652,7 @@ watch(() => comfyStatus.queue_remaining, async (newVal, oldVal) => {
       @apply="() => { showFilters = false; fetchImages(true) }"
       @reset="() => { selectedFilters.folder = null; selectedFilters.model = null; selectedFilters.lora = null; fetchImages(true) }"
     />
+    </template>
   </div>
 </template>
 
