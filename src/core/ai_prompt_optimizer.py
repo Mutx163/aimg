@@ -50,13 +50,11 @@ class AIPromptOptimizer:
     )
 
     SYSTEM_PROMPT_IMAGE_TO_PROMPT = (
-        "你是专业的AI绘图提示词分析专家。"
-        "请根据图片内容输出一段细节丰富的中文提示词。"
-        "必须覆盖：主体外观、服饰材质与颜色、姿态动作、背景环境、光线氛围、镜头景别/构图、人物朝向、道具摆放与相对位置。"
-        "输出一整段自然中文，不要分点，不要解释，不要英文标签。"
-        "必须明确人物朝向（面向左/右/镜头）以及手部与道具的相对位置。"
-        "不要使用问号或列表符号，统一使用中文逗号连接短语。"
-        "长度尽量在120~220字。"
+        "You are an image-to-prompt analyst for generative models. "
+        "Generate one clear Chinese prompt from the input image. "
+        "Describe what is visible in the image without adding analysis text. "
+        "Describe subject appearance, outfit colors/materials, action, background, lighting, composition, facing direction, and object positions. "
+        "Return one single Chinese paragraph only, no bullets, no explanation."
     )
 
     _STYLE_HINTS = (
@@ -156,9 +154,11 @@ class AIPromptOptimizer:
 
             result = self._call_glm_api(messages, stream_callback)
             if is_negative:
+                result = self._strip_reasoning_artifacts(result)
                 return True, self._trim_negative_keywords(result, max_items=30)
 
             result = self._strip_format_markers(result)
+            result = self._strip_reasoning_artifacts(result)
             result = self._sanitize_prompt_punctuation(result)
             result = self._replace_lora_aliases_with_triggers(result, lora_guidance)
             result = self._remove_non_trigger_lora_aliases(result, lora_guidance)
@@ -187,9 +187,9 @@ class AIPromptOptimizer:
             messages = self.construct_image_prompt_messages(image_b64, lora_guidance=lora_guidance)
             result = self._call_glm_api(messages, stream_callback)
             result = self._strip_format_markers(result)
+            result = self._strip_reasoning_artifacts(result)
             result = self._sanitize_prompt_punctuation(result)
             result = self._enrich_image_prompt_if_too_short(result)
-            result = self._ensure_spatial_layout_clauses(result)
             result = self._replace_lora_aliases_with_triggers(result, lora_guidance)
             result = self._remove_non_trigger_lora_aliases(result, lora_guidance)
             result = self._dedupe_prompt(result)
@@ -210,11 +210,10 @@ class AIPromptOptimizer:
         lora_guidance: Optional[Dict[str, Any]] = None,
     ) -> list:
         user_text = (
-            "请根据图片生成可直接用于文生图的一段中文提示词。"
-            "要求细节充分、信息完整，至少覆盖：人物/主体、服装、动作、场景、光线、镜头构图、人物朝向（面向左/右/镜头）、道具与人体和环境的相对位置。"
-            "请明确写出人物面向方向、左右手动作、道具在人物左侧/右侧/前方/后方的位置关系。"
-            "不要输出问号，统一使用中文逗号。"
-            "输出一段完整中文，不要分点。"
+            "Please generate one Chinese prompt from the image. "
+            "Explicitly describe facing direction, left/right hand actions, and relative positions of phone/props and background structures. "
+            "Explicitly state shot scale and crop range. "
+            "Return one Chinese paragraph only, no bullets, no question style."
         )
         lora_instruction = self._build_lora_instruction(lora_guidance)
         if lora_instruction:
@@ -246,8 +245,6 @@ class AIPromptOptimizer:
             payload["stream"] = True
         if "thinking" not in self.model_name.lower():
             payload["max_tokens"] = 4096
-        if "glm" in self.model_name.lower():
-            payload["thinking"] = {"type": "enabled"}
 
         session = requests.Session()
         retries = Retry(
@@ -341,6 +338,35 @@ class AIPromptOptimizer:
             text = text.replace(marker, "")
         return text.strip()
 
+    def _strip_reasoning_artifacts(self, text: str) -> str:
+        """Remove hidden-reasoning blocks and non-prompt boilerplate from model output."""
+        cleaned = str(text or "")
+
+        # Remove explicit reasoning tags.
+        cleaned = re.sub(r"(?is)<think>.*?</think>", " ", cleaned)
+        cleaned = re.sub(r"(?is)<analysis>.*?</analysis>", " ", cleaned)
+        cleaned = re.sub(r"(?is)<reasoning>.*?</reasoning>", " ", cleaned)
+        cleaned = re.sub(r"(?is)<reflection>.*?</reflection>", " ", cleaned)
+        cleaned = re.sub(r"(?i)</?think>|</?analysis>|</?reasoning>|</?reflection>", " ", cleaned)
+
+        # Remove common "no image provided" boilerplate that sometimes leaks into output.
+        cn_patterns = [
+            r"抱歉[^。！\n]{0,160}(没|未)[^。！\n]{0,40}(看|收到|检测到)[^。！\n]{0,80}(图片|图像)[^。！\n]{0,120}[。！]?",
+            r"请[^。！\n]{0,40}(上传|提供)[^。！\n]{0,40}(图片|图像)[^。！\n]{0,120}[。！]?",
+        ]
+        for pat in cn_patterns:
+            cleaned = re.sub(pat, " ", cleaned, flags=re.IGNORECASE)
+
+        en_patterns = [
+            r"(?i)i\\s+(?:currently\\s+)?(?:can't|cannot|don't)\\s+(?:see|find|access)\\s+[^.\\n]{0,120}(?:image|picture)[^.\\n]{0,120}\\.?",
+            r"(?i)please\\s+(?:upload|provide)\\s+[^.\\n]{0,120}(?:image|picture)[^.\\n]{0,120}\\.?",
+        ]
+        for pat in en_patterns:
+            cleaned = re.sub(pat, " ", cleaned)
+
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
     def _sanitize_prompt_punctuation(self, text: str) -> str:
         cleaned = (text or "").strip()
         if not cleaned:
@@ -428,19 +454,58 @@ class AIPromptOptimizer:
         normalized_text = " ".join(self._normalize_piece(p) for p in parts)
         additions: List[str] = []
 
-        direction_keywords = ("朝向", "面向", "看向", "视线", "侧身", "转向")
+        direction_keywords = (
+            "\u671d\u5411",  # 朝向
+            "\u9762\u5411",  # 面向
+            "\u770b\u5411",  # 看向
+            "\u89c6\u7ebf",  # 视线
+            "\u4fa7\u8eab",  # 侧身
+            "\u8f6c\u5411",  # 转向
+        )
         if not any(keyword in normalized_text for keyword in direction_keywords):
-            additions.append("人物面向镜头略偏右，视线聚焦主体动作")
+            additions.append(
+                "\u4eba\u7269\u671d\u5411\u4e0e\u89c6\u7ebf\u65b9\u5411\u660e\u786e"
+            )
 
-        position_keywords = ("相对位置", "左侧", "右侧", "前方", "后方", "前景", "中景", "后景")
+        position_keywords = (
+            "\u76f8\u5bf9\u4f4d\u7f6e",  # 相对位置
+            "\u5de6\u4fa7",  # 左侧
+            "\u53f3\u4fa7",  # 右侧
+            "\u524d\u65b9",  # 前方
+            "\u540e\u65b9",  # 后方
+            "\u524d\u666f",  # 前景
+            "\u4e2d\u666f",  # 中景
+            "\u540e\u666f",  # 后景
+        )
         if not any(keyword in normalized_text for keyword in position_keywords):
-            additions.append("主体位于中景，道具位于人物手部前侧，前景与背景层次清晰")
+            additions.append(
+                "\u4e3b\u4f53\u4e0e\u9053\u5177\u53ca\u80cc\u666f\u7ed3\u6784\u7684\u76f8\u5bf9\u4f4d\u7f6e\u660e\u786e"
+            )
 
         if not additions:
             return text
-        return self._dedupe_prompt("，".join(parts + additions))
+        return self._dedupe_prompt(", ".join(parts + additions))
+
+    def _ensure_fidelity_lock_clause(self, prompt: str) -> str:
+        text = (prompt or "").strip()
+        if not text:
+            return text
+
+        parts = self._split_prompt_pieces(text)
+        if not parts:
+            return text
+
+        lock_clause = (
+            "\u59ff\u6001\u52a8\u4f5c\u3001\u955c\u5934\u89d2\u5ea6\u3001\u666f\u522b\u6784\u56fe\u4e0e\u88c1\u5207\u8303\u56f4\u660e\u786e"
+        )
+        norm_lock = self._normalize_piece(lock_clause)
+        existing = {self._normalize_piece(p) for p in parts}
+        if norm_lock not in existing:
+            parts.append(lock_clause)
+        return self._dedupe_prompt(", ".join(parts))
 
     def _is_light_optimize_request(self, user_input: str) -> bool:
+
         text = (user_input or "").strip().lower()
         if not text:
             return False

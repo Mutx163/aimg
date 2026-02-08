@@ -497,6 +497,9 @@ class ParameterPanel(QWidget):
         self.current_lora_meta = {} # 存储LoRA附加信息 {name: {note, prompt, auto_use_prompt}}
         self._ai_is_processing = False # AI处理并发锁
         self._img_prompt_processing = False
+        self._img_prompt_loading_button = None
+        self._img_original_prompt = None
+        self._img_stream_started = False
         self.history_manager = AIHistoryManager()
         self.history_dialogs = {}
         self.current_ai_worker = None
@@ -2241,23 +2244,17 @@ class ParameterPanel(QWidget):
         self._run_prompt_ai_optimization(is_negative=True)
 
     def _on_clipboard_import_click(self):
-        if self._ai_is_processing or self._img_prompt_processing:
+        if self._img_prompt_processing:
+            self._cancel_image_prompt_task()
+            return
+        if self._ai_is_processing:
             self._temp_notify("当前已有AI任务在执行")
             return
         
         clipboard = QGuiApplication.clipboard()
-        
-        # 1. 优先尝试识别图片
-        image = clipboard.image()
-        if image and not image.isNull():
-            image_b64 = self._qimage_to_base64(image)
-            if image_b64:
-                self._temp_notify("🎨 正在从剪贴板读取图片进行识图...")
-                self._run_image_to_prompt(image_b64)
-                return
-        
-        # 2. 检查是否有本地图片文件链接
         mime = clipboard.mimeData()
+        
+        # 1. 优先检查是否有本地图片文件链接（避免拿到缩略图）
         if mime and mime.hasUrls():
             for url in mime.urls():
                 path = url.toLocalFile()
@@ -2265,8 +2262,17 @@ class ParameterPanel(QWidget):
                     image_b64 = self._image_file_to_base64(path)
                     if image_b64:
                         self._temp_notify(f"📁 正在识图: {os.path.basename(path)}")
-                        self._run_image_to_prompt(image_b64)
+                        self._run_image_to_prompt(image_b64, loading_button=self.sender())
                         return
+
+        # 2. 再尝试直接读取剪贴板图像数据
+        image = clipboard.image()
+        if image and not image.isNull():
+            image_b64 = self._qimage_to_base64(image)
+            if image_b64:
+                self._temp_notify("🎨 正在从剪贴板读取图片进行识图...")
+                self._run_image_to_prompt(image_b64, loading_button=self.sender())
+                return
                         
         # 3. 如果不是图片，尝试导入文本
         if mime and mime.hasText():
@@ -2296,7 +2302,10 @@ class ParameterPanel(QWidget):
         QMessageBox.warning(self, "剪贴板无有效内容", "未检测到图片或文本内容")
 
     def _on_file_import_click(self):
-        if self._ai_is_processing or self._img_prompt_processing:
+        if self._img_prompt_processing:
+            self._cancel_image_prompt_task()
+            return
+        if self._ai_is_processing:
             self._temp_notify("当前已有AI任务在执行")
             return
         
@@ -2309,27 +2318,37 @@ class ParameterPanel(QWidget):
         if not image_b64:
             QMessageBox.warning(self, "图片读取失败", "未能读取或解析该图片")
             return
-        self._run_image_to_prompt(image_b64)
+        self._run_image_to_prompt(image_b64, loading_button=self.sender())
 
-    def _run_image_to_prompt(self, image_b64: str):
+    def _run_image_to_prompt(self, image_b64: str, loading_button=None):
         if self._ai_is_processing or self._img_prompt_processing:
             self._temp_notify("当前已有AI任务在执行")
             return
         self._img_prompt_processing = True
-        # self.ai_status_label.setText("⏳ 识图中...")
-        self.btn_file_import.setText("...")
-        if hasattr(self, "btn_neg_file_import"):
-            self.btn_neg_file_import.setText("...")
-        self.btn_clipboard_import.setEnabled(False)
-        self.btn_file_import.setEnabled(False)
+        self._img_original_prompt = self.prompt_edit.toPlainText().strip()
+        self._img_prompt_loading_button = loading_button if isinstance(loading_button, QPushButton) else None
+        if self._img_prompt_loading_button is not None:
+            self._img_prompt_loading_button.setText("取消")
+            self._img_prompt_loading_button.setEnabled(True)
+        else:
+            self.btn_file_import.setText("取消")
+            self.btn_file_import.setEnabled(True)
+            if hasattr(self, "btn_neg_file_import"):
+                self.btn_neg_file_import.setText("取消")
+                self.btn_neg_file_import.setEnabled(True)
+        self.btn_clipboard_import.setEnabled(self.btn_clipboard_import is self._img_prompt_loading_button)
+        self.btn_file_import.setEnabled(self.btn_file_import is self._img_prompt_loading_button)
         if hasattr(self, "btn_neg_clipboard_import"):
-            self.btn_neg_clipboard_import.setEnabled(False)
+            self.btn_neg_clipboard_import.setEnabled(self.btn_neg_clipboard_import is self._img_prompt_loading_button)
         if hasattr(self, "btn_neg_file_import"):
-            self.btn_neg_file_import.setEnabled(False)
+            self.btn_neg_file_import.setEnabled(self.btn_neg_file_import is self._img_prompt_loading_button)
         self.btn_ai_optimize.setEnabled(False)
         self.btn_neg_ai_optimize.setEnabled(False)
+        main_win = self.window()
+        if hasattr(main_win, 'statusBar'):
+            main_win.statusBar().showMessage("⏳ 识图中...可点击当前按钮取消")
         
-        original_prompt = self.prompt_edit.toPlainText().strip()
+        original_prompt = self._img_original_prompt
         self.current_img_worker = ImagePromptWorker(
             image_b64,
             lora_guidance=self._build_lora_guidance_payload(),
@@ -2338,6 +2357,35 @@ class ParameterPanel(QWidget):
         self.current_img_worker.stream_update.connect(self._on_img_stream_update)
         self.current_img_worker.finished.connect(lambda s, r: self._on_image_prompt_finished(s, r, original_prompt))
         self.current_img_worker.start()
+
+    def _reset_image_prompt_ui(self):
+        self._img_prompt_loading_button = None
+        self.btn_clipboard_import.setEnabled(True)
+        self.btn_file_import.setEnabled(True)
+        self.btn_clipboard_import.setText("贴")
+        self.btn_file_import.setText("文")
+        if hasattr(self, "btn_neg_clipboard_import"):
+            self.btn_neg_clipboard_import.setEnabled(True)
+            self.btn_neg_clipboard_import.setText("贴")
+        if hasattr(self, "btn_neg_file_import"):
+            self.btn_neg_file_import.setEnabled(True)
+            self.btn_neg_file_import.setText("文")
+        self.btn_ai_optimize.setEnabled(True)
+        self.btn_neg_ai_optimize.setEnabled(True)
+
+    def _cancel_image_prompt_task(self):
+        if not self._img_prompt_processing:
+            return
+        if self.current_img_worker:
+            self.current_img_worker.is_cancelled = True
+        self._img_prompt_processing = False
+        self.current_img_worker = None
+        if self._img_stream_started and self._img_original_prompt is not None:
+            self.prompt_edit.setPlainText(self._img_original_prompt)
+        self._img_stream_started = False
+        self._img_original_prompt = None
+        self._reset_image_prompt_ui()
+        self._temp_notify("🚫 已取消识图")
 
     def _on_img_stream_update(self, chunk):
         if not self._img_prompt_processing:
@@ -2354,17 +2402,9 @@ class ParameterPanel(QWidget):
         if not self._img_prompt_processing:
             return
         self._img_prompt_processing = False
-        self.btn_clipboard_import.setEnabled(True)
-        self.btn_file_import.setEnabled(True)
-        self.btn_file_import.setText("文")
-        if hasattr(self, "btn_neg_clipboard_import"):
-            self.btn_neg_clipboard_import.setEnabled(True)
-        if hasattr(self, "btn_neg_file_import"):
-            self.btn_neg_file_import.setEnabled(True)
-            self.btn_neg_file_import.setText("文")
-        self.btn_ai_optimize.setEnabled(True)
-        self.btn_neg_ai_optimize.setEnabled(True)
+        self._reset_image_prompt_ui()
         self.current_img_worker = None
+        self._img_original_prompt = None
         
         if success:
             # self.ai_status_label.setText("✅ 识图完成")
