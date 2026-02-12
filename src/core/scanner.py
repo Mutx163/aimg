@@ -4,6 +4,7 @@ import threading
 from typing import List, Optional
 from src.core.database import DatabaseManager
 from src.core.metadata import MetadataParser
+from PyQt6.QtCore import QSettings
 
 class ImageScanner:
     """
@@ -31,23 +32,39 @@ class ImageScanner:
                 return 0
 
             known_paths = self.db.get_all_file_paths()
+            settings = QSettings("ComfyUIImageManager", "Settings")
+            recursive = settings.value("scan_recursive", False, type=bool)
             new_files = []
             
             # print(f"[Scanner] Checking {len(folders)} folders...")
             for folder in folders:
                 if not os.path.exists(folder): continue
                 try:
-                    with os.scandir(folder) as it:
-                        for entry in it:
-                            if entry.is_file() and entry.name.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                                # 规范化路径以进行比对
-                                norm_path = os.path.normpath(entry.path)
-                                # 简单处理：数据库里的路径可能是 / 或 \ 混合，但在 Windows 上 file_path 存储时建议统一
-                                # 这里我们依赖 DatabaseManager 的一致性，或者在此处做标准化
-                                if entry.path not in known_paths and entry.path.replace("\\", "/") not in known_paths:
-                                    new_files.append(entry.path)
+                    if recursive:
+                        for root, _, files in os.walk(folder):
+                            for name in files:
+                                if not name.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                                    continue
+                                path = os.path.join(root, name)
+                                if path not in known_paths and path.replace("\\", "/") not in known_paths:
+                                    new_files.append(path)
+                    else:
+                        with os.scandir(folder) as it:
+                            for entry in it:
+                                if entry.is_file() and entry.name.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                                    if entry.path not in known_paths and entry.path.replace("\\", "/") not in known_paths:
+                                        new_files.append(entry.path)
                 except Exception as e:
                     print(f"[Scanner] Error accessing {folder}: {e}")
+
+            # 清理数据库中已不存在的文件，保证 Web 端删除后自动消失
+            missing_files = []
+            for path in known_paths:
+                p = str(path or "").replace("/", os.sep)
+                if p and not os.path.exists(p):
+                    missing_files.append(path)
+            if missing_files:
+                self.db.delete_images(missing_files)
 
             if not new_files:
                 return 0

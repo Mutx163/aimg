@@ -38,6 +38,7 @@ onMounted(() => {
 
 // Encode path for URL
 const encodePath = (path) => encodeURIComponent(path)
+const thumbSrc = (img) => `/api/image/thumb?size=512&path=${encodePath(img.file_path)}&v=${img.file_mtime || 0}`
 </script>
 
 <template>
@@ -50,7 +51,7 @@ const encodePath = (path) => encodeURIComponent(path)
         class="aspect-[2/3] bg-gray-100 dark:bg-zinc-800 rounded-lg overflow-hidden cursor-pointer transition-all hover:ring-2 hover:ring-indigo-500/50 relative group"
         :class="selectedImage?.file_path === img.file_path ? 'ring-2 ring-indigo-500' : ''">
         
-        <img :src="'/api/image/thumb?size=512&path=' + encodePath(img.file_path)" 
+        <img :src="thumbSrc(img)" 
              loading="lazy" 
              class="w-full h-full object-cover block transition-transform duration-300 group-hover:scale-105" />
              

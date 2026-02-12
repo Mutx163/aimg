@@ -9,6 +9,11 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['error', 'switch'])
+const imageSrc = (img) => {
+    if (!img?.file_path) return ""
+    const v = img.file_mtime || 0
+    return `/api/image/raw?path=${encodeURIComponent(img.file_path)}&v=${v}`
+}
 
 // View State
 const viewScale = ref(1)
@@ -33,21 +38,20 @@ const onWindowResize = () => {
 onMounted(() => window.addEventListener('resize', onWindowResize))
 onUnmounted(() => window.removeEventListener('resize', onWindowResize))
 
-// Reset view when image changes
-watch(() => props.selectedImage, () => {
+// Reset only when the actual file changes, not when parent object references refresh.
+watch(() => props.selectedImage?.file_path || "", (newPath, oldPath) => {
+    if (!newPath || newPath === oldPath) return
     isSwitching.value = true
     isLoading.value = true
     
-    // Clear any pending transition restore
     if (transitionTimer) clearTimeout(transitionTimer)
     
-    // Reset immediately (without transition because isSwitching is true)
     viewScale.value = 1
     viewX.value = 0
     viewY.value = 0
-    
-    // Crucial: Reset switch accumulator so previous scroll inertia doesn't affect new image
     switchAccumulator.value = 0
+    swipeDeltaX.value = 0
+    edgeSwipeDeltaX.value = 0
 })
 
 const onImageLoad = () => {
@@ -81,6 +85,31 @@ const resetView = () => {
     viewX.value = 0
     viewY.value = 0
 }
+
+const getPanBounds = (scale = viewScale.value) => {
+    if (!imageRef.value || !containerRef.value || !imageRef.value.naturalWidth || !imageRef.value.naturalHeight) {
+        return { maxX: 0, maxY: 0 }
+    }
+    const imgW = imageRef.value.naturalWidth * scale
+    const imgH = imageRef.value.naturalHeight * scale
+    const contW = containerRef.value.clientWidth
+    const contH = containerRef.value.clientHeight
+    const maxX = Math.max(0, (imgW - contW) / 2)
+    const maxY = Math.max(0, (imgH - contH) / 2)
+    return { maxX, maxY }
+}
+
+const clampPan = (x, y, scale = viewScale.value) => {
+    const { maxX, maxY } = getPanBounds(scale)
+    return {
+        x: Math.min(maxX, Math.max(-maxX, x)),
+        y: Math.min(maxY, Math.max(-maxY, y)),
+        maxX,
+        maxY,
+    }
+}
+
+const isZoomedForPan = () => viewScale.value > (minScale.value * 1.02)
 
 // Switch Accumulator
 const switchAccumulator = ref(0)
@@ -130,6 +159,9 @@ const onWheel = (e) => {
     newScale = Math.max(minScale.value, Math.min(newScale, 20))
 
     viewScale.value = newScale
+    const clamped = clampPan(viewX.value, viewY.value, newScale)
+    viewX.value = clamped.x
+    viewY.value = clamped.y
 }
 
 const startDrag = (e) => {
@@ -144,8 +176,9 @@ const startDrag = (e) => {
 const onDrag = (e) => {
     if (!isDragging.value) return
     e.preventDefault()
-    viewX.value = e.clientX - dragStartX.value
-    viewY.value = e.clientY - dragStartY.value
+    const clamped = clampPan(e.clientX - dragStartX.value, e.clientY - dragStartY.value)
+    viewX.value = clamped.x
+    viewY.value = clamped.y
 }
 
 const stopDrag = () => {
@@ -154,17 +187,25 @@ const stopDrag = () => {
 
 // --- Touch Handling ---
 const lastTouchDistance = ref(0)
+const touchStartX = ref(0)
+const touchStartY = ref(0)
+const touchLastX = ref(0)
+const touchLastY = ref(0)
+const edgeSwipeDeltaX = ref(0)
+const EDGE_SWITCH_THRESHOLD = 65
 
 const onTouchStart = (e) => {
     if (e.touches.length === 1) {
-        // For touch, we want to allow dragging even if zoomed out (for swipe detection)
-        // So we manually set isDragging instead of calling startDrag which has a check
         isDragging.value = true
-        dragStartX.value = e.touches[0].clientX - viewX.value
-        dragStartY.value = e.touches[0].clientY - viewY.value
-        swipeDeltaX.value = 0 // Reset swipe tracker
+        const x = e.touches[0].clientX
+        const y = e.touches[0].clientY
+        touchStartX.value = x
+        touchStartY.value = y
+        touchLastX.value = x
+        touchLastY.value = y
+        swipeDeltaX.value = 0
+        edgeSwipeDeltaX.value = 0
     } else if (e.touches.length === 2) {
-        // Pinch start
         lastTouchDistance.value = getTouchDistance(e.touches)
     }
 }
@@ -174,65 +215,66 @@ const swipeDeltaX = ref(0) // Track swipe distance without moving image
 const onTouchMove = (e) => {
     e.preventDefault() 
     if (e.touches.length === 1) {
-        // SWIPE LOGIC: If image is roughly fit to screen
-        if (viewScale.value <= minScale.value * 2.0) {
-             // STATIC SWIPE: Do NOT move the image (viewX/viewY)
-             // Just calculate the distance from start to check for intent
-             const currentX = e.touches[0].clientX
-             // dragStartX was set to clientX - viewX (0) -> so dragStartX is just start clientX
-             // But let's recalculate cleanly from touch start
-             // actually dragStartX = e.touches[0].clientX - viewX.value. If viewX is 0, it is clientX.
-             
-             // We can just track delta relative to start
-             // We need to know where we started. 
-             // dragStartX is (StartClientX - InitialViewX).
-             // Current Delta = CurrentClientX - InitialViewX - dragStartX
-             //              = CurrentClientX - InitialViewX - (StartClientX - InitialViewX)
-             //              = CurrentClientX - StartClientX
-             
-             // Let's rely on the native calculation but NOT assign to viewX
-             const calculatedX = e.touches[0].clientX - dragStartX.value
-             swipeDeltaX.value = calculatedX 
-             
-             // FORCE STATIC: Ensure image does not move visually
-             viewX.value = 0
-             viewY.value = 0 
+        const currentX = e.touches[0].clientX
+        const currentY = e.touches[0].clientY
+
+        if (!isZoomedForPan()) {
+            // Not zoomed: horizontal swipe switches images.
+            swipeDeltaX.value = currentX - touchStartX.value
+            viewX.value = 0
+            viewY.value = 0
+            touchLastX.value = currentX
+            touchLastY.value = currentY
         } else {
-             // Normal Pan Logic (Zoomed In)
-             onDrag({ 
-                preventDefault: () => {}, 
-                clientX: e.touches[0].clientX, 
-                clientY: e.touches[0].clientY 
-            })
+            // Zoomed: pan first. Switch is only allowed when dragging beyond horizontal edge.
+            const dx = currentX - touchLastX.value
+            const dy = currentY - touchLastY.value
+            const targetX = viewX.value + dx
+            const targetY = viewY.value + dy
+            const clamped = clampPan(targetX, targetY)
+            const hitHorizontalEdge = Math.abs(targetX - clamped.x) > 0.5
+
+            viewX.value = clamped.x
+            viewY.value = clamped.y
+            touchLastX.value = currentX
+            touchLastY.value = currentY
+
+            if (hitHorizontalEdge && Math.abs(dx) > Math.abs(dy)) {
+                edgeSwipeDeltaX.value += dx
+                swipeDeltaX.value = edgeSwipeDeltaX.value
+            } else {
+                edgeSwipeDeltaX.value = 0
+                swipeDeltaX.value = 0
+            }
         }
     } else if (e.touches.length === 2) {
-        // Pinch Zoom Logic
         const dist = getTouchDistance(e.touches)
         const scaleChange = dist / lastTouchDistance.value
         let newScale = viewScale.value * scaleChange
         newScale = Math.max(minScale.value, Math.min(newScale, 20))
         viewScale.value = newScale
+        const clamped = clampPan(viewX.value, viewY.value, newScale)
+        viewX.value = clamped.x
+        viewY.value = clamped.y
         lastTouchDistance.value = dist
     }
 }
 
 const onTouchEnd = (e) => {
     stopDrag()
-    
-    // Swipe Detection Logic
-    if (viewScale.value <= minScale.value * 2.0) {
-        // Use the internally tracked delta
-        const threshold = 50 
-        
-        if (swipeDeltaX.value > threshold) {
-            emit('switch', -1)
-        } else if (swipeDeltaX.value < -threshold) {
-            emit('switch', 1)
-        }
-        
-        // Reset local tracker
-        swipeDeltaX.value = 0
-        // Ensure View is still 0 (should be already, but just in case)
+    const delta = isZoomedForPan() ? edgeSwipeDeltaX.value : swipeDeltaX.value
+    const threshold = isZoomedForPan() ? EDGE_SWITCH_THRESHOLD : 50
+
+    if (delta > threshold) {
+        emit('switch', -1)
+    } else if (delta < -threshold) {
+        emit('switch', 1)
+    }
+
+    swipeDeltaX.value = 0
+    edgeSwipeDeltaX.value = 0
+
+    if (!isZoomedForPan()) {
         viewX.value = 0
         viewY.value = 0
     }
@@ -263,7 +305,7 @@ const getTouchDistance = (touches) => {
             :class="isDragging || isSwitching || isLoading ? '' : 'transition-transform duration-75'"
             :style="{ transform: `translate(${viewX}px, ${viewY}px) scale(${viewScale})` }">
         <img ref="imageRef"
-                :src="'/api/image/raw?path=' + encodeURIComponent(selectedImage.file_path)"
+                :src="imageSrc(selectedImage)"
                 v-if="!error"
                 @load="onImageLoad"
                 @error="$emit('error')"

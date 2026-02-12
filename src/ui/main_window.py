@@ -22,6 +22,7 @@ from src.ui.widgets.param_panel import ParameterPanel
 from src.ui.widgets.model_explorer import ModelExplorer
 from src.ui.widgets.comparison_view import ComparisonView
 from src.core.comfy_client import ComfyClient
+from src.core.comfy_launcher import ComfyLauncher
 from src.ui.settings_dialog import SettingsDialog
 from src.core.cache import ThumbnailCache
 from src.ui.controllers.file_controller import FileController
@@ -45,6 +46,7 @@ class CompareSession:
 
 class MainWindow(QMainWindow):
     COMPARE_LAST_SESSION_KEY = "compare_last_session_v1"
+    COMFY_PROGRESS_SNAPSHOT_KEY = "comfy/progress_snapshot_v1"
 
     def __init__(self):
         super().__init__()
@@ -122,7 +124,9 @@ class MainWindow(QMainWindow):
         # 初始化 ComfyUI 客户端
         self.comfy_client = ComfyClient(self.settings.value("comfy_address", "127.0.0.1:8188"))
         self.comfy_client.status_changed.connect(lambda msg: self.statusBar().showMessage(f"[Comfy] {msg}", 3000))
+        self.comfy_client.progress_detail_updated.connect(self._on_comfy_progress_detail)
         self.comfy_client.progress_updated.connect(self._on_comfy_progress)
+        self.comfy_client.system_stats_updated.connect(self._on_comfy_system_stats)
         self.comfy_client.prompt_submitted.connect(self._on_prompt_submitted)
         
         # 绑定模型列表获取信号
@@ -135,6 +139,13 @@ class MainWindow(QMainWindow):
         # 监听队列状态以更新右下角计数
         self.comfy_client.queue_updated.connect(self._update_queue_button)
         self._has_realtime_progress = False
+        self._progress_eta_seconds = None
+        self._running_prompt_id = ""
+        self._progress_timing_started_at = None
+        self._progress_timing_last_ts = None
+        self._progress_timing_last_value = 0
+        self._progress_timing_total = 0
+        self._progress_timing_avg_step_seconds = None
         self.queue_sync_timer = QTimer(self)
         self.queue_sync_timer.setInterval(1000)
         self.queue_sync_timer.timeout.connect(self.comfy_client.get_queue)
@@ -373,6 +384,14 @@ class MainWindow(QMainWindow):
         self.interrupt_btn.raise_()
         
         box_lay.addWidget(self.progress_container)
+
+        # --- 资源状态（独立于进度条） ---
+        self.resource_label = QLabel("显存 --/-- | 内存 --/--")
+        self.resource_label.setMinimumWidth(190)
+        self.resource_label.setFixedHeight(22)
+        self.resource_label.setStyleSheet("color: palette(mid); font-size: 11px;")
+        self.resource_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        box_lay.addWidget(self.resource_label)
         
         # --- 队列按钮 ---
         self.queue_btn = QPushButton("📋 队列")
@@ -647,11 +666,58 @@ class MainWindow(QMainWindow):
             self._load_historical_schedulers()
 
 
+    def _ensure_comfy_ready_for_submit(self, timeout_seconds: float = 3.0) -> bool:
+        """提交前兜底检查 ComfyUI；不可达时复用现有启动逻辑。"""
+        address = str(
+            self.settings.value(
+                "comfy_address",
+                getattr(self.comfy_client, "server_address", "127.0.0.1:8188"),
+                type=str,
+            )
+            or ""
+        ).strip()
+        if not address:
+            address = str(getattr(self.comfy_client, "server_address", "127.0.0.1:8188") or "127.0.0.1:8188")
+
+        if ":" in address:
+            host, port = address.rsplit(":", 1)
+        else:
+            host, port = address, "8188"
+        host = (host or "127.0.0.1").strip()
+        port = (port or "8188").strip()
+        normalized_address = f"{host}:{port}"
+
+        if getattr(self.comfy_client, "server_address", "") != normalized_address:
+            self.comfy_client.server_address = normalized_address
+
+        if ComfyLauncher.is_port_open(host, port):
+            self.comfy_client.connect_server()
+            return True
+
+        print(f"[Main] ComfyUI unreachable ({normalized_address}), trying launcher fallback...")
+        self.statusBar().showMessage("ComfyUI 未连接，正在尝试自动启动...", 3000)
+        ComfyLauncher.ensure_comfy_running()
+
+        deadline = time.time() + max(float(timeout_seconds), 0.0)
+        while time.time() < deadline:
+            if ComfyLauncher.is_port_open(host, port):
+                self.comfy_client.connect_server()
+                return True
+            QApplication.processEvents()
+            time.sleep(0.2)
+
+        self.comfy_client.connect_server()
+        return False
+
     def on_remote_gen_requested(self, workflow, batch_count=1, randomize_seed=True):
         """处理远程生成请求 - 使用当前图片的workflow重新生成"""
         # 清空上一轮日志缓存
         self.last_gen_logs = ""
         self.last_log_count = 0
+
+        if not self._ensure_comfy_ready_for_submit():
+            self.statusBar().showMessage("ComfyUI 尚未就绪，已尝试自动启动，请稍后重试生成", 5000)
+            return
         
         # 随机模式每次提交自动随机；固定模式按工作区指定seed提交
         seed_mode_text = "随机种子" if randomize_seed else "固定种子"
@@ -1118,6 +1184,10 @@ class MainWindow(QMainWindow):
         expected_count = int(payload.get("expected_count") or len(workflows))
         if not session_id or not workflows:
             QMessageBox.warning(self, "提交失败", "对比任务数据不完整。")
+            return
+
+        if not self._ensure_comfy_ready_for_submit():
+            QMessageBox.warning(self, "ComfyUI 未就绪", "检测到 ComfyUI 未连接，已尝试自动启动，请稍后重试。")
             return
 
         session = CompareSession(
@@ -1815,17 +1885,264 @@ class MainWindow(QMainWindow):
         """处理 ComfyUI 进度更新"""
         if hasattr(self, 'progress_bar'):
             self._has_realtime_progress = True
+            safe_total = max(int(total), 1)
+            safe_current = max(min(int(current), safe_total), 0)
+            local_eta_seconds = self._estimate_local_eta_seconds(safe_current, safe_total)
+            if self._progress_eta_seconds is None and isinstance(local_eta_seconds, (int, float)):
+                self._progress_eta_seconds = local_eta_seconds
             # 确保处于确定进度状态
             if self.progress_bar.maximum() == 0:
-                self.progress_bar.setMaximum(total)
+                self.progress_bar.setMaximum(safe_total)
             
             # 确保子控件也是可见的
             self.progress_container.setVisible(True)
             self.interrupt_btn.raise_() # 确保每次重绘后都在最上层
             
-            self.progress_bar.setMaximum(total)
-            self.progress_bar.setValue(current)
-            self.progress_bar.setFormat(f"生成中... {current}/{total} (%p%)")
+            self.progress_bar.setMaximum(safe_total)
+            self.progress_bar.setValue(safe_current)
+            self.progress_bar.setFormat(self._format_progress_text(safe_current, safe_total))
+            self._save_progress_snapshot(safe_current, safe_total)
+
+    def _on_comfy_progress_detail(self, detail: Dict[str, Any]):
+        """处理 ComfyUI 进度详情（ETA）。"""
+        eta = detail.get("eta_seconds")
+        self._progress_eta_seconds = eta if isinstance(eta, (int, float)) else None
+        if hasattr(self, "progress_bar") and self.progress_bar.maximum() > 0:
+            self.progress_bar.setFormat(
+                self._format_progress_text(self.progress_bar.value(), self.progress_bar.maximum())
+            )
+
+    @staticmethod
+    def _format_eta(eta_seconds: Any) -> str:
+        if not isinstance(eta_seconds, (int, float)):
+            return ""
+        eta = max(int(round(eta_seconds)), 0)
+        if eta < 60:
+            return f"{eta}s"
+        if eta < 3600:
+            mins, secs = divmod(eta, 60)
+            return f"{mins}m{secs:02d}s"
+        hours, rem = divmod(eta, 3600)
+        mins, secs = divmod(rem, 60)
+        return f"{hours}h{mins:02d}m{secs:02d}s"
+
+    def _format_progress_text(self, current: int, total: int) -> str:
+        eta_text = self._format_eta(self._progress_eta_seconds)
+        if eta_text:
+            return f"生成中... {current}/{total} (%p%) 预计 {eta_text}"
+        return f"生成中... {current}/{total} (%p%)"
+
+    def _reset_progress_eta_tracking(self) -> None:
+        self._progress_timing_started_at = None
+        self._progress_timing_last_ts = None
+        self._progress_timing_last_value = 0
+        self._progress_timing_total = 0
+        self._progress_timing_avg_step_seconds = None
+
+    def _estimate_local_eta_seconds(self, current: int, total: int) -> Any:
+        """当服务端没给 ETA 时，用本地步速估算剩余时间。"""
+        if total <= 0 or current < 0:
+            return None
+        if current >= total:
+            return 0.0
+
+        now = time.time()
+        if (
+            self._progress_timing_started_at is None
+            or self._progress_timing_total != total
+            or current < self._progress_timing_last_value
+        ):
+            self._progress_timing_started_at = now
+            self._progress_timing_last_ts = now
+            self._progress_timing_last_value = current
+            self._progress_timing_total = total
+            self._progress_timing_avg_step_seconds = None
+            return None
+
+        last_ts = self._progress_timing_last_ts or now
+        last_value = self._progress_timing_last_value
+        delta_steps = current - last_value
+        delta_seconds = max(now - last_ts, 0.0)
+
+        if delta_steps > 0 and delta_seconds > 0:
+            per_step = delta_seconds / delta_steps
+            if isinstance(self._progress_timing_avg_step_seconds, (int, float)):
+                self._progress_timing_avg_step_seconds = (
+                    self._progress_timing_avg_step_seconds * 0.7 + per_step * 0.3
+                )
+            else:
+                self._progress_timing_avg_step_seconds = per_step
+            self._progress_timing_last_ts = now
+            self._progress_timing_last_value = current
+        elif delta_seconds >= 1.0:
+            self._progress_timing_last_ts = now
+
+        remaining = max(total - current, 0)
+        avg_step = self._progress_timing_avg_step_seconds
+        if isinstance(avg_step, (int, float)) and avg_step > 0:
+            return remaining * avg_step
+
+        if current > 1 and self._progress_timing_started_at is not None:
+            elapsed = max(now - self._progress_timing_started_at, 0.0)
+            if elapsed > 0:
+                return remaining * (elapsed / current)
+        return None
+
+    @staticmethod
+    def _extract_prompt_id_from_running_task(task: Any) -> str:
+        if isinstance(task, list) and len(task) >= 2:
+            return str(task[1] or "")
+        return ""
+
+    def _save_progress_snapshot(self, current: int, total: int) -> None:
+        prompt_id = str(getattr(self, "_running_prompt_id", "") or "").strip()
+        if not prompt_id or total <= 0:
+            return
+        payload = {
+            "prompt_id": prompt_id,
+            "current": int(max(current, 0)),
+            "total": int(max(total, 0)),
+            "saved_at": float(time.time()),
+            "avg_step_seconds": (
+                float(self._progress_timing_avg_step_seconds)
+                if isinstance(self._progress_timing_avg_step_seconds, (int, float))
+                and self._progress_timing_avg_step_seconds > 0
+                else None
+            ),
+        }
+        self.settings.setValue(self.COMFY_PROGRESS_SNAPSHOT_KEY, json.dumps(payload, ensure_ascii=False))
+
+    def _clear_progress_snapshot(self) -> None:
+        self.settings.remove(self.COMFY_PROGRESS_SNAPSHOT_KEY)
+
+    def _recover_progress_from_snapshot(self, prompt_id: str, current: int, total: int) -> int:
+        if not prompt_id or total <= 0:
+            return current
+        raw = self.settings.value(self.COMFY_PROGRESS_SNAPSHOT_KEY, "", type=str)
+        if not raw:
+            return current
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return current
+        if not isinstance(payload, dict):
+            return current
+
+        snap_prompt = str(payload.get("prompt_id") or "")
+        snap_total = int(payload.get("total") or 0)
+        snap_current = int(payload.get("current") or 0)
+        snap_saved_at = float(payload.get("saved_at") or 0.0)
+        snap_avg = payload.get("avg_step_seconds")
+        snap_avg_step = (
+            float(snap_avg)
+            if isinstance(snap_avg, (int, float)) and float(snap_avg) > 0
+            else None
+        )
+
+        if snap_prompt != prompt_id or snap_total != total:
+            return current
+
+        recovered = max(current, min(max(snap_current, 0), total))
+        if snap_avg_step is not None and snap_saved_at > 0:
+            elapsed = max(time.time() - snap_saved_at, 0.0)
+            estimated = int(snap_current + elapsed / snap_avg_step)
+            recovered = max(recovered, min(max(estimated, 0), total))
+            self._progress_timing_avg_step_seconds = snap_avg_step
+        return recovered
+
+    @staticmethod
+    def _fmt_gb(value: Any) -> str:
+        if not isinstance(value, (int, float)):
+            return "--"
+        v = float(value)
+        if v > 1024 * 1024 * 1024:
+            return f"{v / (1024 ** 3):.1f}G"
+        if v > 1024 * 1024:
+            return f"{v / (1024 ** 2):.0f}M"
+        return f"{v:.0f}B"
+
+    def _on_comfy_system_stats(self, stats: Dict[str, Any]):
+        """更新状态栏显存/内存信息（独立显示，不占用进度条）。"""
+        if not hasattr(self, "resource_label"):
+            return
+        vram = f"显存 {self._fmt_gb(stats.get('vram_used'))}/{self._fmt_gb(stats.get('vram_total'))}"
+        ram = f"内存 {self._fmt_gb(stats.get('ram_used'))}/{self._fmt_gb(stats.get('ram_total'))}"
+        self.resource_label.setText(f"{vram} | {ram}")
+        gpu_name = str(stats.get("gpu_name") or "").strip()
+        if gpu_name:
+            self.resource_label.setToolTip(gpu_name)
+
+    @staticmethod
+    def _first_numeric_in_dict(data: Dict[str, Any], keys: List[str]) -> Any:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, (int, float)):
+                return value
+        return None
+
+    def _infer_total_steps_from_prompt_graph(self, prompt_graph: Any) -> int:
+        if not isinstance(prompt_graph, dict):
+            return 0
+        steps = 0
+        for node_data in prompt_graph.values():
+            if not isinstance(node_data, dict):
+                continue
+            class_type = str(node_data.get("class_type") or "").lower()
+            if "sampler" not in class_type:
+                continue
+            inputs = node_data.get("inputs") if isinstance(node_data.get("inputs"), dict) else {}
+            node_steps = self._first_numeric_in_dict(
+                inputs,
+                ["steps", "step", "total_steps", "step_count", "max_steps"],
+            )
+            if isinstance(node_steps, (int, float)):
+                steps = max(steps, int(node_steps))
+        return max(steps, 0)
+
+    def _recover_progress_from_queue(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        running = data.get("queue_running", [])
+        if not running:
+            return {"value": 0, "max": 0, "eta_seconds": None}
+
+        task = running[0]
+        task_parts = task if isinstance(task, list) else [task]
+        current = 0
+        total = 0
+        eta_seconds = None
+
+        # 尝试从运行任务附带信息提取 progress/eta（避免扫描完整 prompt graph）
+        for part in task_parts[3:]:
+            if not isinstance(part, dict):
+                continue
+            current_candidate = self._first_numeric_in_dict(
+                part,
+                ["value", "current", "current_step", "step", "completed_steps"],
+            )
+            total_candidate = self._first_numeric_in_dict(
+                part,
+                ["max", "total", "total_steps", "steps", "step_count", "max_steps"],
+            )
+            eta_candidate = self._first_numeric_in_dict(
+                part,
+                ["eta_relative", "eta", "remaining", "eta_seconds", "remaining_seconds", "time_left"],
+            )
+            if isinstance(current_candidate, (int, float)):
+                current = max(int(current_candidate), 0)
+            if isinstance(total_candidate, (int, float)):
+                total = max(int(total_candidate), 0)
+            if isinstance(eta_candidate, (int, float)) and eta_candidate >= 0:
+                eta_seconds = float(eta_candidate)
+            if total > 0:
+                break
+
+        # 如果队列附带信息没有总步数，则从 prompt graph 推断（通常是 KSampler.steps）
+        if total <= 0 and isinstance(task, list) and len(task) >= 3:
+            total = self._infer_total_steps_from_prompt_graph(task[2])
+
+        if total > 0:
+            current = min(current, total)
+
+        return {"value": current, "max": total, "eta_seconds": eta_seconds}
 
     def _on_prompt_submitted(self, prompt_id):
         """处理任务提交成功"""
@@ -1840,6 +2157,11 @@ class MainWindow(QMainWindow):
         """更新状态栏队列按钮的任务计数"""
         running = data.get('queue_running', [])
         pending = data.get('queue_pending', [])
+        current_running_prompt_id = ""
+        if running:
+            current_running_prompt_id = self._extract_prompt_id_from_running_task(running[0])
+        if current_running_prompt_id:
+            self._running_prompt_id = current_running_prompt_id
         total = len(running) + len(pending)
         
         if total > 0:
@@ -1864,19 +2186,53 @@ class MainWindow(QMainWindow):
             if self.queue_sync_timer.isActive():
                 self.queue_sync_timer.stop()
             self._has_realtime_progress = False
+            self._progress_eta_seconds = None
+            self._reset_progress_eta_tracking()
+            self._running_prompt_id = ""
+            self._clear_progress_snapshot()
             if hasattr(self, 'progress_bar'):
                 self.progress_container.setVisible(False)
 
         if len(running) > 0 and hasattr(self, 'progress_bar') and not self._has_realtime_progress:
             self.progress_container.setVisible(True)
-            self.progress_bar.setMaximum(0)
-            self.progress_bar.setFormat("正在恢复跟踪... 队列执行中")
+            recovered = self._recover_progress_from_queue(data)
+            recovered_total = int(recovered.get("max") or 0)
+            recovered_current = int(recovered.get("value") or 0)
+            recovered_eta = recovered.get("eta_seconds")
+            self._progress_eta_seconds = recovered_eta if isinstance(recovered_eta, (int, float)) else None
+            self._reset_progress_eta_tracking()
+            if recovered_total > 0 and current_running_prompt_id:
+                recovered_current = self._recover_progress_from_snapshot(
+                    current_running_prompt_id,
+                    recovered_current,
+                    recovered_total,
+                )
+            if recovered_total > 0:
+                self._progress_timing_started_at = time.time()
+                self._progress_timing_last_ts = self._progress_timing_started_at
+                self._progress_timing_total = recovered_total
+                self._progress_timing_last_value = max(min(recovered_current, recovered_total), 0)
+
+            if recovered_total > 0:
+                self.progress_bar.setMaximum(recovered_total)
+                self.progress_bar.setValue(max(min(recovered_current, recovered_total), 0))
+                self.progress_bar.setFormat(
+                    self._format_progress_text(self.progress_bar.value(), self.progress_bar.maximum())
+                )
+                self._save_progress_snapshot(self.progress_bar.value(), self.progress_bar.maximum())
+            else:
+                # 不使用 maximum=0，避免某些平台样式下文字不可见
+                self.progress_bar.setMaximum(1)
+                self.progress_bar.setValue(0)
+                self.progress_bar.setFormat("队列执行中... 正在同步步数/时间")
             self.interrupt_btn.raise_()
 
     def _on_comfy_node_start(self, node_id, node_type):
         """处理节点开始执行"""
         if hasattr(self, 'progress_bar'):
             self._has_realtime_progress = True
+            self._progress_eta_seconds = None
+            self._reset_progress_eta_tracking()
             self.progress_container.setVisible(True)
             
             # 常用节点名称翻译
@@ -1908,6 +2264,9 @@ class MainWindow(QMainWindow):
     def _on_comfy_done(self, result=None):
         """处理执行完成"""
         self._has_realtime_progress = False
+        self._progress_eta_seconds = None
+        self._reset_progress_eta_tracking()
+        self._clear_progress_snapshot()
         if hasattr(self, 'progress_bar'):
             self.progress_container.setVisible(False) # 隐藏整个容器
         self.statusBar().showMessage("生成任务已完成", 5000)

@@ -13,6 +13,8 @@ class ComfyClient(QObject):
     """
     status_changed = pyqtSignal(str) # 队列状态或错误信息
     progress_updated = pyqtSignal(int, int) # 当前步数, 总步数
+    progress_detail_updated = pyqtSignal(dict) # 进度详情 (含 ETA)
+    system_stats_updated = pyqtSignal(dict) # 系统资源状态 (显存/内存)
     execution_start = pyqtSignal(str, str) # 节点ID, 节点类型/名称
     execution_done = pyqtSignal(str) # 执行完成的图片路径(或ID)
     prompt_submitted = pyqtSignal(str) # 任务提交成功，携带 prompt_id
@@ -40,11 +42,15 @@ class ComfyClient(QObject):
         self._prompt_context_by_id: Dict[str, Dict[str, Any]] = {}
         
         self.nam = QNetworkAccessManager() # 用于非阻塞 HTTP 请求
+        self._system_stats_supported = True
         
         # 重连定时器
         self.reconnect_timer = QTimer(self)
         self.reconnect_timer.setInterval(3000) # 3秒重连一次
         self.reconnect_timer.timeout.connect(self.connect_server)
+        self.system_stats_timer = QTimer(self)
+        self.system_stats_timer.setInterval(2000)
+        self.system_stats_timer.timeout.connect(self.get_system_stats)
 
     def connect_server(self):
         """连接 WebSocket 监听状态"""
@@ -59,12 +65,17 @@ class ComfyClient(QObject):
         self.status_changed.emit("ComfyUI 已连接")
         # 连接成功后停止重连并同步基础状态
         self.reconnect_timer.stop()
+        if self._system_stats_supported and not self.system_stats_timer.isActive():
+            self.system_stats_timer.start()
+            self.get_system_stats()
         self.fetch_available_models()
         # 重启后尽快同步队列，便于主界面恢复进度展示
         QTimer.singleShot(100, self.get_queue)
     def _on_disconnected(self):
         print(f"[Comfy] WebSocket 连接断开")
         self.status_changed.emit("连接断开，正在重连...")
+        if self.system_stats_timer.isActive():
+            self.system_stats_timer.stop()
         if not self.reconnect_timer.isActive():
             self.reconnect_timer.start()
 
@@ -72,6 +83,8 @@ class ComfyClient(QObject):
         print(f"[Comfy] WebSocket 错误: {error}")
         self.status_changed.emit(f"连接失败: {error}")
         # 发生错误时也尝试重连
+        if self.system_stats_timer.isActive():
+            self.system_stats_timer.stop()
         if not self.reconnect_timer.isActive():
             self.reconnect_timer.start()
 
@@ -117,10 +130,10 @@ class ComfyClient(QObject):
                 print(f"[Comfy] 采样过程中发生错误")
                 self.get_queue()
 
-            elif msg_type == "progress":
-                value = data["data"]["value"]
-                max_val = data["data"]["max"]
-                self.progress_updated.emit(value, max_val)
+            elif msg_type in ("progress", "progress_state"):
+                progress_info = self._parse_progress_payload(data.get("data"))
+                self.progress_detail_updated.emit(progress_info)
+                self.progress_updated.emit(progress_info["value"], progress_info["max"])
 
             elif msg_type == "executed":
                 payload = data.get("data", {}) if isinstance(data, dict) else {}
@@ -286,6 +299,192 @@ class ComfyClient(QObject):
                 print(f"[Comfy] 获取队列失败: {reply.errorString()}")
         except Exception as e:
             print(f"[Comfy] 队列响应解析失败: {e}")
+        finally:
+            reply.deleteLater()
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        try:
+            f = float(value)
+            return f if f >= 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _pick_int_from_keys(cls, data: Dict[str, Any], keys: List[str]) -> Optional[int]:
+        for key in keys:
+            if key in data:
+                try:
+                    return int(data.get(key))
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    @classmethod
+    def _pick_float_from_keys(cls, data: Dict[str, Any], keys: List[str]) -> Optional[float]:
+        for key in keys:
+            if key in data:
+                value = cls._safe_float(data.get(key))
+                if value is not None:
+                    return value
+        return None
+
+    @staticmethod
+    def _dict_candidates(payload_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = [payload_dict]
+        for key in ("progress", "state", "status", "exec_info", "data"):
+            nested = payload_dict.get(key)
+            if isinstance(nested, dict):
+                candidates.append(nested)
+        return candidates
+
+    @classmethod
+    def _parse_progress_payload(cls, payload: Any) -> Dict[str, Any]:
+        payload_dict = payload if isinstance(payload, dict) else {}
+        value = 0
+        max_val = 0
+        eta_seconds = None
+
+        for candidate in cls._dict_candidates(payload_dict):
+            if not isinstance(candidate, dict):
+                continue
+
+            parsed_value = cls._pick_int_from_keys(
+                candidate,
+                ["value", "current", "step", "current_step", "step_no", "completed_steps"],
+            )
+            parsed_max = cls._pick_int_from_keys(
+                candidate,
+                ["max", "total", "steps", "total_steps", "step_count", "max_steps"],
+            )
+            parsed_eta = cls._pick_float_from_keys(
+                candidate,
+                [
+                    "eta_relative",
+                    "eta",
+                    "remaining",
+                    "eta_seconds",
+                    "remaining_seconds",
+                    "time_left",
+                    "time_remaining",
+                ],
+            )
+
+            if parsed_value is not None:
+                value = max(parsed_value, 0)
+            if parsed_max is not None:
+                max_val = max(parsed_max, 0)
+            if parsed_eta is not None:
+                eta_seconds = parsed_eta
+
+            if max_val > 0 or value > 0 or eta_seconds is not None:
+                break
+
+        return {
+            "value": value,
+            "max": max_val,
+            "eta_seconds": eta_seconds,
+        }
+
+    def get_system_stats(self) -> None:
+        """查询 ComfyUI 系统资源状态（显存/内存）"""
+        if not self._system_stats_supported:
+            return
+        url = QUrl(f"http://{self.server_address}/system_stats")
+        reply = self.nam.get(QNetworkRequest(url))
+        reply.finished.connect(lambda: self._handle_system_stats_response(reply))
+
+    @staticmethod
+    def _pick_numeric(data: Dict[str, Any], keys: List[str]) -> Optional[float]:
+        for key in keys:
+            if key in data:
+                value = ComfyClient._safe_float(data.get(key))
+                if value is not None:
+                    return value
+        return None
+
+    @staticmethod
+    def _pick_device(devices: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(devices, list):
+            return None
+        typed_devices = [d for d in devices if isinstance(d, dict)]
+        if not typed_devices:
+            return None
+
+        for dev in typed_devices:
+            dev_type = str(dev.get("type") or "").lower()
+            dev_name = str(dev.get("name") or "").lower()
+            if "cuda" in dev_type or "cuda" in dev_name or "nvidia" in dev_name:
+                return dev
+        return typed_devices[0]
+
+    @classmethod
+    def _parse_system_stats_payload(cls, payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+
+        system = payload.get("system") if isinstance(payload.get("system"), dict) else {}
+        device = cls._pick_device(payload.get("devices"))
+
+        ram_total = cls._pick_numeric(system, ["ram_total", "total_ram", "memory_total"])
+        ram_free = cls._pick_numeric(system, ["ram_free", "free_ram", "memory_free"])
+        ram_used = cls._pick_numeric(system, ["ram_used", "used_ram", "memory_used"])
+        if ram_used is None and ram_total is not None and ram_free is not None:
+            ram_used = max(ram_total - ram_free, 0.0)
+
+        vram_total = None
+        vram_free = None
+        vram_used = None
+        gpu_name = ""
+        if isinstance(device, dict):
+            gpu_name = str(device.get("name") or "")
+            vram_total = cls._pick_numeric(
+                device,
+                ["vram_total", "total_vram", "torch_vram_total", "memory_total", "total_memory"],
+            )
+            vram_free = cls._pick_numeric(
+                device,
+                ["vram_free", "free_vram", "torch_vram_free", "memory_free", "free_memory"],
+            )
+            vram_used = cls._pick_numeric(
+                device,
+                ["vram_used", "used_vram", "memory_used", "used_memory"],
+            )
+            if vram_used is None and vram_total is not None and vram_free is not None:
+                vram_used = max(vram_total - vram_free, 0.0)
+
+        return {
+            "gpu_name": gpu_name,
+            "ram_used": ram_used,
+            "ram_total": ram_total,
+            "vram_used": vram_used,
+            "vram_total": vram_total,
+        }
+
+    def _handle_system_stats_response(self, reply: QNetworkReply) -> None:
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                status_code = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+                if status_code == 404:
+                    self._system_stats_supported = False
+                    if self.system_stats_timer.isActive():
+                        self.system_stats_timer.stop()
+                    print("[Comfy] /system_stats 不可用，已停用资源轮询")
+                return
+
+            payload = json.loads(bytes(reply.readAll()).decode("utf-8"))
+            stats = self._parse_system_stats_payload(payload)
+            if stats:
+                self.system_stats_updated.emit(stats)
+        except Exception as e:
+            print(f"[Comfy] 系统状态解析失败: {e}")
         finally:
             reply.deleteLater()
 

@@ -26,6 +26,8 @@ const isAuthenticated = ref(false)
 const authCode = ref("")
 const authError = ref("")
 const appInitialized = ref(false)
+const lastGallerySyncAt = ref(0)
+const syncInProgress = ref(false)
 
 // --- Resize & Mobile State ---
 const leftWidth = ref(parseInt(localStorage.getItem('aimg_left_width')) || 240)
@@ -53,7 +55,7 @@ const filterData = reactive({ folders: [], models: [], loras: [], samplers: [], 
 const selectedFilters = reactive({ folder: null, model: null, lora: null })
 
 const isGenerating = ref(false)
-const comfyStatus = reactive({ connected: false })
+const comfyStatus = reactive({ connected: false, queue_remaining: 0, active_count: 0 })
 
 // Default params
 const defaultGenParams = {
@@ -142,11 +144,30 @@ const handleAuthRequired = () => {
   authError.value = "登录已过期，请重新输入验证码"
 }
 
+const syncGallery = async () => {
+  if (authRequired.value && !isAuthenticated.value) return
+  if (syncInProgress.value) return
+  syncInProgress.value = true
+  try {
+    try {
+      await fetch('/api/scan', { method: 'POST' })
+    } catch (e) {}
+    // 如果当前正在加载，等待片刻避免刷新被跳过
+    for (let i = 0; i < 20 && loading.value; i++) {
+      await new Promise(r => setTimeout(r, 100))
+    }
+    await fetchImages(true, true, true)
+    lastGallerySyncAt.value = Date.now()
+  } finally {
+    syncInProgress.value = false
+  }
+}
+
 const initAppData = () => {
   if (appInitialized.value) return
   appInitialized.value = true
-  fetchImages()
   fetchFilters()
+  syncGallery()
   pollComfyStatus()
 }
 
@@ -199,19 +220,25 @@ const submitAuthLogin = async () => {
 }
 
 // --- API Calls ---
-const fetchImages = async (isRefresh = false) => {
+const fetchImages = async (isRefresh = false, skipScan = false, silentRefresh = false) => {
   if (authRequired.value && !isAuthenticated.value) return
   if (loading.value) return
+
+  let requestPage = page.value
   if (isRefresh) {
-    page.value = 1
-    images.value = []
-    hasMore.value = true
+    if (!skipScan) {
+      try {
+        await fetch('/api/scan', { method: 'POST' })
+      } catch (e) {}
+    }
+    requestPage = 1
+    lastGallerySyncAt.value = Date.now()
   }
-  if (!hasMore.value) return
+  if (!isRefresh && !hasMore.value) return
   loading.value = true
   try {
     const query = new URLSearchParams({
-      keyword: searchKeyword.value, page: page.value,
+      keyword: searchKeyword.value, page: requestPage,
       folder: selectedFilters.folder || "", model: selectedFilters.model || "", lora: selectedFilters.lora || ""
     })
     const url = `/api/images?${query.toString()}`
@@ -219,9 +246,41 @@ const fetchImages = async (isRefresh = false) => {
     const response = await fetch(url)
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const data = await response.json()
+    if (isRefresh) {
+      const refreshed = Array.isArray(data.images) ? data.images : []
+      const selectedPath = selectedImage.value?.file_path || ""
+      images.value = refreshed
+      hasMore.value = !!data.has_more
+      page.value = refreshed.length > 0 ? 2 : 1
+
+      if (!refreshed.length) {
+        selectedImage.value = null
+        meta.value = null
+        debugMsg.value = `暂无数据 (API返回空数组)`
+      } else {
+        if (selectedPath) {
+          const stillExists = refreshed.find(i => i.file_path === selectedPath)
+          if (stillExists) {
+            // Keep current object reference to avoid resetting zoom/pan while viewing the same image.
+            if (selectedImage.value?.file_path !== stillExists.file_path) {
+              selectedImage.value = stillExists
+            } else {
+              Object.assign(selectedImage.value, stillExists)
+            }
+          } else if (!silentRefresh || !isMobile.value) {
+            viewDetail(refreshed[0])
+          }
+        } else if (!isMobile.value) {
+          viewDetail(refreshed[0])
+        }
+        debugMsg.value = ""
+      }
+      return
+    }
+
     if (data.images.length === 0) {
       hasMore.value = false
-      if (page.value === 1) debugMsg.value = `暂无数据 (API返回空数组)`
+      if (requestPage === 1) debugMsg.value = `暂无数据 (API返回空数组)`
     } else {
       const existingPaths = new Set(images.value.map(i => i.file_path))
       const uniqueNewImages = data.images.filter(i => !existingPaths.has(i.file_path))
@@ -278,9 +337,16 @@ const pollComfyStatus = async () => {
     const data = await resp.json()
     comfyStatus.connected = true
     comfyStatus.queue_remaining = data.queue_remaining || 0
+    comfyStatus.active_count = data.active_count || 0
+
+    // 与 Python 端对齐：空闲时周期性轻同步，覆盖“外部新增/删除”场景
+    if ((comfyStatus.active_count || 0) === 0 && Date.now() - lastGallerySyncAt.value > 12000) {
+      syncGallery()
+    }
   } catch (e) { 
     comfyStatus.connected = false 
     comfyStatus.queue_remaining = 0
+    comfyStatus.active_count = 0
   }
   setTimeout(pollComfyStatus, 2000)
 }
@@ -462,20 +528,12 @@ onUnmounted(() => {
 })
 
 // Watch for generation completion to refresh list
-watch(() => comfyStatus.queue_remaining, async (newVal, oldVal) => {
+watch(() => comfyStatus.active_count, async (newVal, oldVal) => {
     if (!appInitialized.value || (authRequired.value && !isAuthenticated.value)) return
     if (oldVal > 0 && newVal === 0) {
         console.log("[App] Generation finished, triggering scan...")
-        // Force a scan to ensure new file is picked up
-        try {
-            await fetch('/api/scan', { method: 'POST' })
-            // Wait a short moment for FS to settle just in case
-            await new Promise(r => setTimeout(r, 500))
-            fetchImages(true)
-        } catch (e) {
-            console.error("Scan trigger failed:", e)
-            fetchImages(true)
-        }
+        await new Promise(r => setTimeout(r, 500))
+        await syncGallery()
     }
 })
 </script>

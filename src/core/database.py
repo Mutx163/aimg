@@ -632,7 +632,7 @@ class DatabaseManager:
         # 动态构建 SQL，使用 parameters preventing injection
         placeholders = ','.join(['?'] * len(file_paths))
         query = f'''
-            SELECT file_path, width, height, model_name, seed, steps, sampler, scheduler, cfg_scale, prompt, negative_prompt, loras, tech_info
+            SELECT file_path, width, height, model_name, seed, steps, sampler, scheduler, cfg_scale, prompt, negative_prompt, loras, tech_info, file_mtime
             FROM images WHERE file_path IN ({placeholders})
         '''
         
@@ -666,7 +666,8 @@ class DatabaseManager:
                     'cfg_scale': row[8] or 0,
                     'prompt': row[9] or '',
                     'negative_prompt': row[10] or '',
-                    'loras': json.loads(row[11]) if row[11] else []
+                    'loras': json.loads(row[11]) if row[11] else [],
+                    'file_mtime': row[13] or 0
                 }
             return results
         except Exception as e:

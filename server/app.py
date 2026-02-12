@@ -290,6 +290,7 @@ async def get_images(
             "file_name": os.path.basename(path),
             "width": info.get('width', 0) or 0,
             "height": info.get('height', 0) or 0,
+            "file_mtime": info.get('file_mtime', 0) or 0,
         })
     has_more = (start_idx + page_size) < total
     return {"total": total, "page": page, "page_size": page_size, "images": valid_images, "has_more": has_more}
@@ -415,6 +416,9 @@ async def get_full_queue():
         pending_tasks = []
         running_items = queue_data.get("queue_running", [])
         pending_items = queue_data.get("queue_pending", [])
+        running_count = len(running_items)
+        pending_count = len(pending_items)
+        active_count = running_count + pending_count
         for i, item in enumerate(running_items + pending_items):
             prompt_id = item[1]
             task_info = {"id": prompt_id, "status": "running" if item in running_items else "pending", "prompt": "任务中...", "lora_info": "", "progress": 0, "progress_text": ""}
@@ -432,8 +436,15 @@ async def get_full_queue():
                     if l_name.endswith(".safetensors"): l_name = l_name[:-12]
                     if l_name: task_info["lora_info"] = f"{l_name} ({inputs.get('strength_model', 1.0)})"
             pending_tasks.append(task_info)
-        return {"pending": pending_tasks, "queue_remaining": queue_data.get("exec_info", {}).get("queue_remaining", 0)}
-    except Exception as e: return {"pending": [], "queue_remaining": 0}
+        return {
+            "pending": pending_tasks,
+            "queue_remaining": queue_data.get("exec_info", {}).get("queue_remaining", 0),
+            "running_count": running_count,
+            "pending_count": pending_count,
+            "active_count": active_count,
+        }
+    except Exception as e:
+        return {"pending": [], "queue_remaining": 0, "running_count": 0, "pending_count": 0, "active_count": 0}
 
 @app.post("/api/comfy/interrupt")
 async def interrupt_task():
